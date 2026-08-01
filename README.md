@@ -19,6 +19,8 @@ GET /movies/{tmdb_id}
 GET /tv/{tmdb_id}
 GET /anime?query=One%20Piece
 GET /search?q=matrix
+GET /anime/movie/{tmdb_id}/images
+GET /anime/tv/{tmdb_id}/images
 ```
 
 Catalog routes do not require a client key. `/metrics` is on the private admin

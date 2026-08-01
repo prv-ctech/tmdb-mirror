@@ -9,8 +9,8 @@ use axum::{
 use serde_json::Value;
 use tmdb_api::{ApiState, CatalogApiStore, ReadinessProbe, build_catalog_router, build_router};
 use tmdb_db::{
-    AnimeScope, CatalogDetail, CatalogError, CatalogMovieDetails, CatalogPage, CatalogRecentPage,
-    CatalogTitle, CatalogTopPage, PopularCursor, RecentCursor, TopCursor,
+    AnimeScope, CatalogDetail, CatalogError, CatalogImageAsset, CatalogMovieDetails, CatalogPage,
+    CatalogRecentPage, CatalogTitle, CatalogTopPage, PopularCursor, RecentCursor, TopCursor,
 };
 use tmdb_domain::{MediaType, TitleKey};
 use tower::ServiceExt;
@@ -27,6 +27,7 @@ struct FakeStore {
     top: ScopeCalls,
     searches: SearchCalls,
     detail: Arc<Mutex<Option<CatalogDetail>>>,
+    images: Arc<Mutex<Option<Vec<CatalogImageAsset>>>>,
 }
 
 #[async_trait]
@@ -110,6 +111,21 @@ impl CatalogApiStore for FakeStore {
             .map_err(|_| CatalogError::Query)?
             .push((term.to_owned(), media_type, anime_scope, limit));
         Ok(Vec::new())
+    }
+
+    async fn list_images(
+        &self,
+        _key: TitleKey,
+        anime_scope: AnimeScope,
+    ) -> Result<Option<Vec<CatalogImageAsset>>, CatalogError> {
+        match anime_scope {
+            AnimeScope::OnlyAnime => self
+                .images
+                .lock()
+                .map_err(|_| CatalogError::Query)
+                .map(|images| images.clone()),
+            AnimeScope::OnlyNonAnime => Ok(None),
+        }
     }
 }
 
@@ -217,6 +233,44 @@ async fn anime_search_uses_only_anime_scope_and_plus_decodes()
         calls,
         vec![("one piece".to_owned(), None, AnimeScope::OnlyAnime, 11)]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn anime_image_route_returns_anime_assets_and_ordinary_route_stays_isolated()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = FakeStore::default();
+    store
+        .images
+        .lock()
+        .map_err(|_| "store lock poisoned")?
+        .replace(vec![CatalogImageAsset {
+            id: 7,
+            image_kind: "poster".to_owned(),
+            source: "tmdb".to_owned(),
+            source_key: "anime-poster".to_owned(),
+            source_url: Some("https://image.tmdb.org/t/p/w500/anime-poster.jpg".to_owned()),
+            storage_path: Some("anime/movie/123/cover.jpg".to_owned()),
+            mime_type: Some("image/jpeg".to_owned()),
+            width: Some(500),
+            height: Some(750),
+            file_size_bytes: Some(12_345),
+            sha256: Some("a".repeat(64)),
+            status: "ready".to_owned(),
+            iso_639_1: None,
+        }]);
+
+    let response = get(app(&store), "/anime/movie/123/images").await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1_000_000).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        json["data"][0]["url"],
+        "https://image.tmdb.org/t/p/w500/anime-poster.jpg"
+    );
+
+    let response = get(app(&store), "/movies/123/images").await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     Ok(())
 }
 

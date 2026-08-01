@@ -518,6 +518,7 @@ pub fn build_catalog_router_with_media(
         .route("/anime/top-rated", get(list_anime_top))
         .route("/anime", get(list_anime))
         .route("/anime/{media_type}/{tmdb_id}", get(get_anime))
+        .route("/anime/{media_type}/{tmdb_id}/images", get(anime_images))
         .route("/search", get(search_titles))
         .route("/genres", get(list_genres))
         .route("/languages", get(list_languages))
@@ -1587,6 +1588,7 @@ async fn scoped_resource(
     request_id: Option<Extension<RequestId>>,
     media_type: MediaType,
     kind: ResourceKind,
+    anime_scope: AnimeScope,
 ) -> Response {
     let request_id = request_id_string(request_id);
     if raw_query.is_some_and(|query| !query.is_empty()) {
@@ -1597,28 +1599,31 @@ async fn scoped_resource(
         Err(error) => return error_response(error, &request_id),
     };
     let key = TitleKey::new(media_type, tmdb_id);
-    let scope = AnimeScope::OnlyNonAnime;
     let result = match kind {
         ResourceKind::Credits => state
             .store
-            .list_credits(key, scope)
+            .list_credits(key, anime_scope)
             .await
             .map(|value| value.map(|items| serde_json::to_value(items).unwrap_or_default())),
-        ResourceKind::Images => state.store.list_images(key, scope).await.map(|value| {
-            value.map(|items| {
-                let items = items
-                    .into_iter()
-                    .map(|item| {
-                        image_response(
-                            item,
-                            state.allow_local_media,
-                            state.media_base_url.as_deref(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                serde_json::to_value(items).unwrap_or_default()
-            })
-        }),
+        ResourceKind::Images => state
+            .store
+            .list_images(key, anime_scope)
+            .await
+            .map(|value| {
+                value.map(|items| {
+                    let items = items
+                        .into_iter()
+                        .map(|item| {
+                            image_response(
+                                item,
+                                state.allow_local_media,
+                                state.media_base_url.as_deref(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    serde_json::to_value(items).unwrap_or_default()
+                })
+            }),
     };
     match result {
         Ok(Some(data)) => (StatusCode::OK, Json(serde_json::json!({"data": data}))).into_response(),
@@ -1678,6 +1683,7 @@ async fn movie_credits(
         request_id,
         MediaType::Movie,
         ResourceKind::Credits,
+        AnimeScope::OnlyNonAnime,
     )
     .await
 }
@@ -1694,6 +1700,7 @@ async fn tv_credits(
         request_id,
         MediaType::Tv,
         ResourceKind::Credits,
+        AnimeScope::OnlyNonAnime,
     )
     .await
 }
@@ -1710,6 +1717,7 @@ async fn movie_images(
         request_id,
         MediaType::Movie,
         ResourceKind::Images,
+        AnimeScope::OnlyNonAnime,
     )
     .await
 }
@@ -1726,6 +1734,34 @@ async fn tv_images(
         request_id,
         MediaType::Tv,
         ResourceKind::Images,
+        AnimeScope::OnlyNonAnime,
+    )
+    .await
+}
+
+async fn anime_images(
+    Extension(state): Extension<CatalogApiState>,
+    Path((raw_media_type, raw_id)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    let media_type = match MediaType::from_str(&raw_media_type) {
+        Ok(media_type) => media_type,
+        Err(_) => {
+            return error_response(
+                CatalogApiError::InvalidQuery,
+                &request_id_string(request_id),
+            );
+        }
+    };
+    scoped_resource(
+        state,
+        raw_id,
+        query,
+        request_id,
+        media_type,
+        ResourceKind::Images,
+        AnimeScope::OnlyAnime,
     )
     .await
 }
