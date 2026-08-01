@@ -23,9 +23,9 @@ if (-not (Test-Path -LiteralPath $seedFile -PathType Leaf)) {
 
 $composeArgs = @('compose', '--env-file', $envFile, '--project-name', $ProjectName, '--file', $composeFile)
 $sql = [IO.File]::ReadAllText($seedFile, [Text.UTF8Encoding]::new($false))
-$passwordOutput = & docker @($composeArgs + @('exec', '-T', 'postgres', 'cat', '/run/secrets/postgres_owner_password')) 2>&1
+$passwordOutput = & docker @($composeArgs + @('exec', '-T', 'postgres', 'printenv', 'POSTGRES_PASSWORD')) 2>&1
 if ($LASTEXITCODE -ne 0) {
-    throw "Unable to read the disposable database password from the container."
+    throw "Unable to read the disposable database password from the container environment."
 }
 $postgresPassword = ([string]::Join("`n", @($passwordOutput))).Trim()
 if ([string]::IsNullOrWhiteSpace($postgresPassword)) {

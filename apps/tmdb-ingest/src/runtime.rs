@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use chrono::{Days, Utc};
 use tmdb_config::{
-    ConfigSource, DatabaseConfig, EnvSource, Environment, load_secret_for_environment,
+    ConfigSource, EnvSource, Environment, load_secret_for_environment, load_shared_database,
 };
 use tmdb_db::{PoolPolicy, connect_direct, migrate};
 use tmdb_jobs::{JobRepository, NewJob, Worker, WorkerConfig, WorkerId};
@@ -26,7 +26,7 @@ pub async fn run() -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!(error))?;
     let source = EnvSource;
     let environment = load_environment(source)?;
-    let database = load_database(source, "ingest_writer", environment)?;
+    let database = load_shared_database(&source, environment)?;
     let tmdb_client = load_tmdb_client(source, environment)?;
     let export_root = std::path::PathBuf::from(RAW_ROOT);
     let export_max_bytes = parse_or(
@@ -78,7 +78,7 @@ pub async fn run_worker() -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!(error))?;
     let source = EnvSource;
     let environment = load_environment(source)?;
-    let migrator = load_database_with_prefix(source, "TMDB_MIGRATOR_DB", "migrator", environment)?;
+    let migrator = load_shared_database(&source, environment)?;
     let migration_pool = connect_direct(&migrator, PoolPolicy::Migrator)
         .await
         .map_err(|error| anyhow::anyhow!(error))
@@ -89,7 +89,7 @@ pub async fn run_worker() -> anyhow::Result<()> {
         .context("apply database migrations")?;
     migration_pool.close().await;
 
-    let database = load_database(source, "ingest_writer", environment)?;
+    let database = load_shared_database(&source, environment)?;
     let tmdb_client = load_tmdb_client(source, environment)?;
     let export_max_bytes = parse_or(
         source,
@@ -245,43 +245,6 @@ async fn claim_schedule_slot(
     Ok(inserted.is_some())
 }
 
-fn load_database(
-    source: EnvSource,
-    expected_role: &str,
-    environment: Environment,
-) -> anyhow::Result<DatabaseConfig> {
-    let username = required(source, "TMDB_DIRECT_DB_USER")?;
-    if username != expected_role {
-        bail!("TMDB_DIRECT_DB_USER must select the {expected_role} role");
-    }
-    Ok(DatabaseConfig {
-        host: required(source, "TMDB_DIRECT_DB_HOST")?,
-        port: parse(source, "TMDB_DIRECT_DB_PORT")?,
-        database: required(source, "TMDB_DIRECT_DB_NAME")?,
-        username,
-        password: load_secret_for_environment(&source, "TMDB_DIRECT_DB_PASSWORD", environment)?,
-    })
-}
-
-fn load_database_with_prefix(
-    source: EnvSource,
-    prefix: &str,
-    expected_role: &str,
-    environment: Environment,
-) -> anyhow::Result<DatabaseConfig> {
-    let username = required(source, &format!("{prefix}_USER"))?;
-    if username != expected_role {
-        bail!("{prefix}_USER must select the {expected_role} role");
-    }
-    Ok(DatabaseConfig {
-        host: required(source, &format!("{prefix}_HOST"))?,
-        port: parse(source, &format!("{prefix}_PORT"))?,
-        database: required(source, &format!("{prefix}_NAME"))?,
-        username,
-        password: load_secret_for_environment(&source, &format!("{prefix}_PASSWORD"), environment)?,
-    })
-}
-
 fn load_tmdb_client(source: EnvSource, environment: Environment) -> anyhow::Result<TmdbClient> {
     let base_url = required(source, "TMDB_API_BASE_URL")?;
     let token = load_secret_for_environment(&source, "TMDB_READ_ACCESS_TOKEN", environment)
@@ -335,15 +298,6 @@ fn required(source: EnvSource, name: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("missing configuration field {name}"))?
         .into_string()
         .map_err(|_| anyhow::anyhow!("configuration field {name} is not valid Unicode"))
-}
-
-fn parse<T>(source: EnvSource, name: &str) -> anyhow::Result<T>
-where
-    T: std::str::FromStr,
-{
-    required(source, name)?
-        .parse()
-        .map_err(|_| anyhow::anyhow!("configuration field {name} is invalid"))
 }
 
 fn parse_or<T>(source: EnvSource, name: &str, default: T) -> anyhow::Result<T>

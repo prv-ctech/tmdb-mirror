@@ -26,7 +26,7 @@ fn doctor_requires_json_output_flag() -> Result<(), Box<dyn std::error::Error>> 
             "doctor",
         ])
         .env("TMDB_ENVIRONMENT", "development")
-        .env("TMDB_DIRECT_DB_PASSWORD", "test-only-not-read")
+        .env("POSTGRES_PASSWORD", "test-only-not-read")
         .output()?;
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;

@@ -19,11 +19,11 @@ Host ports default to `55433` (PostgreSQL), `18080` (API), `18081` (admin), and
 
 Run from the repository root in PowerShell. Supply the TMDB read token through
 an environment variable or a process argument; the bootstrap script writes it
-only to the ignored `.stress-runtime/<project>/secrets` directory and never to
-the Compose environment file, logs, or result JSON.
+to the ignored `.stress-runtime/<project>/compose.env` file, which is the single
+Compose environment file for the disposable project.
 
 ```powershell
-$env:TMDB_STRESS_READ_TOKEN = '<token from your secret manager>'
+$env:TMDB_STRESS_READ_TOKEN = '<paste-tmdb-read-token>'
 $env:TMDB_STRESS_TRAWL_BASE_URL = 'http://<trawl-host>:8191'
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-bootstrap.ps1
 $env:TMDB_STRESS_READ_TOKEN = $null
@@ -57,7 +57,7 @@ artifacts are written below the ignored runtime directory.
 ## Refresh a token without rebuilding
 
 ```powershell
-$env:TMDB_STRESS_READ_TOKEN = '<new token from your secret manager>'
+$env:TMDB_STRESS_READ_TOKEN = '<paste-new-tmdb-read-token>'
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-set-token.ps1
 $env:TMDB_STRESS_READ_TOKEN = $null
 docker compose --env-file .stress-runtime\tmdb_stress_test\compose.env --project-name tmdb_stress_test --file deploy\compose.stress.yaml restart worker

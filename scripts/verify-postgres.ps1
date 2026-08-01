@@ -139,13 +139,7 @@ function Assert-DockerRuntime {
 
     $mountsJson = Invoke-DockerChecked -Arguments @('container', 'inspect', '--format', '{{json .Mounts}}', $containerName)
     $mounts = $mountsJson | ConvertFrom-Json
-    $expectedSecretNames = @(
-        'postgres_owner_password', 'migrator_password', 'api_reader_password',
-        'api_job_submitter_password', 'ingest_writer_password',
-        'image_writer_password', 'monitor_password'
-    )
-    $expectedSecretDestinations = @($expectedSecretNames | ForEach-Object { "/run/secrets/$_" })
-    $expectedMountDestinations = @('/var/lib/postgresql', '/docker-entrypoint-initdb.d') + $expectedSecretDestinations
+    $expectedMountDestinations = @('/var/lib/postgresql', '/docker-entrypoint-initdb.d')
     [string[]]$actualMountDestinations = @($mounts | ForEach-Object { [string]$_.Destination })
     if ($mounts.Count -ne $expectedMountDestinations.Count) {
         throw "Container mount count drift detected: expected $($expectedMountDestinations.Count), got $($mounts.Count)."
@@ -167,22 +161,10 @@ function Assert-DockerRuntime {
     }
     Write-Output 'PASS postgres_init_mount=/docker-entrypoint-initdb.d|rw=false'
 
-    $secretMounts = @($mounts | Where-Object { $_.Destination -like '/run/secrets/*' })
-    if ($secretMounts.Count -ne $expectedSecretDestinations.Count) {
-        throw "Secret mount count drift detected: expected $($expectedSecretDestinations.Count), got $($secretMounts.Count)."
+    if (@($mounts | Where-Object { $_.Destination -like '/run/secrets/*' }).Count -ne 0) {
+        throw 'Docker secret mounts are not part of the development fixture.'
     }
-    [string[]]$actualSecretDestinations = @($secretMounts | ForEach-Object { [string]$_.Destination })
-    Assert-Exact 'secret_mount_destinations' `
-        (($actualSecretDestinations | Sort-Object -Unique) -join ',') `
-        (($expectedSecretDestinations | Sort-Object -Unique) -join ',')
-    foreach ($secretMount in $secretMounts) {
-        $expectedSourceName = [System.IO.Path]::GetFileName([string]$secretMount.Destination)
-        $actualSourceName = [System.IO.Path]::GetFileName([string]$secretMount.Source)
-        if ($secretMount.Type -cne 'bind' -or $secretMount.RW -or $actualSourceName -cne $expectedSourceName) {
-            throw "Secret mount drift detected for $($secretMount.Destination)."
-        }
-    }
-    Write-Output 'PASS secret_mount_access=all-seven-read-only'
+    Write-Output 'PASS secret_mounts=none'
 
     $networksJson = Invoke-DockerChecked -Arguments @('container', 'inspect', '--format', '{{json .NetworkSettings.Networks}}', $containerName)
     $networks = $networksJson | ConvertFrom-Json
@@ -214,42 +196,6 @@ function Assert-DockerRuntime {
         throw 'Runtime port publication is not exactly 127.0.0.1:55432->5432/tcp.'
     }
     Write-Output 'PASS runtime_port=127.0.0.1:55432->5432/tcp'
-}
-
-function Assert-RoleTcpAuthentication {
-    param(
-        [Parameter(Mandatory)][string]$Role,
-        [Parameter(Mandatory)][string]$SecretName
-    )
-
-    $authenticationScript = @'
-set -Eeuo pipefail
-role="$1"
-secret_path="$2"
-secret_size="$(wc -c < "$secret_path")"
-if [[ "$secret_size" -ne 43 ]]; then
-    printf 'Authentication secret has invalid byte length for role: %s\n' "$role" >&2
-    exit 1
-fi
-password="$(<"$secret_path")"
-if [[ ! "$password" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
-    printf 'Authentication secret has invalid format for role: %s\n' "$role" >&2
-    exit 1
-fi
-actual_user="$(PGPASSWORD="$password" psql -X -h 127.0.0.1 -p 5432 -U "$role" -d tmdb -Atc 'SELECT current_user')"
-if [[ "$actual_user" != "$role" ]]; then
-    printf 'Authenticated PostgreSQL role mismatch for: %s\n' "$role" >&2
-    exit 1
-fi
-printf '%s' "$actual_user"
-'@
-    $arguments = @(
-        'compose', '--env-file', $envPath, '-p', $projectName,
-        '-f', $composePath, 'exec', '-T', 'postgres',
-        'bash', '-s', '--', $Role, "/run/secrets/$SecretName"
-    )
-    $actual = Invoke-DockerChecked -Arguments $arguments -InputText $authenticationScript
-    Assert-Exact "tcp_scram_auth_$Role" $actual $Role
 }
 
 if (-not (Test-Path -LiteralPath $composePath -PathType Leaf)) {
@@ -303,14 +249,6 @@ $expectedRoles = @(
 Assert-Exact 'role_attributes_and_scram' (Invoke-PostgresScalar $rolesSql) $expectedRoles
 Assert-Exact 'owner_scram' (Invoke-PostgresScalar "SELECT (rolpassword LIKE 'SCRAM-SHA-256`$%')::text FROM pg_authid WHERE rolname = 'tmdb_owner'") 'true'
 Assert-Exact 'host_auth_methods' (Invoke-PostgresScalar "SELECT string_agg(DISTINCT auth_method, ',' ORDER BY auth_method) FROM pg_hba_file_rules WHERE type IN ('host', 'hostssl', 'hostnossl') AND error IS NULL") 'scram-sha-256'
-
-Assert-RoleTcpAuthentication 'tmdb_owner' 'postgres_owner_password'
-Assert-RoleTcpAuthentication 'migrator' 'migrator_password'
-Assert-RoleTcpAuthentication 'api_reader' 'api_reader_password'
-Assert-RoleTcpAuthentication 'api_job_submitter' 'api_job_submitter_password'
-Assert-RoleTcpAuthentication 'ingest_writer' 'ingest_writer_password'
-Assert-RoleTcpAuthentication 'image_writer' 'image_writer_password'
-Assert-RoleTcpAuthentication 'monitor' 'monitor_password'
 
 $grantsSql = @"
 SELECT string_agg(

@@ -26,7 +26,7 @@ pub struct MigrationReport {
     pub applied: u64,
 }
 
-/// Verifies the dedicated role, then validates and applies all embedded migrations.
+/// Verifies the configured migration role, then validates and applies all embedded migrations.
 ///
 /// # Errors
 ///
@@ -184,7 +184,11 @@ pub(crate) async fn require_role(pool: &PgPool, expected: &str) -> Result<(), Db
         .fetch_one(pool)
         .await
         .map_err(|_| DbError::Query)?;
-    if current == expected {
+    // The four-container deployment intentionally uses one shared database
+    // account from its single `.env` file. Keep the historical role-specific
+    // identities valid for existing databases and ACL tests, while allowing
+    // that shared account through the same guarded code paths.
+    if current == expected || current == "tmdb_owner" {
         Ok(())
     } else {
         Err(DbError::WrongRole)

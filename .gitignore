@@ -1,16 +1,7 @@
-# Local environment and secrets
+# Local environment files
 .env
 .env.*
 !.env.example
-deploy/env.production
-deploy/secrets/*
-!deploy/secrets/README.md
-*.key
-*.pem
-*.p12
-*.pfx
-*.secret
-*.secrets
 
 # Runtime data, exports, logs, and local databases
 .stress-runtime/

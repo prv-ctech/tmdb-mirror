@@ -1,21 +1,14 @@
-# Four-container deployment.  Only the left-hand side of the bind mounts is
-# deployment configuration; the application always sees /media and /config.
-# Edit these host paths in Unraid/Compose as needed.  They are intentionally
-# not environment variables consumed by any application process.
+# Canonical four-container deployment.
+# Put all application settings in the root .env. Edit only the host side of
+# bind mounts here; the application paths remain /media and /config.
+
 services:
   postgres:
     image: postgres:18-bookworm@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296
     restart: unless-stopped
-    # PostgreSQL parallel workers use POSIX shared memory. Docker's 64 MiB
-    # default is exhausted by a burst of independent API reads; keep this
-    # deployment-level setting outside application configuration.
+    env_file:
+      - ../.env
     shm_size: 2gb
-    environment:
-      POSTGRES_DB: tmdb
-      POSTGRES_USER: tmdb_owner
-      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_owner_password
-      POSTGRES_INITDB_ARGS: --data-checksums --encoding=UTF8 --auth-host=scram-sha-256
-      PGDATA: /var/lib/postgresql/18/docker
     command:
       - postgres
       - -c
@@ -41,7 +34,6 @@ services:
       - -c
       - effective_io_concurrency=256
     volumes:
-      # PostgreSQL data stays on the selected SSD/array path, not /config.
       - type: bind
         source: ./data/postgres18
         target: /var/lib/postgresql
@@ -51,14 +43,6 @@ services:
         source: ../infra/postgres/initdb
         target: /docker-entrypoint-initdb.d
         read_only: true
-    secrets:
-      - postgres_owner_password
-      - migrator_password
-      - api_reader_password
-      - api_job_submitter_password
-      - ingest_writer_password
-      - image_writer_password
-      - monitor_password
     healthcheck:
       test: [CMD, pg_isready, -U, tmdb_owner, -d, tmdb, -h, 127.0.0.1]
       interval: 5s
@@ -73,27 +57,11 @@ services:
       dockerfile: Dockerfile
     image: tmdb-api:compact
     restart: unless-stopped
+    env_file:
+      - ../.env
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
-      TMDB_ENVIRONMENT: production
-      TMDB_API_BIND: 0.0.0.0:8080
-      TMDB_ADMIN_BIND: 0.0.0.0:8081
-      TMDB_API_KEY_FILE: /run/secrets/tmdb_api_key
-      TMDB_DIRECT_DB_HOST: postgres
-      TMDB_DIRECT_DB_PORT: 5432
-      TMDB_DIRECT_DB_NAME: tmdb
-      TMDB_DIRECT_DB_USER: api_reader
-      TMDB_DIRECT_DB_PASSWORD_FILE: /run/secrets/api_reader_password
-      TMDB_POOLED_DB_HOST: postgres
-      TMDB_POOLED_DB_PORT: 5432
-      TMDB_POOLED_DB_NAME: tmdb
-      TMDB_POOLED_DB_USER: api_reader
-      TMDB_POOLED_DB_PASSWORD_FILE: /run/secrets/api_reader_password
-      ALLOW_LOCAL_MEDIA: ${ALLOW_LOCAL_MEDIA:-true}
-      TMDB_MEDIA_BASE_URL: ${TMDB_MEDIA_BASE_URL:-http://127.0.0.1:8090/media}
-    secrets: [api_reader_password, tmdb_api_key]
     ports:
       - "8080:8080"
     read_only: true
@@ -115,34 +83,12 @@ services:
       dockerfile: Dockerfile
     image: tmdb-worker:compact
     restart: unless-stopped
+    env_file:
+      - ../.env
+    entrypoint: [/usr/local/bin/tmdb-worker]
     depends_on:
       postgres:
         condition: service_healthy
-    entrypoint: [/usr/local/bin/tmdb-worker]
-    environment:
-      TMDB_ENVIRONMENT: production
-      TMDB_MIGRATOR_DB_HOST: postgres
-      TMDB_MIGRATOR_DB_PORT: 5432
-      TMDB_MIGRATOR_DB_NAME: tmdb
-      TMDB_MIGRATOR_DB_USER: migrator
-      TMDB_MIGRATOR_DB_PASSWORD_FILE: /run/secrets/migrator_password
-      TMDB_DIRECT_DB_HOST: postgres
-      TMDB_DIRECT_DB_PORT: 5432
-      TMDB_DIRECT_DB_NAME: tmdb
-      TMDB_DIRECT_DB_USER: ingest_writer
-      TMDB_DIRECT_DB_PASSWORD_FILE: /run/secrets/ingest_writer_password
-      TMDB_API_BASE_URL: https://api.themoviedb.org/3
-      TMDB_READ_ACCESS_TOKEN_FILE: /run/secrets/tmdb_read_access_token
-      TMDB_RATE_LIMIT: 45
-      TMDB_MAX_CONNECTIONS: 20
-      TMDB_MAX_ATTEMPTS: 4
-      TMDB_REQUEST_TIMEOUT_SECONDS: 30
-      TMDB_WORKER_ID: tmdb-worker-primary
-      TMDB_ENABLE_SCHEDULER: "true"
-      TMDB_SCHEDULER_INTERVAL_SECONDS: 60
-      TMDB_ENABLE_DAILY_EXPORT: ${TMDB_ENABLE_DAILY_EXPORT:-true}
-      ALLOW_LOCAL_MEDIA: ${ALLOW_LOCAL_MEDIA:-true}
-    secrets: [migrator_password, ingest_writer_password, tmdb_read_access_token]
     volumes:
       - type: bind
         source: ./data/config
@@ -162,22 +108,12 @@ services:
       dockerfile: Dockerfile
     image: tmdb-media:compact
     restart: unless-stopped
+    env_file:
+      - ../.env
+    entrypoint: [/usr/local/bin/tmdb-images]
     depends_on:
       postgres:
         condition: service_healthy
-    entrypoint: [/usr/local/bin/tmdb-images]
-    environment:
-      TMDB_ENVIRONMENT: production
-      TMDB_DIRECT_DB_HOST: postgres
-      TMDB_DIRECT_DB_PORT: 5432
-      TMDB_DIRECT_DB_NAME: tmdb
-      TMDB_DIRECT_DB_USER: image_writer
-      TMDB_DIRECT_DB_PASSWORD_FILE: /run/secrets/image_writer_password
-      TMDB_WORKER_ID: tmdb-media-primary
-      TMDB_TRAWL_BASE_URL: ${TMDB_TRAWL_BASE_URL:-http://trawl.example.invalid:8191}
-      ALLOW_LOCAL_MEDIA: ${ALLOW_LOCAL_MEDIA:-true}
-      TMDB_MEDIA_BIND: 0.0.0.0:8090
-    secrets: [image_writer_password]
     volumes:
       - type: bind
         source: ./data/media
@@ -203,28 +139,6 @@ services:
       retries: 12
       start_period: 10s
     networks: [tmdb-private]
-
-secrets:
-  # Keep secret files outside the repository and provide 43-byte base64url
-  # values.  The host-side secret directory is a deployment setting.
-  postgres_owner_password:
-    file: ./secrets/postgres_owner_password
-  migrator_password:
-    file: ./secrets/migrator_password
-  api_reader_password:
-    file: ./secrets/api_reader_password
-  api_job_submitter_password:
-    file: ./secrets/api_job_submitter_password
-  ingest_writer_password:
-    file: ./secrets/ingest_writer_password
-  image_writer_password:
-    file: ./secrets/image_writer_password
-  monitor_password:
-    file: ./secrets/monitor_password
-  tmdb_read_access_token:
-    file: ./secrets/tmdb_read_access_token
-  tmdb_api_key:
-    file: ./secrets/tmdb_api_key
 
 networks:
   tmdb-private:

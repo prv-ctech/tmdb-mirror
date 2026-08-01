@@ -16,7 +16,6 @@ Set-StrictMode -Version Latest
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $composeFile = Join-Path $repoRoot 'deploy/compose.stress.yaml'
 $runtimeRoot = Join-Path (Join-Path $repoRoot '.stress-runtime') $ProjectName
-$secretRoot = Join-Path $runtimeRoot 'secrets'
 $envFile = Join-Path $runtimeRoot 'compose.env'
 $metadataFile = Join-Path $runtimeRoot 'metadata.json'
 $appImage = 'tmdb-stress-app:local'
@@ -44,21 +43,6 @@ function Write-Utf8NoBom {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Value)
     $encoding = [System.Text.UTF8Encoding]::new($false)
     [System.IO.File]::WriteAllText($Path, $Value, $encoding)
-}
-
-function New-Secret {
-    $bytes = New-Object byte[] 32
-    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
-    return [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
-}
-
-function Assert-RoleSecret {
-    param([Parameter(Mandatory)][string]$Path)
-    $bytes = [System.IO.File]::ReadAllBytes($Path)
-    if ($bytes.Length -ne 43) { throw "Generated role secret has an invalid length: $Path" }
-    $value = [System.Text.Encoding]::ASCII.GetString($bytes)
-    if ($value -cnotmatch '^[A-Za-z0-9_-]{43}$') { throw "Generated role secret has an invalid format: $Path" }
 }
 
 function Assert-PortAvailable {
@@ -117,13 +101,20 @@ function Wait-Migrations {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         try {
-            $password = (Invoke-Compose -Arguments @('exec', '-T', 'postgres', 'cat', '/run/secrets/postgres_owner_password')).Trim()
-            $version = (Invoke-Compose -Arguments @(
+            $password = (Invoke-Compose -Arguments @('exec', '-T', 'postgres', 'printenv', 'POSTGRES_PASSWORD')).Trim()
+            $migrationsExist = (Invoke-Compose -Arguments @(
                 'exec', '-T', '-e', "PGPASSWORD=$password", 'postgres', 'psql', '-X', '-At',
                 '--username', 'tmdb_owner', '--dbname', 'tmdb', '-c',
-                "SELECT COALESCE(max(version), 0) FROM ops._sqlx_migrations WHERE success"
+                "SELECT to_regclass('ops._sqlx_migrations') IS NOT NULL"
             )).Trim()
-            if ([int]$version -ge 17) { return }
+            if ($migrationsExist -eq 't') {
+                $version = (Invoke-Compose -Arguments @(
+                    'exec', '-T', '-e', "PGPASSWORD=$password", 'postgres', 'psql', '-X', '-At',
+                    '--username', 'tmdb_owner', '--dbname', 'tmdb', '-c',
+                    "SELECT COALESCE(max(version), 0) FROM ops._sqlx_migrations WHERE success"
+                )).Trim()
+                if ([int]$version -ge 17) { return }
+            }
         }
         catch {
             # The worker may still be opening its migration connection.
@@ -162,36 +153,43 @@ foreach ($port in @($ApiPort, $AdminPort, $ImagePort, $PostgresPort)) { Assert-P
 $null = Invoke-DockerChecked -Arguments @('version', '--format', '{{.Server.Version}}')
 
 try {
-    New-Item -ItemType Directory -Force -Path $secretRoot | Out-Null
-    $roleSecrets = @(
-        'postgres_owner_password', 'migrator_password', 'api_reader_password',
-        'api_job_submitter_password', 'ingest_writer_password', 'image_writer_password',
-        'monitor_password', 'tmdb_api_key'
-    )
-    foreach ($name in $roleSecrets) {
-        $path = Join-Path $secretRoot $name
-        Write-Utf8NoBom -Path $path -Value (New-Secret)
-        if ($name -ne 'tmdb_api_key') { Assert-RoleSecret -Path $path }
-    }
-    # The token is deliberately written only to the ignored runtime secret
-    # directory and is never included in compose.env, metadata, logs, or git.
-    Write-Utf8NoBom -Path (Join-Path $secretRoot 'tmdb_read_access_token') -Value $TmdbReadToken.Trim()
-
-    $secretRootForCompose = $secretRoot.Replace('\', '/')
+    New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
+    $envFileForCompose = $envFile.Replace('\', '/')
     $envText = @(
         "TMDB_STRESS_PROJECT=$ProjectName",
-        "TMDB_STRESS_SECRET_ROOT=$secretRootForCompose",
+        "TMDB_STRESS_ENV_FILE=$envFileForCompose",
         "TMDB_STRESS_APP_IMAGE=$appImage",
         "TMDB_STRESS_API_PORT=$ApiPort",
         "TMDB_STRESS_ADMIN_PORT=$AdminPort",
         "TMDB_STRESS_IMAGE_PORT=$ImagePort",
         "TMDB_STRESS_PG_PORT=$PostgresPort",
+        'TMDB_ENVIRONMENT=test',
+        'POSTGRES_DB=tmdb',
+        'POSTGRES_USER=tmdb_owner',
+        'POSTGRES_PASSWORD=tmdb-stress',
+        'PGDATA=/var/lib/postgresql/18/docker',
+        'POSTGRES_INITDB_ARGS=--data-checksums --encoding=UTF8 --auth-host=scram-sha-256',
+        'DATABASE_HOST=postgres',
+        'DATABASE_PORT=5432',
+        'DATABASE_NAME=tmdb',
+        'DATABASE_USER=tmdb_owner',
+        'TMDB_API_BIND=0.0.0.0:8080',
+        'TMDB_ADMIN_BIND=0.0.0.0:8081',
+        'TMDB_MEDIA_BIND=0.0.0.0:8090',
+        'TMDB_ADMIN_API_KEY=test-admin-key-placeholder-0123456789',
+        "TMDB_READ_ACCESS_TOKEN=$($TmdbReadToken.Trim())",
         'TMDB_API_BASE_URL=https://api.themoviedb.org/3',
-        # Keep this aligned with crates/tmdb-upstream/src/policy.rs.
+        "TMDB_MEDIA_BASE_URL=http://127.0.0.1:$ImagePort/media",
         'TMDB_RATE_LIMIT=40',
         'TMDB_MAX_CONNECTIONS=20',
         'TMDB_MAX_ATTEMPTS=4',
         'TMDB_REQUEST_TIMEOUT_SECONDS=30',
+        'TMDB_DAILY_EXPORT_MAX_BYTES=536870912',
+        'TMDB_WORKER_ID=tmdb-stress-worker',
+        'TMDB_IMAGE_WORKER_ID=tmdb-stress-media',
+        'TMDB_WORKER_LEASE_SECONDS=60',
+        'TMDB_WORKER_HEARTBEAT_SECONDS=15',
+        'TMDB_WORKER_IDLE_POLL_MS=100',
         'TMDB_STRESS_PG_MAX_CONNECTIONS=120',
         'TMDB_STRESS_PG_SHARED_BUFFERS=2GB',
         'TMDB_STRESS_PG_EFFECTIVE_CACHE_SIZE=8GB',
@@ -199,6 +197,7 @@ try {
         'TMDB_STRESS_PG_MAINTENANCE_WORK_MEM=512MB',
         'ALLOW_LOCAL_MEDIA=true',
         'TMDB_ENABLE_SCHEDULER=true',
+        'TMDB_SCHEDULER_INTERVAL_SECONDS=60',
         'TMDB_ENABLE_DAILY_EXPORT=false'
     )
     if (-not [string]::IsNullOrWhiteSpace($TrawlBaseUrl)) {
@@ -254,8 +253,6 @@ try {
     Write-Output "Runtime metadata: $metadataFile"
 }
 finally {
-    # Do not leave the supplied credential in this PowerShell process after
-    # bootstrap, even when a build or health check fails.
     $TmdbReadToken = $null
     $TrawlBaseUrl = $null
     if (Test-Path Env:TMDB_STRESS_READ_TOKEN) { Remove-Item Env:TMDB_STRESS_READ_TOKEN -ErrorAction SilentlyContinue }

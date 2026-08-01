@@ -51,7 +51,6 @@ if ($violations.Count -gt 0) {
 $ignoredProbes = @(
     '.env',
     '.stress-runtime/example/token',
-    'deploy/secrets/example-secret',
     'target/debug/example',
     'example.log'
 )
@@ -60,11 +59,6 @@ foreach ($probe in $ignoredProbes) {
     if ($LASTEXITCODE -ne 0) {
         throw "Git ignore policy does not cover generated path: $probe"
     }
-}
-
-& git -C $repoRoot check-ignore --no-index --quiet -- deploy/secrets/README.md
-if ($LASTEXITCODE -eq 0) {
-    throw 'The tracked deploy/secrets/README.md must remain visible to Git.'
 }
 
 Write-Output "Repository hygiene passed for $($trackedFiles.Count) tracked files."

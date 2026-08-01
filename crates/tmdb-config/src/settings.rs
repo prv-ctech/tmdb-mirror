@@ -4,7 +4,7 @@ use std::str::FromStr;
 use http::Uri;
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::secret::{SecretOrigin, load_secret_with_origin};
+use crate::secret::load_secret_with_origin;
 use crate::{ConfigError, ConfigSource, StorageRoots};
 
 /// Deployment environment controlling secret policy.
@@ -32,7 +32,7 @@ impl FromStr for Environment {
 }
 
 /// One bounded `PostgreSQL` connection identity.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DatabaseConfig {
     /// `PostgreSQL` host name.
     pub host: String,
@@ -64,7 +64,7 @@ pub struct AppConfig {
     /// Optional private Trawl service endpoint.
     pub trawl_base_url: Option<Uri>,
     /// Optional API key used to protect the private administrative listener.
-    /// Production configuration must provide this through `TMDB_API_KEY_FILE`.
+    /// Production configuration must provide this through `TMDB_ADMIN_API_KEY`.
     pub admin_api_key: Option<SecretString>,
 }
 
@@ -72,11 +72,12 @@ impl AppConfig {
     /// Loads and validates all application configuration from one source.
     ///
     /// The environment keys are `TMDB_ENVIRONMENT`, `TMDB_API_BIND`,
-    /// `TMDB_ADMIN_BIND`, `TMDB_{DIRECT,POOLED}_DB_{HOST,PORT,NAME,USER}`,
-    /// password fields with optional `_FILE` indirection, and optional
-    /// `TMDB_TRAWL_BASE_URL`.  Filesystem roots are fixed to `/media` and
-    /// `/config` (with their application subdirectories); host paths are
-    /// selected only by deployment volume mappings and are never read here.
+    /// `TMDB_ADMIN_BIND`, and the shared `TMDB_DB_*` database settings. The
+    /// legacy `TMDB_DIRECT_DB_*` and `TMDB_POOLED_DB_*` names remain accepted
+    /// for existing callers. Database and API credentials may be supplied
+    /// directly in the environment; optional `_FILE` indirection is retained
+    /// only for compatibility. Filesystem roots are fixed to `/media` and
+    /// `/config` and are selected only by deployment volume mappings.
     ///
     /// # Errors
     ///
@@ -87,13 +88,18 @@ impl AppConfig {
         let environment = parse_required(source, "TMDB_ENVIRONMENT")?;
         let api_bind = parse_required(source, "TMDB_API_BIND")?;
         let admin_bind = parse_required(source, "TMDB_ADMIN_BIND")?;
-        let direct_database = load_database(source, environment, "TMDB_DIRECT_DB")?;
-        let pooled_database = load_database(source, environment, "TMDB_POOLED_DB")?;
+        let direct_database = load_database_or_shared(source, environment, "TMDB_DIRECT_DB")?;
+        let pooled_database = load_database_or_shared(source, environment, "TMDB_POOLED_DB")?;
         let storage_roots = StorageRoots::fixed();
         let trawl_base_url = optional_uri(source, "TMDB_TRAWL_BASE_URL")?;
-        let admin_api_key = optional_secret(source, environment, "TMDB_API_KEY")?;
+        let admin_key_name = if has_secret_source(source, "TMDB_ADMIN_API_KEY") {
+            "TMDB_ADMIN_API_KEY"
+        } else {
+            "TMDB_API_KEY"
+        };
+        let admin_api_key = optional_secret(source, environment, admin_key_name)?;
         if environment == Environment::Production && admin_api_key.is_none() {
-            return Err(ConfigError::Missing("TMDB_API_KEY".to_owned()));
+            return Err(ConfigError::Missing("TMDB_ADMIN_API_KEY".to_owned()));
         }
 
         Ok(Self {
@@ -117,11 +123,8 @@ fn optional_secret(
     if source.get(name).is_none() && source.get(&format!("{name}_FILE")).is_none() {
         return Ok(None);
     }
-    let (secret, origin) = load_secret_with_origin(source, name)?;
-    if environment == Environment::Production && origin == SecretOrigin::Direct {
-        return Err(ConfigError::InlineSecretForbidden(name.to_owned()));
-    }
-    if name == "TMDB_API_KEY" && secret.expose_secret().len() < 32 {
+    let (secret, _origin) = load_secret_with_origin(source, name)?;
+    if matches!(name, "TMDB_API_KEY" | "TMDB_ADMIN_API_KEY") && secret.expose_secret().len() < 32 {
         return Err(ConfigError::InvalidValue(name.to_owned()));
     }
     if environment != Environment::Production && is_known_example(&secret) {
@@ -130,7 +133,24 @@ fn optional_secret(
     Ok(Some(secret))
 }
 
-fn load_database(
+fn load_database_or_shared(
+    source: &impl ConfigSource,
+    environment: Environment,
+    prefix: &str,
+) -> Result<DatabaseConfig, ConfigError> {
+    if source.get(&format!("{prefix}_HOST")).is_none()
+        && source.get(&format!("{prefix}_PORT")).is_none()
+        && source.get(&format!("{prefix}_NAME")).is_none()
+        && source.get(&format!("{prefix}_USER")).is_none()
+        && !has_secret_source(source, &format!("{prefix}_PASSWORD"))
+    {
+        return load_shared_database(source, environment);
+    }
+
+    load_prefixed_database(source, environment, prefix)
+}
+
+fn load_prefixed_database(
     source: &impl ConfigSource,
     environment: Environment,
     prefix: &str,
@@ -140,11 +160,7 @@ fn load_database(
     let database_name = format!("{prefix}_NAME");
     let user_name = format!("{prefix}_USER");
     let password_name = format!("{prefix}_PASSWORD");
-    let (password, origin) = load_secret_with_origin(source, &password_name)?;
-
-    if environment == Environment::Production && origin == SecretOrigin::Direct {
-        return Err(ConfigError::InlineSecretForbidden(password_name));
-    }
+    let (password, _origin) = load_secret_with_origin(source, &password_name)?;
     if environment != Environment::Production && is_known_example(&password) {
         return Err(ConfigError::ExampleSecretForbidden(password_name));
     }
@@ -156,6 +172,74 @@ fn load_database(
         username: required_string(source, &user_name)?,
         password,
     })
+}
+
+/// Loads one shared database identity for the API and both workers.
+///
+/// `TMDB_DB_*` values take precedence. `DATABASE_*` aliases and the standard
+/// `POSTGRES_*` names are accepted so a single Compose `env_file` can be used
+/// without repeating the same settings per service.
+pub fn load_shared_database(
+    source: &impl ConfigSource,
+    environment: Environment,
+) -> Result<DatabaseConfig, ConfigError> {
+    let host = configured_string(source, &["TMDB_DB_HOST", "DATABASE_HOST"])?
+        .unwrap_or_else(|| "postgres".to_owned());
+    let port_text = configured_string(source, &["TMDB_DB_PORT", "DATABASE_PORT"])?
+        .unwrap_or_else(|| "5432".to_owned());
+    let port = port_text
+        .parse()
+        .map_err(|_| ConfigError::InvalidValue("TMDB_DB_PORT".to_owned()))?;
+    let database = configured_string(source, &["TMDB_DB_NAME", "DATABASE_NAME", "POSTGRES_DB"])?
+        .unwrap_or_else(|| "tmdb".to_owned());
+    let username = configured_string(source, &["TMDB_DB_USER", "DATABASE_USER", "POSTGRES_USER"])?
+        .unwrap_or_else(|| "tmdb_owner".to_owned());
+    let password_name = [
+        "TMDB_DB_PASSWORD",
+        "DATABASE_PASSWORD",
+        "POSTGRES_PASSWORD",
+        "TMDB_DIRECT_DB_PASSWORD",
+    ]
+    .into_iter()
+    .find(|name| has_secret_source(source, name))
+    .ok_or_else(|| ConfigError::Missing("POSTGRES_PASSWORD".to_owned()))?;
+    let (password, _origin) = load_secret_with_origin(source, password_name)?;
+    if environment != Environment::Production && is_known_example(&password) {
+        return Err(ConfigError::ExampleSecretForbidden(
+            password_name.to_owned(),
+        ));
+    }
+
+    Ok(DatabaseConfig {
+        host,
+        port,
+        database,
+        username,
+        password,
+    })
+}
+
+fn configured_string(
+    source: &impl ConfigSource,
+    names: &[&str],
+) -> Result<Option<String>, ConfigError> {
+    for name in names {
+        let Some(value) = source.get(name) else {
+            continue;
+        };
+        let value = value
+            .into_string()
+            .map_err(|_| ConfigError::InvalidUnicode((*name).to_owned()))?;
+        if value.is_empty() || value.contains('\0') {
+            return Err(ConfigError::InvalidValue((*name).to_owned()));
+        }
+        return Ok(Some(value));
+    }
+    Ok(None)
+}
+
+fn has_secret_source(source: &impl ConfigSource, name: &str) -> bool {
+    source.get(name).is_some() || source.get(&format!("{name}_FILE")).is_some()
 }
 
 fn is_known_example(secret: &SecretString) -> bool {

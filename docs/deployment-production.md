@@ -43,22 +43,17 @@ No `TMDB_MEDIA_HOST_ROOT`, `TMDB_WORK_HOST_ROOT`, `TMDB_MEDIA_ROOT`,
 `TMDB_WORK_ROOT`, or similar host-path environment variable is read by the
 application.
 
-## Secrets and startup
+## Environment and startup
 
-Create the file-backed secrets referenced by `deploy/compose.compact.yaml` in
-`deploy/secrets/` (or change those deployment-only file mappings). The root
-`docker-compose-example.yaml` uses the same filenames and is the easiest file
-to inspect when learning the topology. Database role secrets are 43-byte
-base64url values without a trailing newline. Keep the TMDB read token and API
-key file-backed and outside source control.
-
-Copy `deploy/env.production.example` to the ignored `deploy/env.production`,
-replace its reserved example hostnames, and use that file for Compose:
+Copy the root environment template, replace its angle-bracket values, and keep
+that `.env` file outside source control. It contains the single PostgreSQL
+password, TMDB read token, and admin API key used by the stack. The same file is
+passed to all four containers through `env_file`.
 
 ```powershell
-Copy-Item deploy/env.production.example deploy/env.production
-./scripts/validate-production-compose.ps1
-docker compose --env-file deploy/env.production -f deploy/compose.production.yaml up -d --build
+Copy-Item .env.example .env
+./scripts/validate-production-compose.ps1 -EnvFile .env -ComposeFile deploy/compose.compact.yaml
+docker compose -f deploy/compose.production.yaml up -d --build
 ```
 
 The main worker applies migrations under the existing PostgreSQL advisory lock;

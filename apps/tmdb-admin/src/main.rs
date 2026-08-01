@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
-use tmdb_config::{DatabaseConfig, EnvSource, Environment, load_secret_for_environment};
+use tmdb_config::{EnvSource, Environment, load_shared_database};
 use tmdb_db::{PoolPolicy, ReadinessReport, connect_direct, migrate, readiness};
 use tmdb_jobs::{JobId, JobRepository, NewJob};
 use tmdb_upstream::DailyExportParser;
@@ -19,21 +19,21 @@ struct Cli {
 
 #[derive(Debug, Args)]
 struct DatabaseArgs {
-    #[arg(long, env = "TMDB_ENVIRONMENT")]
+    #[arg(long, env = "TMDB_ENVIRONMENT", default_value = "development")]
     environment: Environment,
-    #[arg(long, env = "TMDB_DIRECT_DB_HOST")]
+    #[arg(long, env = "DATABASE_HOST", default_value = "postgres")]
     host: String,
-    #[arg(long, env = "TMDB_DIRECT_DB_PORT", default_value_t = 5432)]
+    #[arg(long, env = "DATABASE_PORT", default_value_t = 5432)]
     port: u16,
-    #[arg(long, env = "TMDB_DIRECT_DB_NAME")]
+    #[arg(long, env = "DATABASE_NAME", default_value = "tmdb")]
     database: String,
-    #[arg(long, env = "TMDB_DIRECT_DB_USER")]
+    #[arg(long, env = "DATABASE_USER", default_value = "tmdb_owner")]
     username: String,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Apply embedded migrations as the dedicated migrator role.
+    /// Apply embedded migrations with the configured database account.
     Migrate,
     /// Check `PostgreSQL` compatibility, migrations, extensions, and read-only access.
     Doctor {
@@ -90,27 +90,19 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let username = cli.database.username.clone();
-    let config = DatabaseConfig {
-        host: cli.database.host,
-        port: cli.database.port,
-        database: cli.database.database,
-        username,
-        password: load_secret_for_environment(
-            &EnvSource,
-            "TMDB_DIRECT_DB_PASSWORD",
-            cli.database.environment,
-        )?,
-    };
+    let mut config = load_shared_database(&EnvSource, cli.database.environment)?;
+    config.host = cli.database.host;
+    config.port = cli.database.port;
+    config.database = cli.database.database;
+    config.username = username;
 
     match cli.command {
         Command::Migrate => {
-            require_role(&cli.database.username, "migrator")?;
             let pool = connect_direct(&config, PoolPolicy::Migrator).await?;
             let report = migrate(&pool).await?;
             println!("{}", serde_json::to_string(&report)?);
         }
         Command::Doctor { json: true } => {
-            require_role(&cli.database.username, "api_reader")?;
             let pool = connect_direct(&config, PoolPolicy::ReadOnly).await?;
             let report = doctor(&pool).await?;
             println!("{}", serde_json::to_string(&report)?);
@@ -119,7 +111,6 @@ async fn main() -> anyhow::Result<()> {
             anyhow::bail!("doctor requires --json");
         }
         Command::SubmitNoop { dedup_key } => {
-            require_role(&cli.database.username, "api_job_submitter")?;
             let pool = connect_direct(&config, PoolPolicy::ReadWrite).await?;
             let outcome = JobRepository::new(pool)
                 .submit(NewJob::noop(&dedup_key)?)
@@ -136,7 +127,6 @@ async fn main() -> anyhow::Result<()> {
             media_type,
             tmdb_id,
         } => {
-            require_role(&cli.database.username, "api_job_submitter")?;
             let (job_type, payload) = refresh_job(&media_type, tmdb_id)?;
             let pool = connect_direct(&config, PoolPolicy::ReadWrite).await?;
             let outcome = JobRepository::new(pool)
@@ -158,7 +148,6 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         Command::SubmitDailyExport { media_type, url } => {
-            require_role(&cli.database.username, "api_job_submitter")?;
             let media_type = validate_media_type(&media_type)?;
             let job_type = "ingest.daily_export";
             let payload = serde_json::json!({"media_type": media_type, "url": url});
@@ -183,10 +172,6 @@ async fn main() -> anyhow::Result<()> {
             media_type,
             queue_limit,
         } => {
-            require_any_role(
-                &cli.database.username,
-                &["api_job_submitter", "ingest_writer"],
-            )?;
             let (job_type, media_type) = refresh_job_type(&media_type)?;
             let parser = DailyExportParser::default();
             let full_records = parser.count_file(&path)?;
@@ -231,7 +216,6 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         Command::JobStatus { job_id } => {
-            require_role(&cli.database.username, "api_job_submitter")?;
             let job_id =
                 Uuid::parse_str(&job_id).map_err(|_| anyhow::anyhow!("invalid job UUID"))?;
             let pool = connect_direct(&config, PoolPolicy::ReadOnly).await?;
@@ -318,22 +302,6 @@ async fn doctor(pool: &sqlx::PgPool) -> anyhow::Result<DoctorReport> {
             readiness_select: grants.2,
         },
     })
-}
-
-fn require_role(actual: &str, expected: &str) -> anyhow::Result<()> {
-    if actual == expected {
-        Ok(())
-    } else {
-        anyhow::bail!("this command requires the {expected} database role")
-    }
-}
-
-fn require_any_role(actual: &str, expected: &[&str]) -> anyhow::Result<()> {
-    if expected.contains(&actual) {
-        Ok(())
-    } else {
-        anyhow::bail!("this command requires one of the approved database roles")
-    }
 }
 
 fn validate_media_type(value: &str) -> anyhow::Result<&str> {

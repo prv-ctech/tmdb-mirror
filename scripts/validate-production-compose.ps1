@@ -11,7 +11,7 @@ Set-StrictMode -Version Latest
 # default expressions are evaluated before that automatic variable is usable
 # when the script is invoked from another working directory.
 if ([string]::IsNullOrWhiteSpace($EnvFile)) {
-    $EnvFile = Join-Path $PSScriptRoot '..\deploy\env.production'
+    $EnvFile = Join-Path $PSScriptRoot '..\.env'
 }
 if ([string]::IsNullOrWhiteSpace($ComposeFile)) {
     $ComposeFile = Join-Path $PSScriptRoot '..\deploy\compose.compact.yaml'
@@ -44,7 +44,11 @@ foreach ($line in Get-Content -LiteralPath $envPath) {
     }
 }
 
-$requiredKeys = @('COMPOSE_PROJECT_NAME', 'ALLOW_LOCAL_MEDIA', 'TMDB_MEDIA_BASE_URL')
+$requiredKeys = @(
+    'TMDB_ENVIRONMENT', 'POSTGRES_DB', 'POSTGRES_USER', 'POSTGRES_PASSWORD',
+    'TMDB_READ_ACCESS_TOKEN', 'TMDB_ADMIN_API_KEY', 'ALLOW_LOCAL_MEDIA',
+    'TMDB_MEDIA_BASE_URL'
+)
 foreach ($key in $requiredKeys) {
     if (-not $entries.ContainsKey($key) -or [string]::IsNullOrWhiteSpace($entries[$key])) {
         throw "Required deployment setting is missing: $key"

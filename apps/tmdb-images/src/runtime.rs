@@ -8,14 +8,12 @@ use crate::image::{
 };
 use crate::media_server;
 use crate::persistence::persist_ready;
-use anyhow::{Context, bail};
+use anyhow::Context;
 use async_trait::async_trait;
 use reqwest::Url;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tmdb_config::{
-    ConfigSource, DatabaseConfig, EnvSource, Environment, load_secret_for_environment,
-};
+use tmdb_config::{ConfigSource, EnvSource, Environment, load_shared_database};
 use tmdb_db::{PoolPolicy, connect_direct};
 use tmdb_jobs::{
     ClaimedJob, JobExecutionError, JobExecutor, JobRepository, Worker, WorkerConfig, WorkerId,
@@ -32,7 +30,7 @@ pub async fn run() -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!(error))?;
     let source = EnvSource;
     let environment = load_environment(source)?;
-    let database = load_database(source, "image_writer", environment)?;
+    let database = load_shared_database(&source, environment)?;
     let worker_config = load_worker_config(source, "tmdb-images")?;
     let store = load_image_store()?;
     let downloader = load_downloader(source)?;
@@ -237,24 +235,6 @@ fn load_downloader(source: EnvSource) -> anyhow::Result<ImageDownloader<ReqwestT
     }
 }
 
-fn load_database(
-    source: EnvSource,
-    expected_role: &str,
-    environment: Environment,
-) -> anyhow::Result<DatabaseConfig> {
-    let username = required(source, "TMDB_DIRECT_DB_USER")?;
-    if username != expected_role {
-        bail!("TMDB_DIRECT_DB_USER must select the {expected_role} role");
-    }
-    Ok(DatabaseConfig {
-        host: required(source, "TMDB_DIRECT_DB_HOST")?,
-        port: parse(source, "TMDB_DIRECT_DB_PORT")?,
-        database: required(source, "TMDB_DIRECT_DB_NAME")?,
-        username,
-        password: load_secret_for_environment(&source, "TMDB_DIRECT_DB_PASSWORD", environment)?,
-    })
-}
-
 fn load_environment(source: EnvSource) -> anyhow::Result<Environment> {
     required(source, "TMDB_ENVIRONMENT")?
         .parse()
@@ -286,15 +266,6 @@ fn required(source: EnvSource, name: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("missing configuration field {name}"))?
         .into_string()
         .map_err(|_| anyhow::anyhow!("configuration field {name} is not valid Unicode"))
-}
-
-fn parse<T>(source: EnvSource, name: &str) -> anyhow::Result<T>
-where
-    T: std::str::FromStr,
-{
-    required(source, name)?
-        .parse()
-        .map_err(|_| anyhow::anyhow!("configuration field {name} is invalid"))
 }
 
 fn parse_or<T>(source: EnvSource, name: &str, default: T) -> anyhow::Result<T>

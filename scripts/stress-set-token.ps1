@@ -13,15 +13,25 @@ if ([string]::IsNullOrWhiteSpace($TmdbReadToken)) {
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $runtimeRoot = Join-Path (Join-Path $repoRoot '.stress-runtime') $ProjectName
-$secretRoot = Join-Path $runtimeRoot 'secrets'
-$tokenPath = Join-Path $secretRoot 'tmdb_read_access_token'
-if (-not (Test-Path -LiteralPath $secretRoot -PathType Container)) {
-    throw "Stress runtime secrets are missing: $secretRoot. Run stress-bootstrap.ps1 first."
+$envFile = Join-Path $runtimeRoot 'compose.env'
+if (-not (Test-Path -LiteralPath $envFile -PathType Leaf)) {
+    throw "Stress runtime environment is missing: $envFile. Run stress-bootstrap.ps1 first."
 }
 
 try {
-    [IO.File]::WriteAllText($tokenPath, $TmdbReadToken.Trim() + "`n", [Text.UTF8Encoding]::new($false))
-    Write-Output "Updated the isolated runtime TMDB token at $tokenPath (value intentionally not displayed)."
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.AddRange([IO.File]::ReadAllLines($envFile, [Text.UTF8Encoding]::new($false)))
+    $index = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i].StartsWith('TMDB_READ_ACCESS_TOKEN=', [StringComparison]::Ordinal)) {
+            $index = $i
+            break
+        }
+    }
+    if ($index -lt 0) { throw 'TMDB_READ_ACCESS_TOKEN is missing from the stress environment.' }
+    $lines[$index] = "TMDB_READ_ACCESS_TOKEN=$($TmdbReadToken.Trim())"
+    [IO.File]::WriteAllLines($envFile, $lines, [Text.UTF8Encoding]::new($false))
+    Write-Output "Updated the isolated runtime token in $envFile (value not displayed)."
 }
 finally {
     $TmdbReadToken = $null

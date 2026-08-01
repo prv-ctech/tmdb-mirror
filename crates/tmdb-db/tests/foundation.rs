@@ -1,4 +1,4 @@
-use std::{fs, sync::Arc};
+use std::sync::Arc;
 
 use secrecy::SecretString;
 use sqlx::PgPool;
@@ -1422,7 +1422,8 @@ async fn migration_runner_rejects_every_role_other_than_migrator(
         };
         let debug = format!("{error:?}");
         assert!(!debug.contains("postgres://"));
-        let secret = role_secret(role).map_err(|_| test_error("role secret was not readable"))?;
+        let secret = test_database_password()
+            .map_err(|_| test_error("test database password was not configured"))?;
         assert!(!debug.contains(&secret));
     }
     Ok(())
@@ -1451,14 +1452,22 @@ async fn role_pool(database: &str, role: &str, policy: PoolPolicy) -> sqlx::Resu
         database: database.to_owned(),
         username: role.to_owned(),
         password: SecretString::from(
-            role_secret(role).map_err(|_| test_error("role secret was not readable"))?,
+            test_database_password()
+                .map_err(|_| test_error("test database password was not configured"))?,
         ),
     };
     connect_direct(&config, policy).await.map_err(db_error)
 }
 
-fn role_secret(role: &str) -> std::io::Result<String> {
-    fs::read_to_string(format!("/run/secrets/{role}_password"))
+fn test_database_password() -> std::io::Result<String> {
+    std::env::var("TMDB_TEST_DB_PASSWORD")
+        .or_else(|_| std::env::var("POSTGRES_PASSWORD"))
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "TMDB_TEST_DB_PASSWORD or POSTGRES_PASSWORD is required",
+            )
+        })
 }
 
 async fn current_user(pool: &PgPool) -> sqlx::Result<String> {

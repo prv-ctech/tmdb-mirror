@@ -1,19 +1,11 @@
-# Disposable four-container stress environment.  It deliberately uses named
-# volumes so it cannot touch production bind mounts.  The application still
-# sees only /media and /config; the volume names are test deployment details.
+# Disposable four-container stress environment. Runtime settings are written
+# once to the ignored compose.env file by stress-bootstrap.ps1.
 services:
   postgres:
     image: postgres:18-bookworm@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296
     restart: unless-stopped
-    # Exercise the same shared-memory contract as production. Without this,
-    # PostgreSQL's parallel workers hit Docker's 64 MiB /dev/shm at 100 clients.
+    env_file: ["${TMDB_STRESS_ENV_FILE:?TMDB_STRESS_ENV_FILE must be set}"]
     shm_size: 1gb
-    environment:
-      POSTGRES_DB: tmdb
-      POSTGRES_USER: tmdb_owner
-      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_owner_password
-      POSTGRES_INITDB_ARGS: --data-checksums --encoding=UTF8 --auth-host=scram-sha-256
-      PGDATA: /var/lib/postgresql/18/docker
     command:
       - postgres
       - -c
@@ -47,14 +39,6 @@ services:
     volumes:
       - tmdb_stress_pg18_data:/var/lib/postgresql
       - ../infra/postgres/initdb:/docker-entrypoint-initdb.d:ro
-    secrets:
-      - postgres_owner_password
-      - migrator_password
-      - api_reader_password
-      - api_job_submitter_password
-      - ingest_writer_password
-      - image_writer_password
-      - monitor_password
     healthcheck:
       test: [CMD, pg_isready, -U, tmdb_owner, -d, tmdb, -h, 127.0.0.1]
       interval: 2s
@@ -66,29 +50,10 @@ services:
   api:
     image: ${TMDB_STRESS_APP_IMAGE:-tmdb-stress-app:local}
     restart: on-failure
+    env_file: ["${TMDB_STRESS_ENV_FILE:?TMDB_STRESS_ENV_FILE must be set}"]
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
-      TMDB_ENVIRONMENT: test
-      TMDB_API_BIND: 0.0.0.0:8080
-      TMDB_ADMIN_BIND: 0.0.0.0:8081
-      TMDB_API_KEY_FILE: /run/secrets/tmdb_api_key
-      TMDB_DIRECT_DB_HOST: postgres
-      TMDB_DIRECT_DB_PORT: 5432
-      TMDB_DIRECT_DB_NAME: tmdb
-      TMDB_DIRECT_DB_USER: api_reader
-      TMDB_DIRECT_DB_PASSWORD_FILE: /run/secrets/api_reader_password
-      TMDB_POOLED_DB_HOST: postgres
-      TMDB_POOLED_DB_PORT: 5432
-      TMDB_POOLED_DB_NAME: tmdb
-      TMDB_POOLED_DB_USER: api_reader
-      TMDB_POOLED_DB_PASSWORD_FILE: /run/secrets/api_reader_password
-      ALLOW_LOCAL_MEDIA: ${ALLOW_LOCAL_MEDIA:-true}
-      TMDB_MEDIA_BASE_URL: http://127.0.0.1:${TMDB_STRESS_IMAGE_PORT:-18090}/media
-    secrets:
-      - api_reader_password
-      - tmdb_api_key
     ports:
       - 127.0.0.1:${TMDB_STRESS_API_PORT:-18080}:8080
       - 127.0.0.1:${TMDB_STRESS_ADMIN_PORT:-18081}:8081
@@ -108,41 +73,11 @@ services:
   worker:
     image: ${TMDB_STRESS_APP_IMAGE:-tmdb-stress-app:local}
     restart: on-failure
+    env_file: ["${TMDB_STRESS_ENV_FILE:?TMDB_STRESS_ENV_FILE must be set}"]
     entrypoint: [/usr/local/bin/tmdb-worker]
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
-      TMDB_ENVIRONMENT: test
-      TMDB_MIGRATOR_DB_HOST: postgres
-      TMDB_MIGRATOR_DB_PORT: 5432
-      TMDB_MIGRATOR_DB_NAME: tmdb
-      TMDB_MIGRATOR_DB_USER: migrator
-      TMDB_MIGRATOR_DB_PASSWORD_FILE: /run/secrets/migrator_password
-      TMDB_DIRECT_DB_HOST: postgres
-      TMDB_DIRECT_DB_PORT: 5432
-      TMDB_DIRECT_DB_NAME: tmdb
-      TMDB_DIRECT_DB_USER: ingest_writer
-      TMDB_DIRECT_DB_PASSWORD_FILE: /run/secrets/ingest_writer_password
-      TMDB_API_BASE_URL: ${TMDB_API_BASE_URL:-https://api.themoviedb.org/3}
-      TMDB_READ_ACCESS_TOKEN_FILE: /run/secrets/tmdb_read_access_token
-      TMDB_RATE_LIMIT: ${TMDB_RATE_LIMIT:-40}
-      TMDB_MAX_CONNECTIONS: ${TMDB_MAX_CONNECTIONS:-20}
-      TMDB_MAX_ATTEMPTS: ${TMDB_MAX_ATTEMPTS:-4}
-      TMDB_REQUEST_TIMEOUT_SECONDS: ${TMDB_REQUEST_TIMEOUT_SECONDS:-30}
-      TMDB_DAILY_EXPORT_MAX_BYTES: ${TMDB_DAILY_EXPORT_MAX_BYTES:-536870912}
-      TMDB_WORKER_ID: ${TMDB_INGEST_WORKER_ID:-tmdb-stress-worker}
-      TMDB_WORKER_LEASE_SECONDS: 60
-      TMDB_WORKER_HEARTBEAT_SECONDS: 15
-      TMDB_WORKER_IDLE_POLL_MS: 100
-      TMDB_ENABLE_SCHEDULER: ${TMDB_ENABLE_SCHEDULER:-true}
-      TMDB_SCHEDULER_INTERVAL_SECONDS: ${TMDB_SCHEDULER_INTERVAL_SECONDS:-60}
-      TMDB_ENABLE_DAILY_EXPORT: ${TMDB_ENABLE_DAILY_EXPORT:-false}
-      ALLOW_LOCAL_MEDIA: ${ALLOW_LOCAL_MEDIA:-true}
-    secrets:
-      - migrator_password
-      - ingest_writer_password
-      - tmdb_read_access_token
     volumes:
       - tmdb_stress_config:/config
     read_only: true
@@ -155,25 +90,11 @@ services:
   media:
     image: ${TMDB_STRESS_APP_IMAGE:-tmdb-stress-app:local}
     restart: on-failure
+    env_file: ["${TMDB_STRESS_ENV_FILE:?TMDB_STRESS_ENV_FILE must be set}"]
     entrypoint: [/usr/local/bin/tmdb-images]
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
-      TMDB_ENVIRONMENT: test
-      TMDB_DIRECT_DB_HOST: postgres
-      TMDB_DIRECT_DB_PORT: 5432
-      TMDB_DIRECT_DB_NAME: tmdb
-      TMDB_DIRECT_DB_USER: image_writer
-      TMDB_DIRECT_DB_PASSWORD_FILE: /run/secrets/image_writer_password
-      TMDB_WORKER_ID: ${TMDB_IMAGE_WORKER_ID:-tmdb-stress-media}
-      TMDB_WORKER_LEASE_SECONDS: 60
-      TMDB_WORKER_HEARTBEAT_SECONDS: 15
-      TMDB_WORKER_IDLE_POLL_MS: 100
-      TMDB_TRAWL_BASE_URL: ${TMDB_TRAWL_BASE_URL:-http://trawl.example.invalid:8191}
-      ALLOW_LOCAL_MEDIA: ${ALLOW_LOCAL_MEDIA:-true}
-      TMDB_MEDIA_BIND: 0.0.0.0:8090
-    secrets: [image_writer_password]
     volumes:
       - type: volume
         source: tmdb_stress_media
@@ -195,26 +116,6 @@ services:
       retries: 30
       start_period: 5s
     networks: [tmdb-private]
-
-secrets:
-  postgres_owner_password:
-    file: "${TMDB_STRESS_SECRET_ROOT:?TMDB_STRESS_SECRET_ROOT must be set}/postgres_owner_password"
-  migrator_password:
-    file: "${TMDB_STRESS_SECRET_ROOT:?TMDB_STRESS_SECRET_ROOT must be set}/migrator_password"
-  api_reader_password:
-    file: "${TMDB_STRESS_SECRET_ROOT:?TMDB_STRESS_SECRET_ROOT must be set}/api_reader_password"
-  api_job_submitter_password:
-    file: "${TMDB_STRESS_SECRET_ROOT:?TMDB_STRESS_SECRET_ROOT must be set}/api_job_submitter_password"
-  ingest_writer_password:
-    file: "${TMDB_STRESS_SECRET_ROOT:?TMDB_STRESS_SECRET_ROOT must be set}/ingest_writer_password"
-  image_writer_password:
-    file: "${TMDB_STRESS_SECRET_ROOT:?TMDB_STRESS_SECRET_ROOT must be set}/image_writer_password"
-  monitor_password:
-    file: "${TMDB_STRESS_SECRET_ROOT:?TMDB_STRESS_SECRET_ROOT must be set}/monitor_password"
-  tmdb_read_access_token:
-    file: "${TMDB_STRESS_SECRET_ROOT:?TMDB_STRESS_SECRET_ROOT must be set}/tmdb_read_access_token"
-  tmdb_api_key:
-    file: "${TMDB_STRESS_SECRET_ROOT:?TMDB_STRESS_SECRET_ROOT must be set}/tmdb_api_key"
 
 volumes:
   tmdb_stress_pg18_data:

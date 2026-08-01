@@ -28,26 +28,18 @@ pub fn load_secret(source: &impl ConfigSource, name: &str) -> Result<SecretStrin
     load_secret_with_origin(source, name).map(|(secret, _)| secret)
 }
 
-/// Loads a secret while enforcing the deployment environment's source policy.
-///
-/// Production processes must use a file-backed secret. Development and test
-/// processes may use either source, subject to the normal one-source and value
-/// validation rules.
+/// Loads a secret while preserving the same direct-value or optional file
+/// indirection accepted in every deployment environment.
 ///
 /// # Errors
 ///
-/// Returns the same validation errors as [`load_secret`], plus
-/// [`ConfigError::InlineSecretForbidden`] for production inline values.
+/// Returns the same validation errors as [`load_secret`].
 pub fn load_secret_for_environment(
     source: &impl ConfigSource,
     name: &str,
-    environment: crate::Environment,
+    _environment: crate::Environment,
 ) -> Result<SecretString, ConfigError> {
-    let (secret, origin) = load_secret_with_origin(source, name)?;
-    if environment == crate::Environment::Production && origin == SecretOrigin::Direct {
-        return Err(ConfigError::InlineSecretForbidden(name.to_owned()));
-    }
-    Ok(secret)
+    load_secret_with_origin(source, name).map(|(secret, _origin)| secret)
 }
 
 pub(crate) fn load_secret_with_origin(

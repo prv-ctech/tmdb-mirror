@@ -4,7 +4,9 @@ use std::path::Path;
 
 use secrecy::ExposeSecret;
 use tempfile::NamedTempFile;
-use tmdb_config::{AppConfig, ConfigError, Environment, MapSource, StorageRoots, load_secret};
+use tmdb_config::{
+    AppConfig, ConfigError, Environment, MapSource, StorageRoots, load_secret, load_shared_database,
+};
 
 const DIRECT_PASSWORD: &str = "unit-test-direct-credential";
 const POOLED_PASSWORD: &str = "unit-test-pooled-credential";
@@ -42,6 +44,17 @@ fn valid_entries(environment: &str) -> Vec<(OsString, OsString)> {
 
 fn source_from_entries(entries: Vec<(OsString, OsString)>) -> MapSource {
     entries.into_iter().collect()
+}
+
+fn shared_database_entries(environment: &str) -> MapSource {
+    MapSource::from([
+        ("TMDB_ENVIRONMENT", environment),
+        ("TMDB_DB_HOST", "postgres"),
+        ("TMDB_DB_PORT", "5432"),
+        ("TMDB_DB_NAME", "tmdb"),
+        ("TMDB_DB_USER", "tmdb_owner"),
+        ("POSTGRES_PASSWORD", "shared-database-password"),
+    ])
 }
 
 fn replace_entry(entries: &mut [(OsString, OsString)], key: &str, value: &str) -> bool {
@@ -226,6 +239,19 @@ fn app_config_parses_typed_settings_and_redacts_secrets() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn shared_database_settings_use_one_direct_password() -> Result<(), Box<dyn std::error::Error>> {
+    let source = shared_database_entries("production");
+    let config = load_shared_database(&source, Environment::Production)?;
+
+    assert_eq!(config.host, "postgres");
+    assert_eq!(config.port, 5432);
+    assert_eq!(config.database, "tmdb");
+    assert_eq!(config.username, "tmdb_owner");
+    assert_eq!(config.password.expose_secret(), "shared-database-password");
+    Ok(())
+}
+
+#[test]
 fn app_config_errors_name_fields_without_exposing_values() -> Result<(), Box<dyn std::error::Error>>
 {
     let mut entries = valid_entries("test");
@@ -286,42 +312,9 @@ fn trawl_base_url_rejects_embedded_query_credentials() {
 }
 
 #[test]
-fn production_rejects_inline_secrets_and_accepts_secret_files()
--> Result<(), Box<dyn std::error::Error>> {
+fn production_accepts_direct_secrets() -> Result<(), Box<dyn std::error::Error>> {
     let source = source_from_entries(valid_entries("production"));
-    assert!(matches!(
-        AppConfig::load(&source),
-        Err(ConfigError::InlineSecretForbidden(ref name))
-            if name == "TMDB_DIRECT_DB_PASSWORD"
-    ));
-
-    let direct_file = NamedTempFile::new()?;
-    fs::write(direct_file.path(), DIRECT_PASSWORD)?;
-    let pooled_file = NamedTempFile::new()?;
-    fs::write(pooled_file.path(), POOLED_PASSWORD)?;
-    let api_key_file = NamedTempFile::new()?;
-    fs::write(api_key_file.path(), ADMIN_API_KEY)?;
-
-    let mut entries = valid_entries("production");
-    entries.retain(|(key, _)| {
-        key != "TMDB_DIRECT_DB_PASSWORD"
-            && key != "TMDB_POOLED_DB_PASSWORD"
-            && key != "TMDB_API_KEY"
-    });
-    entries.push((
-        OsString::from("TMDB_DIRECT_DB_PASSWORD_FILE"),
-        direct_file.path().as_os_str().to_os_string(),
-    ));
-    entries.push((
-        OsString::from("TMDB_POOLED_DB_PASSWORD_FILE"),
-        pooled_file.path().as_os_str().to_os_string(),
-    ));
-    entries.push((
-        OsString::from("TMDB_API_KEY_FILE"),
-        api_key_file.path().as_os_str().to_os_string(),
-    ));
-
-    let config = AppConfig::load(&source_from_entries(entries))?;
+    let config = AppConfig::load(&source)?;
     assert_eq!(config.environment, Environment::Production);
     Ok(())
 }

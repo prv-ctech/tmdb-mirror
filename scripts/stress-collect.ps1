@@ -51,9 +51,9 @@ SELECT json_build_object(
   'cache_hit_ratio', (SELECT round(100.0 * sum(blks_hit) / nullif(sum(blks_hit + blks_read), 0), 3) FROM pg_stat_database WHERE datname = current_database())
 );
 '@
-$passwordOutput = & docker @($composeArgs + @('exec', '-T', 'postgres', 'cat', '/run/secrets/postgres_owner_password')) 2>&1
+$passwordOutput = & docker @($composeArgs + @('exec', '-T', 'postgres', 'printenv', 'POSTGRES_PASSWORD')) 2>&1
 if ($LASTEXITCODE -ne 0) {
-    throw 'Unable to read the disposable database password from the container.'
+    throw 'Unable to read the disposable database password from the container environment.'
 }
 $postgresPassword = ([string]::Join("`n", @($passwordOutput))).Trim()
 if ([string]::IsNullOrWhiteSpace($postgresPassword)) {

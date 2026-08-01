@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::fs;
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
@@ -2251,11 +2250,6 @@ async fn wait_until_backend_is_lock_waiting(pool: &PgPool, pid: i32) -> sqlx::Re
 }
 
 async fn role_pool(database: &str, role: &str, policy: PoolPolicy) -> sqlx::Result<PgPool> {
-    let secret_file = if role == "tmdb_owner" {
-        "postgres_owner_password".to_owned()
-    } else {
-        format!("{role}_password")
-    };
     let config = DatabaseConfig {
         host: std::env::var("TMDB_TEST_DB_HOST")
             .unwrap_or_else(|_| "host.docker.internal".to_owned()),
@@ -2266,13 +2260,24 @@ async fn role_pool(database: &str, role: &str, policy: PoolPolicy) -> sqlx::Resu
         database: database.to_owned(),
         username: role.to_owned(),
         password: SecretString::from(
-            fs::read_to_string(format!("/run/secrets/{secret_file}"))
-                .map_err(|_| test_error("test role secret was not readable"))?,
+            test_database_password()
+                .map_err(|_| test_error("test database password was not configured"))?,
         ),
     };
     connect_direct(&config, policy)
         .await
         .map_err(|error| test_error(&error.to_string()))
+}
+
+fn test_database_password() -> std::io::Result<String> {
+    std::env::var("TMDB_TEST_DB_PASSWORD")
+        .or_else(|_| std::env::var("POSTGRES_PASSWORD"))
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "TMDB_TEST_DB_PASSWORD or POSTGRES_PASSWORD is required",
+            )
+        })
 }
 
 async fn assert_denied(pool: &PgPool, statement: &'static str) -> sqlx::Result<()> {

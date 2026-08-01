@@ -9,7 +9,7 @@ pub use http::Uri;
 pub use path::StorageRoots;
 pub use secrecy::SecretString;
 pub use secret::{load_secret, load_secret_for_environment};
-pub use settings::{AppConfig, DatabaseConfig, Environment};
+pub use settings::{AppConfig, DatabaseConfig, Environment, load_shared_database};
 pub use source::{ConfigSource, EnvSource, MapSource};
 
 /// A configuration value could not be loaded or validated.
