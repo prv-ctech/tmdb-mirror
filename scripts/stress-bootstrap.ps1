@@ -168,7 +168,7 @@ try {
         'POSTGRES_USER=tmdb_owner',
         'POSTGRES_PASSWORD=tmdb-stress',
         'PGDATA=/var/lib/postgresql/18/docker',
-        'POSTGRES_INITDB_ARGS=--data-checksums --encoding=UTF8 --auth-host=scram-sha-256',
+        'POSTGRES_INITDB_ARGS=--data-checksums --encoding=UTF8 --auth-local=scram-sha-256 --auth-host=scram-sha-256',
         'DATABASE_HOST=postgres',
         'DATABASE_PORT=5432',
         'DATABASE_NAME=tmdb',
