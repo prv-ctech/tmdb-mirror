@@ -57,6 +57,8 @@ $paths = @(
     '/tv/900000002/credits',
     '/movies/900000001/images',
     '/tv/900000002/images',
+    '/anime/movie/900000017/images',
+    '/anime/tv/900000034/images',
     '/tv/900000002/seasons',
     '/tv/900000002/seasons/1/episodes',
     '/tv/900000002/seasons/1/episodes/1'
@@ -233,8 +235,14 @@ try {
     $filtered = Invoke-JsonGet -Url "$baseUrl/movies?genreId=900000002&language=en&runtimeMin=40&runtimeMax=120&personId=900000002&companyId=900000002&limit=20"
     Add-SemanticCheck 'multi_facet_filter_returns_rows' (@($filtered.data).Count -gt 0) "returned=$(@($filtered.data).Count)"
 
+    $animeMovieImages = Invoke-JsonGet -Url "$baseUrl/anime/movie/900000017/images"
+    $animeTvImages = Invoke-JsonGet -Url "$baseUrl/anime/tv/900000034/images"
+    $animeImageRows = @($animeMovieImages.data) + @($animeTvImages.data)
+    $localAnimeImages = @($animeImageRows | Where-Object { [string]$_.url -like "$imageUrl/media/anime/*" })
+    Add-SemanticCheck 'anime_image_metadata_routes_return_local_urls' ($animeImageRows.Count -ge 2 -and $localAnimeImages.Count -eq $animeImageRows.Count) "returned=$($animeImageRows.Count), local=$($localAnimeImages.Count)"
+
     $imageHealth = Assert-HttpSuccess -Url "$imageUrl/healthz"
-    Add-SemanticCheck 'static_image_server_health' $true 'HTTP 200'
+    Add-SemanticCheck 'static_image_server_health' $true "HTTP $imageHealth"
 }
 catch {
     Add-SemanticCheck 'semantic_checks' $false $_.Exception.Message
