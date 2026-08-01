@@ -1,4 +1,4 @@
-# Development PostgreSQL secrets
+# Compose secret files
 
 Run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\bootstrap-dev.ps1`
 from the repository root. The script creates seven 32-byte base64url passwords in
@@ -8,13 +8,23 @@ preserved. Pass `-Rotate` only before a cluster exists to replace them.
 Generated files are ignored by Git. Do not copy production or legacy credentials
 here, and do not commit any generated password.
 
-The production Compose template additionally expects files named
-`tmdb_read_access_token` and `tmdb_api_key` under the configured `TMDB_SECRET_ROOT`.
-Populate them
-from the TMDB account's read-only token using the same protected-file policy;
-never put the token in a Compose file, environment example, command line, or
-logs. The development bootstrap intentionally does not generate this upstream
-credential.
+Both Compose examples expect these nine files under `deploy/secrets/`:
+
+```text
+postgres_owner_password
+migrator_password
+api_reader_password
+api_job_submitter_password
+ingest_writer_password
+image_writer_password
+monitor_password
+tmdb_read_access_token
+tmdb_api_key
+```
+
+The bootstrap creates the first seven. Create the final two from your TMDB
+credentials using the same protected-file policy. Never put credentials in a
+Compose file, `.env`, an environment example, a command line, or logs.
 
 The tracked `.gitattributes` rule is intentionally limited to
 `infra/postgres/initdb/*.sh` so Git always checks container-executed shell scripts

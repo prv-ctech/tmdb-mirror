@@ -1,5 +1,231 @@
-# Compatibility entry point for the canonical four-container deployment.
-# Edit deploy/compose.compact.yaml for host bind mounts and use
-# deploy/env.production.example for behavior settings.
-include:
-  - path: ./deploy/compose.production.yaml
+# Self-contained four-container TMDB deployment example.
+#
+# Before starting:
+#   1. Copy .env.example to .env and edit the behavior values.
+#   2. Edit the host side of the /var/lib/postgresql, /config, and /media
+#      mounts below. The container paths on the right are fixed.
+#   3. Create the secret files listed at the bottom under deploy/secrets/.
+#
+# Start with:
+#   docker compose -f docker-compose-example.yaml up -d --build
+
+name: tmdb
+
+services:
+  postgres:
+    image: postgres:18-bookworm@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296
+    restart: unless-stopped
+    shm_size: 2gb
+    environment:
+      POSTGRES_DB: tmdb
+      POSTGRES_USER: tmdb_owner
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_owner_password
+      POSTGRES_INITDB_ARGS: --data-checksums --encoding=UTF8 --auth-host=scram-sha-256
+      PGDATA: /var/lib/postgresql/18/docker
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - track_io_timing=on
+      - -c
+      - timezone=UTC
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=32GB
+      - -c
+      - effective_cache_size=96GB
+      - -c
+      - work_mem=32MB
+      - -c
+      - maintenance_work_mem=1GB
+      - -c
+      - wal_compression=on
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=256
+    volumes:
+      # Change only the host path on the left.
+      - ./data/postgres18:/var/lib/postgresql
+      - ./infra/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    secrets:
+      - postgres_owner_password
+      - migrator_password
+      - api_reader_password
+      - api_job_submitter_password
+      - ingest_writer_password
+      - image_writer_password
+      - monitor_password
+    healthcheck:
+      test: [CMD, pg_isready, -U, tmdb_owner, -d, tmdb, -h, 127.0.0.1]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks: [tmdb-private]
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tmdb-api:local
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      TMDB_ENVIRONMENT: production
+      TMDB_API_BIND: 0.0.0.0:8080
+      TMDB_ADMIN_BIND: 0.0.0.0:8081
+      TMDB_API_KEY_FILE: /run/secrets/tmdb_api_key
+      TMDB_DIRECT_DB_HOST: postgres
+      TMDB_DIRECT_DB_PORT: 5432
+      TMDB_DIRECT_DB_NAME: tmdb
+      TMDB_DIRECT_DB_USER: api_reader
+      TMDB_DIRECT_DB_PASSWORD_FILE: /run/secrets/api_reader_password
+      TMDB_POOLED_DB_HOST: postgres
+      TMDB_POOLED_DB_PORT: 5432
+      TMDB_POOLED_DB_NAME: tmdb
+      TMDB_POOLED_DB_USER: api_reader
+      TMDB_POOLED_DB_PASSWORD_FILE: /run/secrets/api_reader_password
+      ALLOW_LOCAL_MEDIA: ${ALLOW_LOCAL_MEDIA:-true}
+      TMDB_MEDIA_BASE_URL: ${TMDB_MEDIA_BASE_URL:-http://media.example.invalid:8090/media}
+    secrets:
+      - api_reader_password
+      - tmdb_api_key
+    ports:
+      - "8080:8080"
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    init: true
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --show-error, http://127.0.0.1:8080/health/live]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks: [tmdb-private]
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tmdb-worker:local
+    restart: unless-stopped
+    entrypoint: [/usr/local/bin/tmdb-worker]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      TMDB_ENVIRONMENT: production
+      TMDB_MIGRATOR_DB_HOST: postgres
+      TMDB_MIGRATOR_DB_PORT: 5432
+      TMDB_MIGRATOR_DB_NAME: tmdb
+      TMDB_MIGRATOR_DB_USER: migrator
+      TMDB_MIGRATOR_DB_PASSWORD_FILE: /run/secrets/migrator_password
+      TMDB_DIRECT_DB_HOST: postgres
+      TMDB_DIRECT_DB_PORT: 5432
+      TMDB_DIRECT_DB_NAME: tmdb
+      TMDB_DIRECT_DB_USER: ingest_writer
+      TMDB_DIRECT_DB_PASSWORD_FILE: /run/secrets/ingest_writer_password
+      TMDB_API_BASE_URL: ${TMDB_API_BASE_URL:-https://api.themoviedb.org/3}
+      TMDB_READ_ACCESS_TOKEN_FILE: /run/secrets/tmdb_read_access_token
+      TMDB_RATE_LIMIT: ${TMDB_RATE_LIMIT:-45}
+      TMDB_MAX_CONNECTIONS: ${TMDB_MAX_CONNECTIONS:-20}
+      TMDB_MAX_ATTEMPTS: ${TMDB_MAX_ATTEMPTS:-4}
+      TMDB_REQUEST_TIMEOUT_SECONDS: ${TMDB_REQUEST_TIMEOUT_SECONDS:-30}
+      TMDB_WORKER_ID: ${TMDB_WORKER_ID:-tmdb-worker-primary}
+      TMDB_WORKER_LEASE_SECONDS: 60
+      TMDB_WORKER_HEARTBEAT_SECONDS: 15
+      TMDB_WORKER_IDLE_POLL_MS: 500
+      TMDB_ENABLE_SCHEDULER: ${TMDB_ENABLE_SCHEDULER:-true}
+      TMDB_SCHEDULER_INTERVAL_SECONDS: ${TMDB_SCHEDULER_INTERVAL_SECONDS:-60}
+      TMDB_ENABLE_DAILY_EXPORT: ${TMDB_ENABLE_DAILY_EXPORT:-true}
+      ALLOW_LOCAL_MEDIA: ${ALLOW_LOCAL_MEDIA:-true}
+    secrets:
+      - migrator_password
+      - ingest_writer_password
+      - tmdb_read_access_token
+    volumes:
+      # Worker scratch, exports, checkpoints, and logs stay under /config.
+      - ./data/config:/config
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    init: true
+    networks: [tmdb-private]
+
+  media:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tmdb-media:local
+    restart: unless-stopped
+    entrypoint: [/usr/local/bin/tmdb-images]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      TMDB_ENVIRONMENT: production
+      TMDB_DIRECT_DB_HOST: postgres
+      TMDB_DIRECT_DB_PORT: 5432
+      TMDB_DIRECT_DB_NAME: tmdb
+      TMDB_DIRECT_DB_USER: image_writer
+      TMDB_DIRECT_DB_PASSWORD_FILE: /run/secrets/image_writer_password
+      TMDB_WORKER_ID: ${TMDB_IMAGE_WORKER_ID:-tmdb-media-primary}
+      TMDB_WORKER_LEASE_SECONDS: 60
+      TMDB_WORKER_HEARTBEAT_SECONDS: 15
+      TMDB_WORKER_IDLE_POLL_MS: 500
+      TMDB_TRAWL_BASE_URL: ${TMDB_TRAWL_BASE_URL:-http://trawl.example.invalid:8191}
+      ALLOW_LOCAL_MEDIA: ${ALLOW_LOCAL_MEDIA:-true}
+      TMDB_MEDIA_BIND: 0.0.0.0:8090
+    secrets:
+      - image_writer_password
+    volumes:
+      # Permanent derivatives and private masters are published under /media.
+      - ./data/media:/media
+      - ./data/config:/config
+    ports:
+      - "8090:8090"
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    init: true
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://127.0.0.1:8090/health/live]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks: [tmdb-private]
+
+secrets:
+  # Create these files locally. Never put their contents in .env or Git.
+  postgres_owner_password:
+    file: ./deploy/secrets/postgres_owner_password
+  migrator_password:
+    file: ./deploy/secrets/migrator_password
+  api_reader_password:
+    file: ./deploy/secrets/api_reader_password
+  api_job_submitter_password:
+    file: ./deploy/secrets/api_job_submitter_password
+  ingest_writer_password:
+    file: ./deploy/secrets/ingest_writer_password
+  image_writer_password:
+    file: ./deploy/secrets/image_writer_password
+  monitor_password:
+    file: ./deploy/secrets/monitor_password
+  tmdb_read_access_token:
+    file: ./deploy/secrets/tmdb_read_access_token
+  tmdb_api_key:
+    file: ./deploy/secrets/tmdb_api_key
+
+networks:
+  tmdb-private:
+    driver: bridge

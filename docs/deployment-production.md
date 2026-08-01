@@ -46,9 +46,11 @@ application.
 ## Secrets and startup
 
 Create the file-backed secrets referenced by `deploy/compose.compact.yaml` in
-`deploy/secrets/` (or change those deployment-only file mappings). Database
-role secrets are 43-byte base64url values without a trailing newline. Keep the
-TMDB read token and API key file-backed and outside source control.
+`deploy/secrets/` (or change those deployment-only file mappings). The root
+`docker-compose-example.yaml` uses the same filenames and is the easiest file
+to inspect when learning the topology. Database role secrets are 43-byte
+base64url values without a trailing newline. Keep the TMDB read token and API
+key file-backed and outside source control.
 
 Copy `deploy/env.production.example` to the ignored `deploy/env.production`,
 replace its reserved example hostnames, and use that file for Compose:
