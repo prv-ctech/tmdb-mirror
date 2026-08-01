@@ -1,0 +1,60 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/tmdb-domain",
+  "crates/tmdb-config",
+  "crates/tmdb-db",
+  "crates/tmdb-jobs",
+  "crates/tmdb-media",
+  "crates/tmdb-upstream",
+  "crates/tmdb-observability",
+  "apps/tmdb-api",
+  "apps/tmdb-ingest",
+  "apps/tmdb-images",
+  "apps/tmdb-admin",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "=0.8.9"
+flate2 = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "=4.6.4", features = ["derive", "env"] }
+http = "1"
+httpdate = "1"
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+prometheus-client = "0.24"
+reqwest = { version = "0.12", default-features = false, features = ["brotli", "deflate", "gzip", "json", "rustls-tls", "stream"] }
+secrecy = { version = "0.10", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros", "chrono", "json", "uuid", "sqlx-toml"] }
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "=0.7.0", features = ["catch-panic", "compression-zstd", "fs", "request-id", "sensitive-headers", "timeout", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["serde", "v7"] }
+zstd = "0.13"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = "deny"
+pedantic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

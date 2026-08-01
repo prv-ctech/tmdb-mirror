@@ -1,0 +1,61 @@
+# TMDB Clone
+
+Rust/PostgreSQL 18 TMDB catalog mirror with fast search, anime separation, and
+local image storage.
+
+## API
+
+Use the API listener as your app's base URL:
+
+```text
+http://<server-host>:8080
+```
+
+Examples:
+
+```text
+GET /movies?limit=20
+GET /movies/{tmdb_id}
+GET /tv/{tmdb_id}
+GET /anime?query=One%20Piece
+GET /search?q=matrix
+```
+
+Catalog routes do not require a client key. `/metrics` is on the private admin
+listener and requires the application key through `X-API-Key` or a Bearer
+header. Do not expose the admin listener publicly.
+
+Local images are served from port `8090`. Set `TMDB_MEDIA_BASE_URL` to a URL
+reachable by your app, for example `http://<server-host>:8090/media`.
+
+## Deploy
+
+The stack has four containers: PostgreSQL, API, main worker, and media worker.
+Create the file-backed secrets, edit the host side of the `/media`, `/config`,
+and PostgreSQL bind mounts. Copy the behavior template, edit its hostnames, and
+then run:
+
+```powershell
+Copy-Item deploy/env.production.example deploy/env.production
+docker compose --env-file deploy/env.production -f deploy/compose.production.yaml up -d --build
+```
+
+The application only uses `/media` and `/config` inside containers. Set
+`TMDB_TRAWL_BASE_URL` only when an existing Trawl instance is available.
+
+## Stress test
+
+The disposable harness keeps tokens and generated data under the ignored
+`.stress-runtime/` directory:
+
+```powershell
+$env:TMDB_STRESS_READ_TOKEN = '<read-token-from-your-secret-manager>'
+$env:TMDB_STRESS_TRAWL_BASE_URL = 'http://<trawl-host>:8191'
+./scripts/stress-bootstrap.ps1
+./scripts/stress-http.ps1 -Concurrency 100 -RequestsPerWorker 50
+./scripts/stress-resilience.ps1
+./scripts/stress-collect.ps1
+```
+
+Run `./scripts/verify-repository-hygiene.ps1` before committing. Never commit
+tokens, passwords, private host addresses, or generated runtime artifacts.

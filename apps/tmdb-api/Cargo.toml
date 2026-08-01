@@ -1,0 +1,35 @@
+[package]
+name = "tmdb-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+chrono.workspace = true
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+secrecy.workspace = true
+sqlx.workspace = true
+tmdb-config = { path = "../../crates/tmdb-config" }
+tmdb-db = { path = "../../crates/tmdb-db" }
+tmdb-domain = { path = "../../crates/tmdb-domain" }
+tmdb-media = { path = "../../crates/tmdb-media" }
+tmdb-observability = { path = "../../crates/tmdb-observability" }
+tokio.workspace = true
+tokio-util.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+zstd.workspace = true
+
+[lints]
+workspace = true

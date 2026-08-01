@@ -1,0 +1,25 @@
+[package]
+name = "tmdb-jobs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+secrecy.workspace = true
+tmdb-config = { path = "../tmdb-config" }
+tmdb-db = { path = "../tmdb-db" }
+
+[lints]
+workspace = true

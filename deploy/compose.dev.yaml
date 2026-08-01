@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:18-bookworm@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296
+    environment:
+      POSTGRES_DB: tmdb
+      POSTGRES_USER: tmdb_owner
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_owner_password
+      POSTGRES_INITDB_ARGS: --data-checksums --encoding=UTF8 --auth-host=scram-sha-256
+      PGDATA: /var/lib/postgresql/18/docker
+    command: [postgres, -c, shared_preload_libraries=pg_stat_statements, -c, track_io_timing=on, -c, timezone=UTC]
+    ports: ["127.0.0.1:55432:5432"]
+    volumes:
+      - tmdb_pg18_data:/var/lib/postgresql
+      - ../infra/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    secrets:
+      - postgres_owner_password
+      - migrator_password
+      - api_reader_password
+      - api_job_submitter_password
+      - ingest_writer_password
+      - image_writer_password
+      - monitor_password
+    healthcheck:
+      test: [CMD, pg_isready, -U, tmdb_owner, -d, tmdb, -t, '1']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [tmdb-internal, tmdb-loopback]
+
+secrets:
+  postgres_owner_password:
+    file: ./secrets/postgres_owner_password
+  migrator_password:
+    file: ./secrets/migrator_password
+  api_reader_password:
+    file: ./secrets/api_reader_password
+  api_job_submitter_password:
+    file: ./secrets/api_job_submitter_password
+  ingest_writer_password:
+    file: ./secrets/ingest_writer_password
+  image_writer_password:
+    file: ./secrets/image_writer_password
+  monitor_password:
+    file: ./secrets/monitor_password
+
+volumes:
+  tmdb_pg18_data:
+
+networks:
+  tmdb-internal:
+    driver: bridge
+    internal: true
+  tmdb-loopback:
+    driver: bridge

@@ -1,0 +1,6 @@
+# Canonical four-container production deployment.
+# The complete service definition, including fixed /media and /config mounts,
+# lives in compose.compact.yaml so the Unraid template and Compose deployment
+# share one audited topology.
+include:
+  - path: ./compose.compact.yaml

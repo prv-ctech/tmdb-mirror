@@ -1,0 +1,58 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+deploy/env.production
+deploy/secrets/*
+!deploy/secrets/README.md
+*.key
+*.pem
+*.p12
+*.pfx
+*.secret
+*.secrets
+
+# Runtime data, exports, logs, and local databases
+.stress-runtime/
+.runtime/
+/data/
+/artifacts/
+/coverage/
+exports/
+results/
+logs/
+temp/
+temp_dir/
+scraps/
+*.log
+*.tmp
+*.bak
+*.dump
+*.sql.gz
+*.sqlite
+*.sqlite3
+
+# Rust
+/target/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE and local worktrees
+.vscode/
+.idea/
+.worktrees/
+.superpowers/
+
+# Local Compose overrides
+docker-compose.yaml
+docker-compose.override.yaml
+
+# Operating-system files
+.DS_Store
+Thumbs.db

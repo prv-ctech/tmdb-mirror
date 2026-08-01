@@ -1,0 +1,262 @@
+[CmdletBinding()]
+param(
+    [string]$ProjectName = 'tmdb_stress_test',
+    [int]$ApiPort = 18080,
+    [int]$AdminPort = 18081,
+    [int]$ImagePort = 18090,
+    [int]$PostgresPort = 55433,
+    [string]$TmdbReadToken = $env:TMDB_STRESS_READ_TOKEN,
+    [string]$TrawlBaseUrl = $env:TMDB_STRESS_TRAWL_BASE_URL,
+    [switch]$SkipBuild
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$composeFile = Join-Path $repoRoot 'deploy/compose.stress.yaml'
+$runtimeRoot = Join-Path (Join-Path $repoRoot '.stress-runtime') $ProjectName
+$secretRoot = Join-Path $runtimeRoot 'secrets'
+$envFile = Join-Path $runtimeRoot 'compose.env'
+$metadataFile = Join-Path $runtimeRoot 'metadata.json'
+$appImage = 'tmdb-stress-app:local'
+
+function Invoke-DockerChecked {
+    param([Parameter(Mandatory)][string[]]$Arguments)
+
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = @(& docker @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($exitCode -ne 0) {
+        $text = [string]::Join("`n", $output)
+        throw "Docker command failed with exit code $exitCode.`n$text"
+    }
+    return [string]::Join("`n", $output).Trim()
+}
+
+function Write-Utf8NoBom {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Value)
+    $encoding = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText($Path, $Value, $encoding)
+}
+
+function New-Secret {
+    $bytes = New-Object byte[] 32
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    return [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+function Assert-RoleSecret {
+    param([Parameter(Mandatory)][string]$Path)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -ne 43) { throw "Generated role secret has an invalid length: $Path" }
+    $value = [System.Text.Encoding]::ASCII.GetString($bytes)
+    if ($value -cnotmatch '^[A-Za-z0-9_-]{43}$') { throw "Generated role secret has an invalid format: $Path" }
+}
+
+function Assert-PortAvailable {
+    param([Parameter(Mandatory)][int]$Port)
+    $listener = $null
+    try {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+        $listener.Start()
+    }
+    catch {
+        throw "Stress-test port 127.0.0.1:$Port is already in use. Choose another port."
+    }
+    finally {
+        if ($null -ne $listener) { $listener.Stop() }
+    }
+}
+
+function Get-ComposeArguments {
+    return @('--env-file', $envFile, '--project-name', $ProjectName, '--file', $composeFile)
+}
+
+function Invoke-Compose {
+    param([Parameter(Mandatory)][string[]]$Arguments)
+    Invoke-DockerChecked -Arguments (@('compose') + (Get-ComposeArguments) + $Arguments)
+}
+
+function Wait-ServiceHealthy {
+    param(
+        [Parameter(Mandatory)][string]$Service,
+        [int]$TimeoutSeconds = 180
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $containerId = $null
+        try {
+            $containerId = (Invoke-Compose -Arguments @('ps', '-q', $Service)).Trim()
+        }
+        catch { $containerId = $null }
+        if ($containerId) {
+            $state = Invoke-DockerChecked -Arguments @('inspect', '--format', '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}', $containerId)
+            if ($state -eq 'running|healthy') { return }
+            if ($state -match '^exited\|' -or $state -match '^dead\|') {
+                $logs = Invoke-Compose -Arguments @('logs', '--no-color', '--timestamps', $Service)
+                throw "Stress service '$Service' stopped before becoming healthy.`n$logs"
+            }
+        }
+        Start-Sleep -Seconds 2
+    } while ([DateTime]::UtcNow -lt $deadline)
+    $logs = Invoke-Compose -Arguments @('logs', '--no-color', '--timestamps', $Service)
+    throw "Timed out waiting for stress service '$Service'.`n$logs"
+}
+
+function Wait-Migrations {
+    param([int]$TimeoutSeconds = 180)
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        try {
+            $password = (Invoke-Compose -Arguments @('exec', '-T', 'postgres', 'cat', '/run/secrets/postgres_owner_password')).Trim()
+            $version = (Invoke-Compose -Arguments @(
+                'exec', '-T', '-e', "PGPASSWORD=$password", 'postgres', 'psql', '-X', '-At',
+                '--username', 'tmdb_owner', '--dbname', 'tmdb', '-c',
+                "SELECT COALESCE(max(version), 0) FROM ops._sqlx_migrations WHERE success"
+            )).Trim()
+            if ([int]$version -ge 17) { return }
+        }
+        catch {
+            # The worker may still be opening its migration connection.
+        }
+        Start-Sleep -Seconds 2
+    } while ([DateTime]::UtcNow -lt $deadline)
+    $logs = Invoke-Compose -Arguments @('logs', '--no-color', '--timestamps', 'worker')
+    throw "Timed out waiting for consolidated worker migrations.`n$logs"
+}
+
+if (-not (Test-Path -LiteralPath $composeFile -PathType Leaf)) {
+    throw "Stress Compose definition is missing: $composeFile"
+}
+if ($ProjectName -notmatch '^[a-z0-9][a-z0-9_-]{2,48}$') {
+    throw 'ProjectName must be 3-49 lowercase letters, digits, underscores, or hyphens.'
+}
+if ([string]::IsNullOrWhiteSpace($TmdbReadToken) -or $TmdbReadToken.Contains("`r") -or $TmdbReadToken.Contains("`n")) {
+    throw 'Provide the TMDB read token through -TmdbReadToken or TMDB_STRESS_READ_TOKEN for this test run.'
+}
+if (-not [string]::IsNullOrWhiteSpace($TrawlBaseUrl)) {
+    if ($TrawlBaseUrl.Contains("`r") -or $TrawlBaseUrl.Contains("`n")) {
+        throw 'TMDB_STRESS_TRAWL_BASE_URL must be a single-line URL.'
+    }
+    $trawlUri = $null
+    if (-not [Uri]::TryCreate($TrawlBaseUrl.Trim(), [UriKind]::Absolute, [ref]$trawlUri) -or
+        $trawlUri.Scheme -notin @('http', 'https') -or
+        [string]::IsNullOrWhiteSpace($trawlUri.Host) -or
+        $null -ne $trawlUri.Query -and $trawlUri.Query.Length -gt 0 -or
+        $null -ne $trawlUri.UserInfo -and $trawlUri.UserInfo.Length -gt 0) {
+        throw 'TMDB_STRESS_TRAWL_BASE_URL must be an http(s) URL without credentials or a query string.'
+    }
+    $TrawlBaseUrl = $TrawlBaseUrl.TrimEnd('/')
+}
+foreach ($port in @($ApiPort, $AdminPort, $ImagePort, $PostgresPort)) { Assert-PortAvailable -Port $port }
+
+$null = Invoke-DockerChecked -Arguments @('version', '--format', '{{.Server.Version}}')
+
+try {
+    New-Item -ItemType Directory -Force -Path $secretRoot | Out-Null
+    $roleSecrets = @(
+        'postgres_owner_password', 'migrator_password', 'api_reader_password',
+        'api_job_submitter_password', 'ingest_writer_password', 'image_writer_password',
+        'monitor_password', 'tmdb_api_key'
+    )
+    foreach ($name in $roleSecrets) {
+        $path = Join-Path $secretRoot $name
+        Write-Utf8NoBom -Path $path -Value (New-Secret)
+        if ($name -ne 'tmdb_api_key') { Assert-RoleSecret -Path $path }
+    }
+    # The token is deliberately written only to the ignored runtime secret
+    # directory and is never included in compose.env, metadata, logs, or git.
+    Write-Utf8NoBom -Path (Join-Path $secretRoot 'tmdb_read_access_token') -Value $TmdbReadToken.Trim()
+
+    $secretRootForCompose = $secretRoot.Replace('\', '/')
+    $envText = @(
+        "TMDB_STRESS_PROJECT=$ProjectName",
+        "TMDB_STRESS_SECRET_ROOT=$secretRootForCompose",
+        "TMDB_STRESS_APP_IMAGE=$appImage",
+        "TMDB_STRESS_API_PORT=$ApiPort",
+        "TMDB_STRESS_ADMIN_PORT=$AdminPort",
+        "TMDB_STRESS_IMAGE_PORT=$ImagePort",
+        "TMDB_STRESS_PG_PORT=$PostgresPort",
+        'TMDB_API_BASE_URL=https://api.themoviedb.org/3',
+        # Keep this aligned with crates/tmdb-upstream/src/policy.rs.
+        'TMDB_RATE_LIMIT=40',
+        'TMDB_MAX_CONNECTIONS=20',
+        'TMDB_MAX_ATTEMPTS=4',
+        'TMDB_REQUEST_TIMEOUT_SECONDS=30',
+        'TMDB_STRESS_PG_MAX_CONNECTIONS=120',
+        'TMDB_STRESS_PG_SHARED_BUFFERS=2GB',
+        'TMDB_STRESS_PG_EFFECTIVE_CACHE_SIZE=8GB',
+        'TMDB_STRESS_PG_WORK_MEM=32MB',
+        'TMDB_STRESS_PG_MAINTENANCE_WORK_MEM=512MB',
+        'ALLOW_LOCAL_MEDIA=true',
+        'TMDB_ENABLE_SCHEDULER=true',
+        'TMDB_ENABLE_DAILY_EXPORT=false'
+    )
+    if (-not [string]::IsNullOrWhiteSpace($TrawlBaseUrl)) {
+        $envText += "TMDB_TRAWL_BASE_URL=$TrawlBaseUrl"
+    }
+    Write-Utf8NoBom -Path $envFile -Value ([string]::Join("`n", $envText) + "`n")
+
+    $metadata = [ordered]@{
+        project = $ProjectName
+        compose_file = $composeFile
+        runtime_root = $runtimeRoot
+        api_url = "http://127.0.0.1:$ApiPort"
+        admin_url = "http://127.0.0.1:$AdminPort"
+        image_url = "http://127.0.0.1:$ImagePort"
+        postgres_host = '127.0.0.1'
+        postgres_port = $PostgresPort
+        started_at_utc = [DateTime]::UtcNow.ToString('O')
+    }
+    Write-Utf8NoBom -Path $metadataFile -Value (($metadata | ConvertTo-Json -Depth 4) + "`n")
+
+    if (-not $SkipBuild) {
+        Write-Output 'Building the pinned Rust application image...'
+        Invoke-DockerChecked -Arguments @('build', '--pull=false', '--file', (Join-Path $repoRoot 'Dockerfile'), '--tag', $appImage, $repoRoot) | Write-Output
+    }
+
+    Write-Output "Starting isolated PostgreSQL project '$ProjectName'..."
+    Invoke-Compose -Arguments @('up', '-d', '--remove-orphans', 'postgres') | Write-Output
+    Wait-ServiceHealthy -Service 'postgres'
+    Write-Output 'Starting the consolidated worker so it applies migrations...'
+    Invoke-Compose -Arguments @('up', '-d', '--remove-orphans', 'worker') | Write-Output
+    Wait-Migrations
+    # The runtime image is intentionally non-root. Prepare the disposable
+    # disk-backed media volume once so the worker can write permanent assets
+    # without adding a storage-init service to the four-container topology.
+    $mediaVolume = "$ProjectName`_media"
+    Invoke-DockerChecked -Arguments @(
+        'volume', 'create', '--label', "com.docker.compose.project=$ProjectName",
+        '--label', 'com.docker.compose.volume=tmdb_stress_media', $mediaVolume
+    ) | Out-Null
+    Invoke-DockerChecked -Arguments @(
+        'run', '--rm', '--user', '0:0', '--mount', "type=volume,source=$mediaVolume,target=/media,volume-nocopy=true",
+        '--entrypoint', '/usr/bin/chown', $appImage, '-R', '10001:10001', '/media'
+    ) | Out-Null
+    Invoke-DockerChecked -Arguments @(
+        'run', '--rm', '--user', '10001:10001', '--mount', "type=volume,source=$mediaVolume,target=/media,volume-nocopy=true",
+        '--entrypoint', '/bin/sh', $appImage, '-c', 'touch /media/.write-test && rm /media/.write-test'
+    ) | Out-Null
+    Write-Output 'Starting API and media worker...'
+    Invoke-Compose -Arguments @('up', '-d', '--remove-orphans', 'api', 'media') | Write-Output
+    Wait-ServiceHealthy -Service 'api'
+    Wait-ServiceHealthy -Service 'media'
+    Write-Output "Stress stack is ready: http://127.0.0.1:$ApiPort"
+    Write-Output "Runtime metadata: $metadataFile"
+}
+finally {
+    # Do not leave the supplied credential in this PowerShell process after
+    # bootstrap, even when a build or health check fails.
+    $TmdbReadToken = $null
+    $TrawlBaseUrl = $null
+    if (Test-Path Env:TMDB_STRESS_READ_TOKEN) { Remove-Item Env:TMDB_STRESS_READ_TOKEN -ErrorAction SilentlyContinue }
+}

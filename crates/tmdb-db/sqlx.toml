@@ -1,0 +1,3 @@
+[migrate]
+create-schemas = ["ops"]
+table-name = "ops._sqlx_migrations"
