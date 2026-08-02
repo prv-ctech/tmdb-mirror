@@ -27,6 +27,9 @@ pub enum ConfigError {
     /// A configured non-secret value failed validation or typed parsing.
     #[error("configuration field {0} is invalid")]
     InvalidValue(String),
+    /// A legacy configuration name is deliberately not supported.
+    #[error("configuration field {0} is not supported")]
+    UnsupportedSetting(String),
     /// A secret file could not be read.
     #[error("could not read the secret configured by {0}")]
     SecretFileRead(String),

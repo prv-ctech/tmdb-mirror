@@ -53,6 +53,11 @@ passed to all four containers through `env_file`.
 Each key has an inline description in `.env.example`. The public, admin, and
 media routes are listed in [api.md](api.md).
 
+The app reads only `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` for
+its database identity. Its database connection is fixed to the internal
+Compose service `postgres:5432`; do not add `DATABASE_*`, `TMDB_DB_*`, or
+per-process database aliases.
+
 ```powershell
 Copy-Item .env.example .env
 ./scripts/validate-production-compose.ps1 -EnvFile .env -ComposeFile deploy/compose.compact.yaml

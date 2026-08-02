@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use serde::Serialize;
 use tmdb_config::{EnvSource, Environment, load_shared_database};
 use tmdb_db::{PoolPolicy, ReadinessReport, connect_direct, migrate, readiness};
@@ -11,24 +11,10 @@ use uuid::Uuid;
 #[derive(Debug, Parser)]
 #[command(version, about = "TMDB database administration")]
 struct Cli {
-    #[command(flatten)]
-    database: DatabaseArgs,
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Debug, Args)]
-struct DatabaseArgs {
     #[arg(long, env = "TMDB_ENVIRONMENT", default_value = "development")]
     environment: Environment,
-    #[arg(long, env = "DATABASE_HOST", default_value = "postgres")]
-    host: String,
-    #[arg(long, env = "DATABASE_PORT", default_value_t = 5432)]
-    port: u16,
-    #[arg(long, env = "DATABASE_NAME", default_value = "tmdb")]
-    database: String,
-    #[arg(long, env = "DATABASE_USER", default_value = "tmdb_owner")]
-    username: String,
+    #[command(subcommand)]
+    command: Command,
 }
 
 #[derive(Debug, Subcommand)]
@@ -89,12 +75,7 @@ enum Command {
 #[allow(clippy::too_many_lines)] // Keep the small CLI command dispatcher in one audit surface.
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let username = cli.database.username.clone();
-    let mut config = load_shared_database(&EnvSource, cli.database.environment)?;
-    config.host = cli.database.host;
-    config.port = cli.database.port;
-    config.database = cli.database.database;
-    config.username = username;
+    let config = load_shared_database(&EnvSource, cli.environment)?;
 
     match cli.command {
         Command::Migrate => {

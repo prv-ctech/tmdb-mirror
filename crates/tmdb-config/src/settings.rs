@@ -55,10 +55,8 @@ pub struct AppConfig {
     pub api_bind: SocketAddr,
     /// Administrative listener.
     pub admin_bind: SocketAddr,
-    /// Direct `PostgreSQL` settings used by workers.
-    pub direct_database: DatabaseConfig,
-    /// Direct `PostgreSQL` settings used by public reads.
-    pub pooled_database: DatabaseConfig,
+    /// One shared `PostgreSQL` identity used by all four containers.
+    pub database: DatabaseConfig,
     /// Pairwise-disjoint storage trees.
     pub storage_roots: StorageRoots,
     /// Optional private Trawl service endpoint.
@@ -72,12 +70,11 @@ impl AppConfig {
     /// Loads and validates all application configuration from one source.
     ///
     /// The environment keys are `TMDB_ENVIRONMENT`, `TMDB_API_BIND`,
-    /// `TMDB_ADMIN_BIND`, and the shared `TMDB_DB_*` database settings. The
-    /// legacy `TMDB_DIRECT_DB_*` and `TMDB_POOLED_DB_*` names remain accepted
-    /// for existing callers. Database and API credentials may be supplied
-    /// directly in the environment; optional `_FILE` indirection is retained
-    /// only for compatibility. Filesystem roots are fixed to `/media` and
-    /// `/config` and are selected only by deployment volume mappings.
+    /// `TMDB_ADMIN_BIND`, `POSTGRES_DB`, `POSTGRES_USER`, and
+    /// `POSTGRES_PASSWORD`. The four-container deployment fixes the database
+    /// host and port to `postgres:5432`; alternate database aliases are
+    /// rejected. Filesystem roots are fixed to `/media` and `/config` and are
+    /// selected only by deployment volume mappings.
     ///
     /// # Errors
     ///
@@ -88,8 +85,7 @@ impl AppConfig {
         let environment = parse_required(source, "TMDB_ENVIRONMENT")?;
         let api_bind = parse_required(source, "TMDB_API_BIND")?;
         let admin_bind = parse_required(source, "TMDB_ADMIN_BIND")?;
-        let direct_database = load_database_or_shared(source, environment, "TMDB_DIRECT_DB")?;
-        let pooled_database = load_database_or_shared(source, environment, "TMDB_POOLED_DB")?;
+        let database = load_shared_database(source, environment)?;
         let storage_roots = StorageRoots::fixed();
         let trawl_base_url = optional_uri(source, "TMDB_TRAWL_BASE_URL")?;
         let admin_key_name = if has_secret_source(source, "TMDB_ADMIN_API_KEY") {
@@ -106,8 +102,7 @@ impl AppConfig {
             environment,
             api_bind,
             admin_bind,
-            direct_database,
-            pooled_database,
+            database,
             storage_roots,
             trawl_base_url,
             admin_api_key,
@@ -133,52 +128,11 @@ fn optional_secret(
     Ok(Some(secret))
 }
 
-fn load_database_or_shared(
-    source: &impl ConfigSource,
-    environment: Environment,
-    prefix: &str,
-) -> Result<DatabaseConfig, ConfigError> {
-    if source.get(&format!("{prefix}_HOST")).is_none()
-        && source.get(&format!("{prefix}_PORT")).is_none()
-        && source.get(&format!("{prefix}_NAME")).is_none()
-        && source.get(&format!("{prefix}_USER")).is_none()
-        && !has_secret_source(source, &format!("{prefix}_PASSWORD"))
-    {
-        return load_shared_database(source, environment);
-    }
-
-    load_prefixed_database(source, environment, prefix)
-}
-
-fn load_prefixed_database(
-    source: &impl ConfigSource,
-    environment: Environment,
-    prefix: &str,
-) -> Result<DatabaseConfig, ConfigError> {
-    let host_name = format!("{prefix}_HOST");
-    let port_name = format!("{prefix}_PORT");
-    let database_name = format!("{prefix}_NAME");
-    let user_name = format!("{prefix}_USER");
-    let password_name = format!("{prefix}_PASSWORD");
-    let (password, _origin) = load_secret_with_origin(source, &password_name)?;
-    if environment != Environment::Production && is_known_example(&password) {
-        return Err(ConfigError::ExampleSecretForbidden(password_name));
-    }
-
-    Ok(DatabaseConfig {
-        host: required_string(source, &host_name)?,
-        port: parse_required(source, &port_name)?,
-        database: required_string(source, &database_name)?,
-        username: required_string(source, &user_name)?,
-        password,
-    })
-}
-
 /// Loads one shared database identity for the API and both workers.
 ///
-/// `TMDB_DB_*` values take precedence. `DATABASE_*` aliases and the standard
-/// `POSTGRES_*` names are accepted so a single Compose `env_file` can be used
-/// without repeating the same settings per service.
+/// The four-container deployment always connects to the Compose service at
+/// `postgres:5432`. The standard `POSTGRES_*` values initialize `PostgreSQL`
+/// and are the only database settings consumed by the application.
 ///
 /// # Errors
 ///
@@ -189,59 +143,59 @@ pub fn load_shared_database(
     source: &impl ConfigSource,
     environment: Environment,
 ) -> Result<DatabaseConfig, ConfigError> {
-    let host = configured_string(source, &["TMDB_DB_HOST", "DATABASE_HOST"])?
-        .unwrap_or_else(|| "postgres".to_owned());
-    let port_text = configured_string(source, &["TMDB_DB_PORT", "DATABASE_PORT"])?
-        .unwrap_or_else(|| "5432".to_owned());
-    let port = port_text
-        .parse()
-        .map_err(|_| ConfigError::InvalidValue("TMDB_DB_PORT".to_owned()))?;
-    let database = configured_string(source, &["TMDB_DB_NAME", "DATABASE_NAME", "POSTGRES_DB"])?
-        .unwrap_or_else(|| "tmdb".to_owned());
-    let username = configured_string(source, &["TMDB_DB_USER", "DATABASE_USER", "POSTGRES_USER"])?
-        .unwrap_or_else(|| "tmdb_owner".to_owned());
-    let password_name = [
-        "TMDB_DB_PASSWORD",
-        "DATABASE_PASSWORD",
-        "POSTGRES_PASSWORD",
-        "TMDB_DIRECT_DB_PASSWORD",
-    ]
-    .into_iter()
-    .find(|name| has_secret_source(source, name))
-    .ok_or_else(|| ConfigError::Missing("POSTGRES_PASSWORD".to_owned()))?;
-    let (password, _origin) = load_secret_with_origin(source, password_name)?;
+    reject_legacy_database_settings(source)?;
+    let database = required_string(source, "POSTGRES_DB")?;
+    let username = required_string(source, "POSTGRES_USER")?;
+    let (password, _origin) = load_secret_with_origin(source, "POSTGRES_PASSWORD")?;
     if environment != Environment::Production && is_known_example(&password) {
         return Err(ConfigError::ExampleSecretForbidden(
-            password_name.to_owned(),
+            "POSTGRES_PASSWORD".to_owned(),
         ));
     }
 
     Ok(DatabaseConfig {
-        host,
-        port,
+        host: "postgres".to_owned(),
+        port: 5432,
         database,
         username,
         password,
     })
 }
 
-fn configured_string(
-    source: &impl ConfigSource,
-    names: &[&str],
-) -> Result<Option<String>, ConfigError> {
-    for name in names {
-        let Some(value) = source.get(name) else {
-            continue;
-        };
-        let value = value
-            .into_string()
-            .map_err(|_| ConfigError::InvalidUnicode((*name).to_owned()))?;
-        if value.is_empty() || value.contains('\0') {
-            return Err(ConfigError::InvalidValue((*name).to_owned()));
+fn reject_legacy_database_settings(source: &impl ConfigSource) -> Result<(), ConfigError> {
+    const LEGACY_DATABASE_SETTINGS: [&str; 20] = [
+        "DATABASE_HOST",
+        "DATABASE_PORT",
+        "DATABASE_NAME",
+        "DATABASE_USER",
+        "DATABASE_PASSWORD",
+        "TMDB_DB_HOST",
+        "TMDB_DB_PORT",
+        "TMDB_DB_NAME",
+        "TMDB_DB_USER",
+        "TMDB_DB_PASSWORD",
+        "TMDB_DIRECT_DB_HOST",
+        "TMDB_DIRECT_DB_PORT",
+        "TMDB_DIRECT_DB_NAME",
+        "TMDB_DIRECT_DB_USER",
+        "TMDB_DIRECT_DB_PASSWORD",
+        "TMDB_POOLED_DB_HOST",
+        "TMDB_POOLED_DB_PORT",
+        "TMDB_POOLED_DB_NAME",
+        "TMDB_POOLED_DB_USER",
+        "TMDB_POOLED_DB_PASSWORD",
+    ];
+
+    for name in LEGACY_DATABASE_SETTINGS {
+        if source.get(name).is_some() {
+            return Err(ConfigError::UnsupportedSetting(name.to_owned()));
         }
-        return Ok(Some(value));
+        let file_name = format!("{name}_FILE");
+        if source.get(&file_name).is_some() {
+            return Err(ConfigError::UnsupportedSetting(file_name));
+        }
     }
-    Ok(None)
+    Ok(())
 }
 
 fn has_secret_source(source: &impl ConfigSource, name: &str) -> bool {

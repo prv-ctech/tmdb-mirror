@@ -20,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
     let config = AppConfig::load(&EnvSource).context("load API configuration")?;
     let allow_local_media = load_bool("ALLOW_LOCAL_MEDIA")?;
     let media_base_url = load_optional_string("TMDB_MEDIA_BASE_URL")?;
-    let pool = connect_direct(&config.pooled_database, PoolPolicy::ReadOnly)
+    let pool = connect_direct(&config.database, PoolPolicy::ReadOnly)
         .await
         .map_err(|error| anyhow::anyhow!(error))
         .context("connect API read pool")?;

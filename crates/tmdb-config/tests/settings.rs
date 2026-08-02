@@ -8,8 +8,7 @@ use tmdb_config::{
     AppConfig, ConfigError, Environment, MapSource, StorageRoots, load_secret, load_shared_database,
 };
 
-const DIRECT_PASSWORD: &str = "unit-test-direct-credential";
-const POOLED_PASSWORD: &str = "unit-test-pooled-credential";
+const DATABASE_PASSWORD: &str = "unit-test-database-credential";
 const ADMIN_API_KEY: &str = "unit-test-admin-key-012345678901234567890123456789";
 
 fn file_source(name: &str, path: &Path) -> MapSource {
@@ -24,16 +23,9 @@ fn valid_entries(environment: &str) -> Vec<(OsString, OsString)> {
         ("TMDB_ENVIRONMENT", environment),
         ("TMDB_API_BIND", "127.0.0.1:8080"),
         ("TMDB_ADMIN_BIND", "127.0.0.1:8081"),
-        ("TMDB_DIRECT_DB_HOST", "postgres.internal"),
-        ("TMDB_DIRECT_DB_PORT", "5432"),
-        ("TMDB_DIRECT_DB_NAME", "tmdb"),
-        ("TMDB_DIRECT_DB_USER", "ingest_writer"),
-        ("TMDB_DIRECT_DB_PASSWORD", DIRECT_PASSWORD),
-        ("TMDB_POOLED_DB_HOST", "pgbouncer.internal"),
-        ("TMDB_POOLED_DB_PORT", "6432"),
-        ("TMDB_POOLED_DB_NAME", "tmdb"),
-        ("TMDB_POOLED_DB_USER", "api_reader"),
-        ("TMDB_POOLED_DB_PASSWORD", POOLED_PASSWORD),
+        ("POSTGRES_DB", "tmdb"),
+        ("POSTGRES_USER", "tmdb_owner"),
+        ("POSTGRES_PASSWORD", DATABASE_PASSWORD),
         ("TMDB_TRAWL_BASE_URL", "http://trawl.internal:8080"),
         ("TMDB_API_KEY", ADMIN_API_KEY),
     ]
@@ -49,12 +41,22 @@ fn source_from_entries(entries: Vec<(OsString, OsString)>) -> MapSource {
 fn shared_database_entries(environment: &str) -> MapSource {
     MapSource::from([
         ("TMDB_ENVIRONMENT", environment),
-        ("TMDB_DB_HOST", "postgres"),
-        ("TMDB_DB_PORT", "5432"),
-        ("TMDB_DB_NAME", "tmdb"),
-        ("TMDB_DB_USER", "tmdb_owner"),
+        ("POSTGRES_DB", "tmdb"),
+        ("POSTGRES_USER", "tmdb_owner"),
         ("POSTGRES_PASSWORD", "shared-database-password"),
     ])
+}
+
+fn postgres_database_entries(environment: &str) -> Vec<(OsString, OsString)> {
+    [
+        ("TMDB_ENVIRONMENT", environment),
+        ("POSTGRES_DB", "tmdb"),
+        ("POSTGRES_USER", "tmdb_owner"),
+        ("POSTGRES_PASSWORD", "shared-database-password"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+    .collect()
 }
 
 fn replace_entry(entries: &mut [(OsString, OsString)], key: &str, value: &str) -> bool {
@@ -69,25 +71,25 @@ fn replace_entry(entries: &mut [(OsString, OsString)], key: &str, value: &str) -
 #[test]
 fn secret_requires_exactly_one_source() -> Result<(), Box<dyn std::error::Error>> {
     let conflicting = MapSource::from([
-        ("TMDB_DB_PASSWORD", "never-log-this"),
-        ("TMDB_DB_PASSWORD_FILE", "/private/secret/location"),
+        ("TEST_SECRET", "never-log-this"),
+        ("TEST_SECRET_FILE", "/private/secret/location"),
     ]);
-    let error = load_secret(&conflicting, "TMDB_DB_PASSWORD")
+    let error = load_secret(&conflicting, "TEST_SECRET")
         .err()
         .ok_or("conflicting secret sources must fail")?;
     assert!(matches!(
         error,
-        ConfigError::ConflictingSecretSources(ref name) if name == "TMDB_DB_PASSWORD"
+        ConfigError::ConflictingSecretSources(ref name) if name == "TEST_SECRET"
     ));
     let rendered = format!("{error:?} {error}");
-    assert!(rendered.contains("TMDB_DB_PASSWORD"));
+    assert!(rendered.contains("TEST_SECRET"));
     assert!(!rendered.contains("never-log-this"));
     assert!(!rendered.contains("/private/secret/location"));
 
     let missing = MapSource::default();
     assert!(matches!(
-        load_secret(&missing, "TMDB_DB_PASSWORD"),
-        Err(ConfigError::Missing(ref name)) if name == "TMDB_DB_PASSWORD"
+        load_secret(&missing, "TEST_SECRET"),
+        Err(ConfigError::Missing(ref name)) if name == "TEST_SECRET"
     ));
     Ok(())
 }
@@ -95,12 +97,12 @@ fn secret_requires_exactly_one_source() -> Result<(), Box<dyn std::error::Error>
 #[test]
 fn map_source_debug_never_exposes_values() {
     let source = MapSource::from([
-        ("TMDB_DB_PASSWORD", "map-secret-must-be-hidden"),
-        ("TMDB_DB_PASSWORD_FILE", "/private/map-secret-path"),
+        ("TEST_SECRET", "map-secret-must-be-hidden"),
+        ("TEST_SECRET_FILE", "/private/map-secret-path"),
     ]);
 
     let rendered = format!("{source:?}");
-    assert!(rendered.contains("TMDB_DB_PASSWORD"));
+    assert!(rendered.contains("TEST_SECRET"));
     assert!(!rendered.contains("map-secret-must-be-hidden"));
     assert!(!rendered.contains("/private/map-secret-path"));
 }
@@ -108,18 +110,18 @@ fn map_source_debug_never_exposes_values() {
 #[test]
 fn direct_secret_rejects_empty_and_nul_and_redacts_debug() -> Result<(), Box<dyn std::error::Error>>
 {
-    let source = MapSource::from([("TMDB_DB_PASSWORD", "visible-only-in-test")]);
-    let secret = load_secret(&source, "TMDB_DB_PASSWORD")?;
+    let source = MapSource::from([("TEST_SECRET", "visible-only-in-test")]);
+    let secret = load_secret(&source, "TEST_SECRET")?;
     assert_eq!(secret.expose_secret(), "visible-only-in-test");
     let rendered = format!("{secret:?}");
     assert!(rendered.contains("[REDACTED]"));
     assert!(!rendered.contains("visible-only-in-test"));
 
     for invalid in ["", "has\0nul"] {
-        let source = MapSource::from([("TMDB_DB_PASSWORD", invalid)]);
+        let source = MapSource::from([("TEST_SECRET", invalid)]);
         assert!(matches!(
-            load_secret(&source, "TMDB_DB_PASSWORD"),
-            Err(ConfigError::InvalidSecret(ref name)) if name == "TMDB_DB_PASSWORD"
+            load_secret(&source, "TEST_SECRET"),
+            Err(ConfigError::InvalidSecret(ref name)) if name == "TEST_SECRET"
         ));
     }
     Ok(())
@@ -129,15 +131,15 @@ fn direct_secret_rejects_empty_and_nul_and_redacts_debug() -> Result<(), Box<dyn
 fn secret_file_removes_exactly_one_crlf() -> Result<(), Box<dyn std::error::Error>> {
     let file = NamedTempFile::new()?;
     fs::write(file.path(), b"file-secret\r\n")?;
-    let source = file_source("TMDB_DB_PASSWORD", file.path());
+    let source = file_source("TEST_SECRET", file.path());
 
-    let secret = load_secret(&source, "TMDB_DB_PASSWORD")?;
+    let secret = load_secret(&source, "TEST_SECRET")?;
     assert_eq!(secret.expose_secret(), "file-secret");
 
     let file = NamedTempFile::new()?;
     fs::write(file.path(), b"file-secret\n\n")?;
-    let source = file_source("TMDB_DB_PASSWORD", file.path());
-    let secret = load_secret(&source, "TMDB_DB_PASSWORD")?;
+    let source = file_source("TEST_SECRET", file.path());
+    let secret = load_secret(&source, "TEST_SECRET")?;
     assert_eq!(secret.expose_secret(), "file-secret\n");
     Ok(())
 }
@@ -147,10 +149,10 @@ fn secret_file_rejects_empty_and_nul_values() -> Result<(), Box<dyn std::error::
     for bytes in [b"\n".as_slice(), b"has\0nul".as_slice()] {
         let file = NamedTempFile::new()?;
         fs::write(file.path(), bytes)?;
-        let source = file_source("TMDB_DB_PASSWORD", file.path());
+        let source = file_source("TEST_SECRET", file.path());
         assert!(matches!(
-            load_secret(&source, "TMDB_DB_PASSWORD"),
-            Err(ConfigError::InvalidSecret(ref name)) if name == "TMDB_DB_PASSWORD"
+            load_secret(&source, "TEST_SECRET"),
+            Err(ConfigError::InvalidSecret(ref name)) if name == "TEST_SECRET"
         ));
     }
     Ok(())
@@ -160,16 +162,16 @@ fn secret_file_rejects_empty_and_nul_values() -> Result<(), Box<dyn std::error::
 fn secret_file_enforces_the_64_kib_limit() -> Result<(), Box<dyn std::error::Error>> {
     let at_limit = NamedTempFile::new()?;
     fs::write(at_limit.path(), vec![b'x'; 64 * 1024])?;
-    let source = file_source("TMDB_DB_PASSWORD", at_limit.path());
-    let secret = load_secret(&source, "TMDB_DB_PASSWORD")?;
+    let source = file_source("TEST_SECRET", at_limit.path());
+    let secret = load_secret(&source, "TEST_SECRET")?;
     assert_eq!(secret.expose_secret().len(), 64 * 1024);
 
     let over_limit = NamedTempFile::new()?;
     fs::write(over_limit.path(), vec![b'x'; 64 * 1024 + 1])?;
-    let source = file_source("TMDB_DB_PASSWORD", over_limit.path());
+    let source = file_source("TEST_SECRET", over_limit.path());
     assert!(matches!(
-        load_secret(&source, "TMDB_DB_PASSWORD"),
-        Err(ConfigError::SecretTooLarge(ref name)) if name == "TMDB_DB_PASSWORD"
+        load_secret(&source, "TEST_SECRET"),
+        Err(ConfigError::SecretTooLarge(ref name)) if name == "TEST_SECRET"
     ));
 
     for trailing_line_ending in [b"\n".as_slice(), b"\r\n".as_slice()] {
@@ -177,10 +179,10 @@ fn secret_file_enforces_the_64_kib_limit() -> Result<(), Box<dyn std::error::Err
         let mut bytes = vec![b'x'; 64 * 1024];
         bytes.extend_from_slice(trailing_line_ending);
         fs::write(over_limit.path(), bytes)?;
-        let source = file_source("TMDB_DB_PASSWORD", over_limit.path());
+        let source = file_source("TEST_SECRET", over_limit.path());
         assert!(matches!(
-            load_secret(&source, "TMDB_DB_PASSWORD"),
-            Err(ConfigError::SecretTooLarge(ref name)) if name == "TMDB_DB_PASSWORD"
+            load_secret(&source, "TEST_SECRET"),
+            Err(ConfigError::SecretTooLarge(ref name)) if name == "TEST_SECRET"
         ));
     }
     Ok(())
@@ -207,8 +209,8 @@ fn app_config_parses_typed_settings_and_redacts_secrets() -> Result<(), Box<dyn 
     assert_eq!(config.environment, Environment::Development);
     assert_eq!(config.api_bind.to_string(), "127.0.0.1:8080");
     assert_eq!(config.admin_bind.to_string(), "127.0.0.1:8081");
-    assert_eq!(config.direct_database.port, 5432);
-    assert_eq!(config.pooled_database.port, 6432);
+    assert_eq!(config.database.host, "postgres");
+    assert_eq!(config.database.port, 5432);
     assert_eq!(
         config.storage_roots.work,
         std::path::Path::new("/config/work")
@@ -233,13 +235,12 @@ fn app_config_parses_typed_settings_and_redacts_secrets() -> Result<(), Box<dyn 
 
     let rendered = format!("{config:?}");
     assert!(rendered.contains("[REDACTED]"));
-    assert!(!rendered.contains(DIRECT_PASSWORD));
-    assert!(!rendered.contains(POOLED_PASSWORD));
+    assert!(!rendered.contains(DATABASE_PASSWORD));
     Ok(())
 }
 
 #[test]
-fn shared_database_settings_use_one_direct_password() -> Result<(), Box<dyn std::error::Error>> {
+fn postgres_database_settings_use_one_password() -> Result<(), Box<dyn std::error::Error>> {
     let source = shared_database_entries("production");
     let config = load_shared_database(&source, Environment::Production)?;
 
@@ -252,21 +253,56 @@ fn shared_database_settings_use_one_direct_password() -> Result<(), Box<dyn std:
 }
 
 #[test]
+fn redundant_database_aliases_are_rejected() {
+    for alias in [
+        "DATABASE_HOST",
+        "DATABASE_PORT",
+        "DATABASE_NAME",
+        "DATABASE_USER",
+        "DATABASE_PASSWORD",
+        "TMDB_DB_HOST",
+        "TMDB_DB_PORT",
+        "TMDB_DB_NAME",
+        "TMDB_DB_USER",
+        "TMDB_DB_PASSWORD",
+        "TMDB_DIRECT_DB_HOST",
+        "TMDB_DIRECT_DB_PORT",
+        "TMDB_DIRECT_DB_NAME",
+        "TMDB_DIRECT_DB_USER",
+        "TMDB_DIRECT_DB_PASSWORD",
+        "TMDB_POOLED_DB_HOST",
+        "TMDB_POOLED_DB_PORT",
+        "TMDB_POOLED_DB_NAME",
+        "TMDB_POOLED_DB_USER",
+        "TMDB_POOLED_DB_PASSWORD",
+    ] {
+        for setting in [alias.to_owned(), format!("{alias}_FILE")] {
+            let mut entries = postgres_database_entries("production");
+            entries.push((OsString::from(&setting), OsString::from("legacy-value")));
+            assert!(matches!(
+                load_shared_database(&source_from_entries(entries), Environment::Production),
+                Err(ConfigError::UnsupportedSetting(ref name)) if name == &setting
+            ));
+        }
+    }
+}
+
+#[test]
 fn app_config_errors_name_fields_without_exposing_values() -> Result<(), Box<dyn std::error::Error>>
 {
     let mut entries = valid_entries("test");
     assert!(replace_entry(
         &mut entries,
-        "TMDB_DIRECT_DB_PORT",
+        "TMDB_API_BIND",
         "private-invalid-port"
     ));
     let error = AppConfig::load(&source_from_entries(entries))
         .err()
         .ok_or("invalid port must fail")?;
     let rendered = format!("{error:?} {error}");
-    assert!(rendered.contains("TMDB_DIRECT_DB_PORT"));
+    assert!(rendered.contains("TMDB_API_BIND"));
     assert!(!rendered.contains("private-invalid-port"));
-    assert!(!rendered.contains(DIRECT_PASSWORD));
+    assert!(!rendered.contains(DATABASE_PASSWORD));
 
     let mut entries = valid_entries("test");
     assert!(replace_entry(
@@ -284,15 +320,11 @@ fn app_config_errors_name_fields_without_exposing_values() -> Result<(), Box<dyn
 #[test]
 fn app_config_rejects_known_example_passwords_outside_production() {
     let mut entries = valid_entries("development");
-    assert!(replace_entry(
-        &mut entries,
-        "TMDB_DIRECT_DB_PASSWORD",
-        "changeme"
-    ));
+    assert!(replace_entry(&mut entries, "POSTGRES_PASSWORD", "changeme"));
     assert!(matches!(
         AppConfig::load(&source_from_entries(entries)),
         Err(ConfigError::ExampleSecretForbidden(ref name))
-            if name == "TMDB_DIRECT_DB_PASSWORD"
+            if name == "POSTGRES_PASSWORD"
     ));
 }
 
@@ -312,7 +344,7 @@ fn trawl_base_url_rejects_embedded_query_credentials() {
 }
 
 #[test]
-fn production_accepts_direct_secrets() -> Result<(), Box<dyn std::error::Error>> {
+fn production_accepts_postgres_password() -> Result<(), Box<dyn std::error::Error>> {
     let source = source_from_entries(valid_entries("production"));
     let config = AppConfig::load(&source)?;
     assert_eq!(config.environment, Environment::Production);

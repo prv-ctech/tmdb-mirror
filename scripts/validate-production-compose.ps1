@@ -55,6 +55,21 @@ foreach ($key in $requiredKeys) {
     }
 }
 
+# The four-container deployment has one PostgreSQL identity and a fixed
+# in-network endpoint. Reject obsolete aliases before Compose starts so an
+# accidental copy from an earlier template cannot be silently ignored.
+$unsupportedDatabaseKeys = @(
+    'DATABASE_HOST', 'DATABASE_PORT', 'DATABASE_NAME', 'DATABASE_USER', 'DATABASE_PASSWORD',
+    'TMDB_DB_HOST', 'TMDB_DB_PORT', 'TMDB_DB_NAME', 'TMDB_DB_USER', 'TMDB_DB_PASSWORD',
+    'TMDB_DIRECT_DB_HOST', 'TMDB_DIRECT_DB_PORT', 'TMDB_DIRECT_DB_NAME', 'TMDB_DIRECT_DB_USER', 'TMDB_DIRECT_DB_PASSWORD',
+    'TMDB_POOLED_DB_HOST', 'TMDB_POOLED_DB_PORT', 'TMDB_POOLED_DB_NAME', 'TMDB_POOLED_DB_USER', 'TMDB_POOLED_DB_PASSWORD'
+)
+foreach ($key in $unsupportedDatabaseKeys) {
+    if ($entries.ContainsKey($key) -or $entries.ContainsKey("${key}_FILE")) {
+        throw "Unsupported database setting: $key. Use POSTGRES_DB, POSTGRES_USER, and POSTGRES_PASSWORD."
+    }
+}
+
 $composeText = Get-Content -LiteralPath $composePath -Raw
 foreach ($target in @('/media', '/config')) {
     if ($composeText -notmatch "target:\s*$([regex]::Escape($target))") {
