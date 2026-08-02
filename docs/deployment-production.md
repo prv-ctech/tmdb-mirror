@@ -29,6 +29,7 @@ The application only knows these container paths:
 | --- | --- |
 | `/media` | Permanent public media and private `.masters` originals |
 | `/config` | NVMe worker scratch, raw exports, checkpoints, and logs |
+| `/config/backups/pgbackrest` | PostgreSQL-owned same-host pgBackRest repository |
 | PostgreSQL `/var/lib/postgresql` | PostgreSQL 18 data/WAL |
 
 Edit only the left-hand side of the bind mounts in Compose or the Unraid
@@ -50,10 +51,13 @@ millions of images or alter unrelated files in a broad host mount. It changes
 only these app-owned paths:
 
 ```text
-/config/work  /config/raw  /config/backups  /config/logs  /config/media
+/config/work  /config/raw  /config/logs  /config/media
 /media/.masters  /media/movies  /media/tv  /media/anime/{movie,tv}
 /media/casting  /media/networks  /media/companies  /media/collections
 ```
+
+PostgreSQL alone creates `/config/backups/pgbackrest`. The worker and media
+worker never recursively change that repository or its parent permissions.
 
 Docker/Unraid must still supply the two mount roots themselves. The canonical
 Compose file creates its relative sample directories automatically. For an
@@ -75,6 +79,9 @@ local Docker build is needed after GitHub Actions has published the images.
 
 Each key has an inline description in `.env.example`. The public, admin, and
 media routes are listed in [api.md](api.md).
+
+`TZ=America/New_York` controls schedule interpretation and human-readable
+terminal timestamps. PostgreSQL and API timestamps remain UTC.
 
 The app reads only `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` for
 its database identity. You may choose any valid database and owner names; the
@@ -169,3 +176,10 @@ capacity production-ready.
 
 The existing Trawl instance is used only as the challenge fallback:
 `TMDB_TRAWL_BASE_URL=http://<trawl-host>:8191`.
+
+The API service is also attached to the existing `prv.network`, but port 8081
+is never published to the host. A container on that private network can call
+`http://tmdb-mirror-api:8081/admin/v1/status` or `/metrics` using the existing
+admin key. PostgreSQL, worker, and media remain only on `tmdb-private`.
+
+Backup and offline recovery steps are in [backup-recovery.md](backup-recovery.md).

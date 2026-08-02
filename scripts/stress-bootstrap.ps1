@@ -292,7 +292,7 @@ try {
     Wait-ServiceHealthy -Service 'media'
     Assert-ServiceProcessIdentity -Service 'worker' -ProcessName 'tmdb-worker'
     Assert-ServiceProcessIdentity -Service 'media' -ProcessName 'tmdb-images'
-    Assert-RuntimeStorage -Service 'worker' -Check 'test -w /config/work && test -w /config/raw && test -w /config/backups && test -w /config/logs'
+    Assert-RuntimeStorage -Service 'worker' -Check 'test -w /config/work && test -w /config/raw && test -w /config/logs'
     Assert-RuntimeStorage -Service 'media' -Check 'test -w /config/media && test -w /media/movies && test -w /media/tv && test -w /media/anime/movie && test -w /media/anime/tv && test -w /media/casting && test -w /media/networks && test -w /media/companies && test -w /media/collections'
     Write-Output "Stress stack is ready: http://127.0.0.1:$ApiPort"
     Write-Output "Runtime metadata: $metadataFile"

@@ -12,7 +12,7 @@ use std::{
 
 use prometheus_client::{
     encoding::{EncodeLabelSet, text},
-    metrics::{counter::Counter, family::Family, histogram::Histogram, info::Info},
+    metrics::{counter::Counter, family::Family, gauge::Gauge, histogram::Histogram, info::Info},
     registry::{Registry, Unit},
 };
 use thiserror::Error;
@@ -173,6 +173,104 @@ pub enum PoolAcquireOutcome {
     Error,
 }
 
+/// A fixed component class reported by operational health metrics.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Component {
+    /// Main migration, ingest, scheduling, and maintenance worker.
+    Worker,
+    /// Local media download and verification worker.
+    Media,
+    /// TMDB/Trawl upstream access.
+    Upstream,
+    /// PostgreSQL-local pgBackRest runner.
+    Backup,
+}
+
+impl Component {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Worker => "worker",
+            Self::Media => "media",
+            Self::Upstream => "upstream",
+            Self::Backup => "backup",
+        }
+    }
+}
+
+/// Bounded state emitted for an operational component.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ComponentState {
+    Ready,
+    Degraded,
+    Failed,
+    Stale,
+    Unknown,
+}
+
+impl ComponentState {
+    const ALL: [Self; 5] = [
+        Self::Ready,
+        Self::Degraded,
+        Self::Failed,
+        Self::Stale,
+        Self::Unknown,
+    ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Degraded => "degraded",
+            Self::Failed => "failed",
+            Self::Stale => "stale",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Durable job queue state reported in bounded operational summaries.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum QueueState {
+    Queued,
+    Running,
+    RetryWait,
+    DeadLetter,
+}
+
+impl QueueState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::RetryWait => "retry_wait",
+            Self::DeadLetter => "dead_letter",
+        }
+    }
+}
+
+/// Fixed catalog count scopes used by metrics.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CatalogScope {
+    Movies,
+    Tv,
+    AnimeMovies,
+    AnimeTv,
+}
+
+impl CatalogScope {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Movies => "movies",
+            Self::Tv => "tv",
+            Self::AnimeMovies => "anime_movies",
+            Self::AnimeTv => "anime_tv",
+        }
+    }
+}
+
 impl PoolAcquireOutcome {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -218,6 +316,23 @@ struct PoolLabels {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
+struct ComponentStateLabels {
+    component: String,
+    state: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
+struct QueueLabels {
+    job_type: String,
+    state: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
+struct CatalogLabels {
+    scope: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
 struct BuildLabels {
     service: String,
     version: String,
@@ -225,9 +340,103 @@ struct BuildLabels {
 }
 
 fn normalize_route(route: &str) -> String {
-    match route {
-        "/health/live" | "/health/ready" | "/metrics" | "/__test/large" => route.to_owned(),
-        _ => UNMATCHED_ROUTE.to_owned(),
+    let unversioned = route.strip_prefix("/v1").unwrap_or(route);
+    if matches!(
+        unversioned,
+        "/health/live"
+            | "/health/ready"
+            | "/metrics"
+            | "/openapi.json"
+            | "/movies"
+            | "/movies/popular"
+            | "/movies/recent"
+            | "/movies/top-rated"
+            | "/movies/{tmdb_id}"
+            | "/movies/{tmdb_id}/translations"
+            | "/movies/{tmdb_id}/alternate-titles"
+            | "/movies/{tmdb_id}/external-ids"
+            | "/movies/{tmdb_id}/videos"
+            | "/movies/{tmdb_id}/release-dates"
+            | "/movies/{tmdb_id}/credits"
+            | "/movies/{tmdb_id}/images"
+            | "/tv"
+            | "/tv/popular"
+            | "/tv/recent"
+            | "/tv/top-rated"
+            | "/tv/{tmdb_id}"
+            | "/tv/{tmdb_id}/translations"
+            | "/tv/{tmdb_id}/alternate-titles"
+            | "/tv/{tmdb_id}/external-ids"
+            | "/tv/{tmdb_id}/videos"
+            | "/tv/{tmdb_id}/certifications"
+            | "/tv/{tmdb_id}/credits"
+            | "/tv/{tmdb_id}/images"
+            | "/tv/{tmdb_id}/seasons"
+            | "/tv/{tmdb_id}/seasons/{season_number}"
+            | "/tv/{tmdb_id}/seasons/{season_number}/episodes"
+            | "/tv/{tmdb_id}/seasons/{season_number}/episodes/{episode_number}"
+            | "/anime"
+            | "/anime/popular"
+            | "/anime/recent"
+            | "/anime/top-rated"
+            | "/anime/{media_type}/{tmdb_id}"
+            | "/anime/{media_type}/{tmdb_id}/translations"
+            | "/anime/{media_type}/{tmdb_id}/alternate-titles"
+            | "/anime/{media_type}/{tmdb_id}/external-ids"
+            | "/anime/{media_type}/{tmdb_id}/videos"
+            | "/anime/{media_type}/{tmdb_id}/release-dates"
+            | "/anime/{media_type}/{tmdb_id}/credits"
+            | "/anime/{media_type}/{tmdb_id}/images"
+            | "/trending/{trend_window}"
+            | "/anime/trending/{trend_window}"
+            | "/calendar/movies"
+            | "/calendar/tv"
+            | "/search"
+            | "/genres"
+            | "/languages"
+            | "/keywords"
+            | "/tags"
+            | "/people"
+            | "/companies"
+            | "/networks"
+            | "/collections"
+            | "/admin/v1/openapi.json"
+            | "/admin/v1/status"
+            | "/admin/v1/jobs"
+            | "/admin/v1/jobs/{job_id}"
+            | "/admin/v1/scans"
+            | "/admin/v1/jobs/{job_id}/cancel"
+            | "/admin/v1/jobs/{job_id}/retry"
+            | "/admin/v1/media/audits"
+            | "/admin/v1/maintenance/analyze"
+            | "/admin/v1/backups"
+            | "/__test/panic"
+            | "/__test/block"
+            | "/__test/large"
+    ) {
+        route.to_owned()
+    } else {
+        UNMATCHED_ROUTE.to_owned()
+    }
+}
+
+fn normalize_job_type(job_type: &str) -> &'static str {
+    match job_type {
+        "system.noop" => "system.noop",
+        "image.download" => "image.download",
+        "ingest.refresh_movie" => "ingest.refresh_movie",
+        "ingest.refresh_tv" => "ingest.refresh_tv",
+        "ingest.refresh_season" => "ingest.refresh_season",
+        "ingest.changes" => "ingest.changes",
+        "ingest.changes_sync" => "ingest.changes_sync",
+        "ingest.daily_export" => "ingest.daily_export",
+        "ingest.trending" => "ingest.trending",
+        "admin.scan" => "admin.scan",
+        "admin.media_audit" => "admin.media_audit",
+        "admin.analyze" => "admin.analyze",
+        "database.backup_full" => "database.backup_full",
+        "database.backup_diff" => "database.backup_diff",
+        _ => "other",
     }
 }
 
@@ -254,6 +463,11 @@ pub struct Metrics {
     http_duration: Family<HttpRequestLabels, Histogram, fn() -> Histogram>,
     readiness_failures: Family<ReadinessLabels, Counter>,
     pool_acquire_duration: Family<PoolLabels, Histogram, fn() -> Histogram>,
+    component_state: Family<ComponentStateLabels, Gauge>,
+    queue_depth: Family<QueueLabels, Gauge>,
+    catalog_titles: Family<CatalogLabels, Gauge>,
+    backup_last_success_timestamp: Gauge,
+    backup_last_failure_timestamp: Gauge,
 }
 
 impl Metrics {
@@ -265,6 +479,11 @@ impl Metrics {
         let readiness_failures = Family::default();
         let pool_acquire_duration =
             Family::new_with_constructor(request_histogram as fn() -> Histogram);
+        let component_state = Family::default();
+        let queue_depth = Family::default();
+        let catalog_titles = Family::default();
+        let backup_last_success_timestamp = Gauge::default();
+        let backup_last_failure_timestamp = Gauge::default();
         let build = Info::new(BuildLabels {
             service: bounded_identity(service),
             version: bounded_identity(version),
@@ -294,6 +513,33 @@ impl Metrics {
             Unit::Seconds,
             pool_acquire_duration.clone(),
         );
+        registry.register(
+            "tmdb_component_state",
+            "Current bounded component state; exactly one state per component is one",
+            component_state.clone(),
+        );
+        registry.register(
+            "tmdb_queue_depth",
+            "Durable job count by bounded job type and status",
+            queue_depth.clone(),
+        );
+        registry.register(
+            "tmdb_catalog_titles",
+            "Catalog title count by bounded media scope",
+            catalog_titles.clone(),
+        );
+        registry.register_with_unit(
+            "tmdb_backup_last_success_timestamp",
+            "Unix timestamp of the latest successful backup; zero means none recorded",
+            Unit::Seconds,
+            backup_last_success_timestamp.clone(),
+        );
+        registry.register_with_unit(
+            "tmdb_backup_last_failure_timestamp",
+            "Unix timestamp of the latest failed backup; zero means none recorded",
+            Unit::Seconds,
+            backup_last_failure_timestamp.clone(),
+        );
         registry.register("tmdb_build", "Immutable build identity", build);
 
         Self {
@@ -302,6 +548,11 @@ impl Metrics {
             http_duration,
             readiness_failures,
             pool_acquire_duration,
+            component_state,
+            queue_depth,
+            catalog_titles,
+            backup_last_success_timestamp,
+            backup_last_failure_timestamp,
         }
     }
 
@@ -335,6 +586,48 @@ impl Metrics {
                 outcome: outcome.as_str().to_owned(),
             })
             .observe(duration.as_secs_f64());
+    }
+
+    /// Sets one current component state, clearing the other fixed state gauges.
+    pub fn set_component_state(&self, component: Component, current: ComponentState) {
+        for state in ComponentState::ALL {
+            self.component_state
+                .get_or_create(&ComponentStateLabels {
+                    component: component.as_str().to_owned(),
+                    state: state.as_str().to_owned(),
+                })
+                .set(i64::from(state == current));
+        }
+    }
+
+    /// Sets the observed queue depth after collapsing unknown job types to `other`.
+    pub fn set_queue_depth(&self, job_type: &str, state: QueueState, count: i64) {
+        self.queue_depth
+            .get_or_create(&QueueLabels {
+                job_type: normalize_job_type(job_type).to_owned(),
+                state: state.as_str().to_owned(),
+            })
+            .set(count.max(0));
+    }
+
+    /// Sets a catalog title count for one fixed scope.
+    pub fn set_catalog_count(&self, scope: CatalogScope, count: i64) {
+        self.catalog_titles
+            .get_or_create(&CatalogLabels {
+                scope: scope.as_str().to_owned(),
+            })
+            .set(count.max(0));
+    }
+
+    /// Sets latest durable backup outcome timestamps in Unix seconds.
+    ///
+    /// A value of `None` is represented as zero so a recovered service cannot
+    /// accidentally continue exposing a stale success/failure timestamp.
+    pub fn set_backup_timestamps(&self, last_success: Option<i64>, last_failure: Option<i64>) {
+        self.backup_last_success_timestamp
+            .set(last_success.unwrap_or_default().max(0));
+        self.backup_last_failure_timestamp
+            .set(last_failure.unwrap_or_default().max(0));
     }
 
     /// Encodes the complete `OpenMetrics` exposition, including `# EOF`.

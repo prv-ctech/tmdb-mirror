@@ -16,8 +16,11 @@ pub use client::{
 };
 pub use model::{
     ChangeGroup, ChangeHistory, ChangeItem, ChangePage, ChangedId, DailyExportRecord,
-    TmdbCollection, TmdbCompany, TmdbCredit, TmdbCredits, TmdbEpisode, TmdbGenre, TmdbKeyword,
-    TmdbMovie, TmdbNetwork, TmdbPerson, TmdbSeason, TmdbSeasonSummary, TmdbTv,
+    TmdbAlternateTitle, TmdbCollection, TmdbCompany, TmdbContentRating, TmdbContentRatings,
+    TmdbCredit, TmdbCredits, TmdbEpisode, TmdbExternalIds, TmdbGenre, TmdbKeyword, TmdbMovie,
+    TmdbNetwork, TmdbPerson, TmdbReleaseDate, TmdbReleaseDateCountry, TmdbReleaseDates, TmdbSeason,
+    TmdbSeasonSummary, TmdbTranslation, TmdbTranslationData, TmdbTranslations, TmdbTrendingItem,
+    TmdbTrendingPage, TmdbTv, TmdbVideo, TmdbVideos,
 };
 pub use parser::{
     DailyExportParser, ExportParseError, parse_change_history, parse_change_page,

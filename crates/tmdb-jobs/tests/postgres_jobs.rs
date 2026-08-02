@@ -57,13 +57,14 @@ async fn jobs_migration_has_exact_readiness_indexes_and_hardened_functions(
     assert_eq!(
         versions,
         [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26
         ]
     );
     let revision: String = sqlx::query_scalar("SELECT schema_revision FROM ops.readiness")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(revision, "0015");
+    assert_eq!(revision, "0026");
 
     let indexes: Vec<(String, String)> = sqlx::query_as(
         "SELECT indexname, indexdef
@@ -644,13 +645,23 @@ async fn expired_lease_reclaims_and_wrong_or_expired_owners_cannot_mutate(
         Err(JobError::LeaseLost)
     ));
 
-    sqlx::query(
+    let expired = sqlx::query(
         "UPDATE ops.jobs SET lease_expires_at = clock_timestamp() - interval '1 second'
           WHERE id = $1",
     )
     .bind(submitted.job_id().as_uuid())
     .execute(&pool)
     .await?;
+    assert_eq!(expired.rows_affected(), 1);
+    let claim_state: (String, bool, bool) = sqlx::query_as(
+        "SELECT status, claimable, lease_expires_at <= clock_timestamp()
+           FROM ops.jobs
+          WHERE id = $1",
+    )
+    .bind(submitted.job_id().as_uuid())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(claim_state, ("running".to_owned(), true, true));
     assert!(matches!(
         repo.heartbeat(submitted.job_id(), &first_worker, LEASE)
             .await,

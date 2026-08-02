@@ -18,6 +18,15 @@ const ROUND_TWO_0004_CHECKSUM: [u8; 48] = [
     0x3e, 0xc5, 0xc5, 0x4f, 0x1d, 0x63, 0xef, 0x58, 0x22, 0xe1, 0x56, 0x96, 0x3d, 0xf3, 0xd1, 0x6b,
     0x3f, 0x54, 0x11, 0x8b, 0xd6, 0xe7, 0xde, 0x2a, 0x54, 0x3a, 0x7b, 0xc1, 0xeb, 0xdd, 0x13, 0x2e,
 ];
+// This exact hash identifies the unrepaired administrative-operations
+// migration. It is accepted only so a database that applied it before the
+// correction can receive the forward-only 0025 repair without a checksum
+// mismatch. New databases embed the corrected 0022 bytes.
+const ADMIN_OPERATIONS_0022_CHECKSUM: [u8; 48] = [
+    0x5b, 0x29, 0xdf, 0x4f, 0xa6, 0xcd, 0xa3, 0x03, 0x4d, 0xd5, 0x41, 0xc3, 0x48, 0x66, 0x9c, 0xbd,
+    0x96, 0x15, 0xd5, 0x4e, 0xdf, 0xad, 0x9e, 0xae, 0x71, 0x6a, 0xca, 0x2d, 0xcf, 0xa1, 0x22, 0x7c,
+    0xbf, 0x8d, 0x45, 0x24, 0x3f, 0x4d, 0xb3, 0xe0, 0x8f, 0x80, 0xef, 0x5e, 0x38, 0xad, 0x4b, 0x33,
+];
 
 /// Result of one serialized `SQLx` migration run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -58,6 +67,7 @@ async fn migrate_while_locked(connection: &mut PgConnection) -> Result<Migration
     let before = applied_count(connection).await?;
     reconcile_round_one_checksum(connection).await?;
     reconcile_round_two_checksum(connection).await?;
+    reconcile_admin_operations_checksum(connection).await?;
     MIGRATOR
         .run(&mut *connection)
         .await
@@ -175,6 +185,44 @@ async fn reconcile_round_two_checksum(connection: &mut PgConnection) -> Result<(
         if removed > 1 {
             return Err(DbError::Migration);
         }
+    }
+    Ok(())
+}
+
+/// Recognizes only the one unrepaired 0022 checksum published during this
+/// implementation. Migration 0025 supplies the actual forward-only database
+/// repair; this update merely lets `SQLx` continue past its immutable checksum
+/// guard. Arbitrary migration history is never accepted.
+async fn reconcile_admin_operations_checksum(connection: &mut PgConnection) -> Result<(), DbError> {
+    let has_migrations: bool =
+        sqlx::query_scalar("SELECT to_regclass('ops._sqlx_migrations') IS NOT NULL")
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|_| DbError::Query)?;
+    if !has_migrations {
+        return Ok(());
+    }
+
+    let current_checksum = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 22)
+        .map(|migration| migration.checksum.as_ref())
+        .ok_or(DbError::Migration)?;
+    let repaired = sqlx::query(
+        "UPDATE ops._sqlx_migrations
+            SET checksum = $1
+          WHERE version = 22
+            AND success
+            AND checksum = $2",
+    )
+    .bind(current_checksum)
+    .bind(ADMIN_OPERATIONS_0022_CHECKSUM.as_slice())
+    .execute(&mut *connection)
+    .await
+    .map_err(|_| DbError::Migration)?
+    .rows_affected();
+    if repaired > 1 {
+        return Err(DbError::Migration);
     }
     Ok(())
 }

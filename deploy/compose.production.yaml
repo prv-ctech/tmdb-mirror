@@ -18,6 +18,14 @@ services:
       - -c
       - timezone=UTC
       - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=pgbackrest --stanza=tmdb archive-push %p
+      - -c
+      - archive_timeout=300s
+      - -c
       - max_connections=200
       - -c
       - shared_buffers=32GB
@@ -37,6 +45,11 @@ services:
       - type: bind
         source: ./data/postgres18
         target: /var/lib/postgresql
+        bind:
+          create_host_path: true
+      - type: bind
+        source: ./data/config
+        target: /config
         bind:
           create_host_path: true
     healthcheck:
@@ -68,7 +81,11 @@ services:
       timeout: 5s
       retries: 12
       start_period: 10s
-    networks: [tmdb-private]
+    networks:
+      tmdb-private: {}
+      prv-network:
+        aliases:
+          - tmdb-mirror-api
 
   worker:
     image: ghcr.io/prv-ctech/tmdb-mirror:main
@@ -134,3 +151,8 @@ services:
 networks:
   tmdb-private:
     driver: bridge
+  # The private administrative listener remains unpublished on the host. Other
+  # containers on prv.network use http://tmdb-mirror-api:8081.
+  prv-network:
+    external: true
+    name: prv.network

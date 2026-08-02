@@ -10,10 +10,12 @@ use axum::{
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::Serialize;
+use serde_json::{Value, json};
 use tmdb_db::{
     AnimeScope, CatalogCredit, CatalogDetail, CatalogEpisode, CatalogError, CatalogFilters,
     CatalogImageAsset, CatalogPage, CatalogPerson, CatalogRecentPage, CatalogRepository,
-    CatalogSeason, CatalogTitle, CatalogTopPage, PopularCursor, RecentCursor, TopCursor,
+    CatalogSeason, CatalogTitle, CatalogTopPage, CatalogTrend, PopularCursor, RecentCursor,
+    TopCursor,
 };
 use tmdb_domain::{MediaType, TitleKey};
 
@@ -201,6 +203,60 @@ pub trait CatalogApiStore: Send + Sync + 'static {
         _key: TitleKey,
         _anime_scope: AnimeScope,
     ) -> Result<Option<Vec<CatalogImageAsset>>, CatalogError> {
+        Err(CatalogError::Query)
+    }
+    async fn list_translations(
+        &self,
+        _key: TitleKey,
+        _anime_scope: AnimeScope,
+    ) -> Result<Option<Vec<tmdb_db::CatalogTranslation>>, CatalogError> {
+        Err(CatalogError::Query)
+    }
+    async fn list_alternate_titles(
+        &self,
+        _key: TitleKey,
+        _anime_scope: AnimeScope,
+    ) -> Result<Option<Vec<tmdb_db::CatalogAlternateTitle>>, CatalogError> {
+        Err(CatalogError::Query)
+    }
+    async fn external_ids(
+        &self,
+        _key: TitleKey,
+        _anime_scope: AnimeScope,
+    ) -> Result<Option<tmdb_db::CatalogExternalIds>, CatalogError> {
+        Err(CatalogError::Query)
+    }
+    async fn list_videos(
+        &self,
+        _key: TitleKey,
+        _anime_scope: AnimeScope,
+    ) -> Result<Option<Vec<tmdb_db::CatalogVideo>>, CatalogError> {
+        Err(CatalogError::Query)
+    }
+    async fn list_release_dates(
+        &self,
+        _key: TitleKey,
+        _anime_scope: AnimeScope,
+    ) -> Result<Option<Vec<tmdb_db::CatalogReleaseDate>>, CatalogError> {
+        Err(CatalogError::Query)
+    }
+    async fn list_trending(
+        &self,
+        _trend_window: &str,
+        _media_type: Option<MediaType>,
+        _anime_scope: AnimeScope,
+        _limit: u16,
+    ) -> Result<Vec<CatalogTrend>, CatalogError> {
+        Err(CatalogError::Query)
+    }
+    async fn list_calendar(
+        &self,
+        _media_type: MediaType,
+        _anime_scope: AnimeScope,
+        _start: NaiveDate,
+        _end: NaiveDate,
+        _limit: u16,
+    ) -> Result<Vec<CatalogTitle>, CatalogError> {
         Err(CatalogError::Query)
     }
     async fn list_company_entities(
@@ -404,6 +460,60 @@ impl CatalogApiStore for CatalogRepository {
     ) -> Result<Option<Vec<CatalogImageAsset>>, CatalogError> {
         Self::list_images(self, key, anime_scope).await
     }
+    async fn list_translations(
+        &self,
+        key: TitleKey,
+        anime_scope: AnimeScope,
+    ) -> Result<Option<Vec<tmdb_db::CatalogTranslation>>, CatalogError> {
+        Self::list_translations(self, key, anime_scope).await
+    }
+    async fn list_alternate_titles(
+        &self,
+        key: TitleKey,
+        anime_scope: AnimeScope,
+    ) -> Result<Option<Vec<tmdb_db::CatalogAlternateTitle>>, CatalogError> {
+        Self::list_alternate_titles(self, key, anime_scope).await
+    }
+    async fn external_ids(
+        &self,
+        key: TitleKey,
+        anime_scope: AnimeScope,
+    ) -> Result<Option<tmdb_db::CatalogExternalIds>, CatalogError> {
+        Self::external_ids(self, key, anime_scope).await
+    }
+    async fn list_videos(
+        &self,
+        key: TitleKey,
+        anime_scope: AnimeScope,
+    ) -> Result<Option<Vec<tmdb_db::CatalogVideo>>, CatalogError> {
+        Self::list_videos(self, key, anime_scope).await
+    }
+    async fn list_release_dates(
+        &self,
+        key: TitleKey,
+        anime_scope: AnimeScope,
+    ) -> Result<Option<Vec<tmdb_db::CatalogReleaseDate>>, CatalogError> {
+        Self::list_release_dates(self, key, anime_scope).await
+    }
+    async fn list_trending(
+        &self,
+        trend_window: &str,
+        media_type: Option<MediaType>,
+        anime_scope: AnimeScope,
+        limit: u16,
+    ) -> Result<Vec<CatalogTrend>, CatalogError> {
+        Self::list_trending(self, trend_window, media_type, anime_scope, limit).await
+    }
+    async fn list_calendar(
+        &self,
+        media_type: MediaType,
+        anime_scope: AnimeScope,
+        start: NaiveDate,
+        end: NaiveDate,
+        limit: u16,
+    ) -> Result<Vec<CatalogTitle>, CatalogError> {
+        Self::list_calendar(self, media_type, anime_scope, start, end, limit).await
+    }
     async fn list_company_entities(
         &self,
         term: Option<&str>,
@@ -501,6 +611,12 @@ pub fn build_catalog_router_with_media(
         allow_local_media,
         media_base_url,
     };
+    let current = build_catalog_routes(state);
+    let versioned = current.clone().route("/openapi.json", get(openapi));
+    Router::new().merge(current).nest("/v1", versioned)
+}
+
+fn build_catalog_routes(state: CatalogApiState) -> Router {
     Router::new()
         // Keep reserved collection names before the `/{tmdb_id}` routes.
         .route("/movies/popular", get(list_movies))
@@ -508,17 +624,51 @@ pub fn build_catalog_router_with_media(
         .route("/movies/top-rated", get(list_movies_top))
         .route("/movies", get(list_movies))
         .route("/movies/{tmdb_id}", get(get_movie))
+        .route("/movies/{tmdb_id}/translations", get(movie_translations))
+        .route(
+            "/movies/{tmdb_id}/alternate-titles",
+            get(movie_alternate_titles),
+        )
+        .route("/movies/{tmdb_id}/external-ids", get(movie_external_ids))
+        .route("/movies/{tmdb_id}/videos", get(movie_videos))
+        .route("/movies/{tmdb_id}/release-dates", get(movie_release_dates))
         .route("/tv/popular", get(list_tv))
         .route("/tv/recent", get(list_tv_recent))
         .route("/tv/top-rated", get(list_tv_top))
         .route("/tv", get(list_tv))
         .route("/tv/{tmdb_id}", get(get_tv))
+        .route("/tv/{tmdb_id}/translations", get(tv_translations))
+        .route("/tv/{tmdb_id}/alternate-titles", get(tv_alternate_titles))
+        .route("/tv/{tmdb_id}/external-ids", get(tv_external_ids))
+        .route("/tv/{tmdb_id}/videos", get(tv_videos))
+        .route("/tv/{tmdb_id}/certifications", get(tv_release_dates))
         .route("/anime/popular", get(list_anime))
         .route("/anime/recent", get(list_anime_recent))
         .route("/anime/top-rated", get(list_anime_top))
         .route("/anime", get(list_anime))
         .route("/anime/{media_type}/{tmdb_id}", get(get_anime))
+        .route(
+            "/anime/{media_type}/{tmdb_id}/translations",
+            get(anime_translations),
+        )
+        .route(
+            "/anime/{media_type}/{tmdb_id}/alternate-titles",
+            get(anime_alternate_titles),
+        )
+        .route(
+            "/anime/{media_type}/{tmdb_id}/external-ids",
+            get(anime_external_ids),
+        )
+        .route("/anime/{media_type}/{tmdb_id}/videos", get(anime_videos))
+        .route(
+            "/anime/{media_type}/{tmdb_id}/release-dates",
+            get(anime_release_dates),
+        )
         .route("/anime/{media_type}/{tmdb_id}/images", get(anime_images))
+        .route("/trending/{trend_window}", get(list_trending))
+        .route("/anime/trending/{trend_window}", get(list_anime_trending))
+        .route("/calendar/movies", get(movie_calendar))
+        .route("/calendar/tv", get(tv_calendar))
         .route("/search", get(search_titles))
         .route("/genres", get(list_genres))
         .route("/languages", get(list_languages))
@@ -543,6 +693,186 @@ pub fn build_catalog_router_with_media(
             get(tv_episode),
         )
         .layer(Extension(state))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the public OpenAPI document is intentionally a single auditable static route declaration"
+)]
+async fn openapi() -> axum::Json<Value> {
+    // This is generated in-process so the published document is kept beside
+    // the route registration. The unversioned endpoints remain compatible;
+    // this document intentionally lists only their stable `/v1` aliases.
+    let routes = [
+        ("/v1/openapi.json", "OpenAPI document"),
+        ("/v1/health/live", "Process liveness"),
+        ("/v1/health/ready", "Database and schema readiness"),
+        ("/v1/movies", "List non-anime movies"),
+        ("/v1/movies/popular", "List popular non-anime movies"),
+        ("/v1/movies/recent", "List recent non-anime movies"),
+        ("/v1/movies/top-rated", "List top-rated non-anime movies"),
+        ("/v1/movies/{tmdb_id}", "Get non-anime movie metadata"),
+        (
+            "/v1/movies/{tmdb_id}/translations",
+            "Get movie translations",
+        ),
+        (
+            "/v1/movies/{tmdb_id}/alternate-titles",
+            "Get movie alternate titles",
+        ),
+        (
+            "/v1/movies/{tmdb_id}/external-ids",
+            "Get movie external identifiers",
+        ),
+        ("/v1/movies/{tmdb_id}/videos", "Get movie videos"),
+        (
+            "/v1/movies/{tmdb_id}/release-dates",
+            "Get movie regional release dates and certifications",
+        ),
+        ("/v1/movies/{tmdb_id}/credits", "Get movie credits"),
+        ("/v1/movies/{tmdb_id}/images", "Get movie image metadata"),
+        ("/v1/tv", "List non-anime TV series"),
+        ("/v1/tv/popular", "List popular non-anime TV series"),
+        ("/v1/tv/recent", "List recent non-anime TV series"),
+        ("/v1/tv/top-rated", "List top-rated non-anime TV series"),
+        ("/v1/tv/{tmdb_id}", "Get non-anime TV metadata"),
+        ("/v1/tv/{tmdb_id}/translations", "Get TV translations"),
+        (
+            "/v1/tv/{tmdb_id}/alternate-titles",
+            "Get TV alternate titles",
+        ),
+        (
+            "/v1/tv/{tmdb_id}/external-ids",
+            "Get TV external identifiers",
+        ),
+        ("/v1/tv/{tmdb_id}/videos", "Get TV videos"),
+        (
+            "/v1/tv/{tmdb_id}/certifications",
+            "Get TV regional certifications",
+        ),
+        ("/v1/tv/{tmdb_id}/credits", "Get TV credits"),
+        ("/v1/tv/{tmdb_id}/images", "Get TV image metadata"),
+        ("/v1/tv/{tmdb_id}/seasons", "List TV seasons"),
+        (
+            "/v1/tv/{tmdb_id}/seasons/{season_number}",
+            "Get a TV season",
+        ),
+        (
+            "/v1/tv/{tmdb_id}/seasons/{season_number}/episodes",
+            "List season episodes",
+        ),
+        (
+            "/v1/tv/{tmdb_id}/seasons/{season_number}/episodes/{episode_number}",
+            "Get a TV episode",
+        ),
+        ("/v1/anime", "List isolated anime movies and TV series"),
+        ("/v1/anime/popular", "List popular isolated anime"),
+        ("/v1/anime/recent", "List recent isolated anime"),
+        ("/v1/anime/top-rated", "List top-rated isolated anime"),
+        (
+            "/v1/anime/{media_type}/{tmdb_id}",
+            "Get isolated anime metadata",
+        ),
+        (
+            "/v1/anime/{media_type}/{tmdb_id}/translations",
+            "Get anime translations",
+        ),
+        (
+            "/v1/anime/{media_type}/{tmdb_id}/alternate-titles",
+            "Get anime alternate titles",
+        ),
+        (
+            "/v1/anime/{media_type}/{tmdb_id}/external-ids",
+            "Get anime external identifiers",
+        ),
+        (
+            "/v1/anime/{media_type}/{tmdb_id}/videos",
+            "Get anime videos",
+        ),
+        (
+            "/v1/anime/{media_type}/{tmdb_id}/release-dates",
+            "Get anime regional release dates and certifications",
+        ),
+        (
+            "/v1/anime/{media_type}/{tmdb_id}/credits",
+            "Get anime credits",
+        ),
+        (
+            "/v1/anime/{media_type}/{tmdb_id}/images",
+            "Get anime image metadata",
+        ),
+        (
+            "/v1/trending/{trend_window}",
+            "List non-anime trending titles",
+        ),
+        (
+            "/v1/anime/trending/{trend_window}",
+            "List isolated anime trending titles",
+        ),
+        (
+            "/v1/calendar/movies",
+            "List upcoming/recent movie calendar entries",
+        ),
+        (
+            "/v1/calendar/tv",
+            "List upcoming/recent TV calendar entries",
+        ),
+        ("/v1/search", "Search non-anime titles"),
+        ("/v1/genres", "List catalog genres"),
+        ("/v1/languages", "List catalog languages"),
+        ("/v1/keywords", "List catalog keywords"),
+        ("/v1/tags", "List catalog tags"),
+        ("/v1/people", "List cast and crew people"),
+        ("/v1/companies", "List production companies"),
+        ("/v1/networks", "List TV networks"),
+        ("/v1/collections", "List movie collections"),
+    ];
+    let mut paths = serde_json::Map::with_capacity(routes.len());
+    for (path, summary) in routes {
+        paths.insert(
+            path.to_owned(),
+            json!({
+                "get": {
+                    "summary": summary,
+                    "responses": {
+                        "200": {"description": "Successful response"},
+                        "400": {"$ref": "#/components/responses/Problem"},
+                        "404": {"$ref": "#/components/responses/Problem"},
+                        "503": {"$ref": "#/components/responses/Problem"}
+                    }
+                }
+            }),
+        );
+    }
+    axum::Json(json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "TMDB Mirror Catalog API",
+            "version": env!("CARGO_PKG_VERSION"),
+            "description": "Unversioned catalog paths remain compatible aliases. Movie and TV routes exclude anime; anime routes search anime movies and TV series together unless media_type is specified."
+        },
+        "paths": paths,
+        "components": {
+            "responses": {
+                "Problem": {
+                    "description": "RFC 9457 problem response",
+                    "content": {"application/problem+json": {"schema": {"$ref": "#/components/schemas/Problem"}}}
+                }
+            },
+            "schemas": {
+                "Problem": {
+                    "type": "object",
+                    "required": ["type", "title", "status"],
+                    "properties": {
+                        "type": {"type": "string"},
+                        "title": {"type": "string"},
+                        "status": {"type": "integer"},
+                        "detail": {"type": "string"}
+                    }
+                }
+            }
+        }
+    }))
 }
 
 #[derive(Clone, Debug)]
@@ -891,6 +1221,166 @@ fn search_query(query: &CatalogQuery) -> Result<&str, CatalogApiError> {
         return Err(CatalogApiError::InvalidQuery);
     }
     query.term.as_deref().ok_or(CatalogApiError::InvalidQuery)
+}
+
+async fn list_trending(
+    Extension(state): Extension<CatalogApiState>,
+    Path(trend_window): Path<String>,
+    RawQuery(raw_query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    trending_response(
+        state,
+        trend_window,
+        raw_query,
+        request_id,
+        AnimeScope::OnlyNonAnime,
+    )
+    .await
+}
+
+async fn list_anime_trending(
+    Extension(state): Extension<CatalogApiState>,
+    Path(trend_window): Path<String>,
+    RawQuery(raw_query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    trending_response(
+        state,
+        trend_window,
+        raw_query,
+        request_id,
+        AnimeScope::OnlyAnime,
+    )
+    .await
+}
+
+async fn trending_response(
+    state: CatalogApiState,
+    trend_window: String,
+    raw_query: Option<String>,
+    request_id: Option<Extension<RequestId>>,
+    anime_scope: AnimeScope,
+) -> Response {
+    let request_id = request_id_string(request_id);
+    let query = match parse_query(raw_query.as_deref()) {
+        Ok(query)
+            if query.cursor.is_none()
+                && query.term.is_none()
+                && query.anime.is_none()
+                && query.filters.is_empty() =>
+        {
+            query
+        }
+        Ok(_) | Err(_) => return error_response(CatalogApiError::InvalidQuery, &request_id),
+    };
+    match state
+        .store
+        .list_trending(&trend_window, query.media_type, anime_scope, query.limit)
+        .await
+    {
+        Ok(data) => (StatusCode::OK, Json(serde_json::json!({"data": data}))).into_response(),
+        Err(error) => store_error_response(error, &request_id),
+    }
+}
+
+async fn movie_calendar(
+    Extension(state): Extension<CatalogApiState>,
+    RawQuery(raw_query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    calendar_response(state, raw_query, request_id, MediaType::Movie).await
+}
+
+async fn tv_calendar(
+    Extension(state): Extension<CatalogApiState>,
+    RawQuery(raw_query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    calendar_response(state, raw_query, request_id, MediaType::Tv).await
+}
+
+async fn calendar_response(
+    state: CatalogApiState,
+    raw_query: Option<String>,
+    request_id: Option<Extension<RequestId>>,
+    media_type: MediaType,
+) -> Response {
+    let request_id = request_id_string(request_id);
+    let query = match parse_calendar_query(raw_query.as_deref()) {
+        Ok(query) => query,
+        Err(error) => return error_response(error, &request_id),
+    };
+    match state
+        .store
+        .list_calendar(
+            media_type,
+            AnimeScope::OnlyNonAnime,
+            query.start,
+            query.end,
+            query.limit,
+        )
+        .await
+    {
+        Ok(data) => items_response(data),
+        Err(error) => store_error_response(error, &request_id),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CalendarQuery {
+    start: NaiveDate,
+    end: NaiveDate,
+    limit: u16,
+}
+
+fn parse_calendar_query(raw_query: Option<&str>) -> Result<CalendarQuery, CatalogApiError> {
+    let raw_query = raw_query.ok_or(CatalogApiError::InvalidQuery)?;
+    if raw_query.is_empty() || raw_query.len() > MAX_QUERY_BYTES {
+        return Err(CatalogApiError::InvalidQuery);
+    }
+    let mut start = None;
+    let mut end = None;
+    let mut limit = DEFAULT_LIMIT;
+    let mut seen_limit = false;
+    for component in raw_query
+        .split('&')
+        .filter(|component| !component.is_empty())
+    {
+        let (raw_key, raw_value) = component.split_once('=').unwrap_or((component, ""));
+        let key = decode_query_component(raw_key)?;
+        let value = decode_query_component(raw_value)?;
+        match key.as_str() {
+            "start" if start.is_none() => {
+                start = Some(
+                    NaiveDate::parse_from_str(&value, "%Y-%m-%d")
+                        .map_err(|_| CatalogApiError::InvalidQuery)?,
+                );
+            }
+            "end" if end.is_none() => {
+                end = Some(
+                    NaiveDate::parse_from_str(&value, "%Y-%m-%d")
+                        .map_err(|_| CatalogApiError::InvalidQuery)?,
+                );
+            }
+            "limit" if !seen_limit => {
+                seen_limit = true;
+                limit = value
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|value| (1..=MAX_LIMIT).contains(value))
+                    .ok_or(CatalogApiError::InvalidQuery)?;
+            }
+            _ => return Err(CatalogApiError::InvalidQuery),
+        }
+    }
+    let (Some(start), Some(end)) = (start, end) else {
+        return Err(CatalogApiError::InvalidQuery);
+    };
+    if start > end || end.signed_duration_since(start).num_days() > 366 {
+        return Err(CatalogApiError::InvalidQuery);
+    }
+    Ok(CalendarQuery { start, end, limit })
 }
 
 async fn list_movies(
@@ -1624,6 +2114,31 @@ async fn scoped_resource(
                     serde_json::to_value(items).unwrap_or_default()
                 })
             }),
+        ResourceKind::Translations => state
+            .store
+            .list_translations(key, anime_scope)
+            .await
+            .map(|value| value.map(|items| serde_json::to_value(items).unwrap_or_default())),
+        ResourceKind::AlternateTitles => state
+            .store
+            .list_alternate_titles(key, anime_scope)
+            .await
+            .map(|value| value.map(|items| serde_json::to_value(items).unwrap_or_default())),
+        ResourceKind::ExternalIds => state
+            .store
+            .external_ids(key, anime_scope)
+            .await
+            .map(|value| value.map(|item| serde_json::to_value(item).unwrap_or_default())),
+        ResourceKind::Videos => state
+            .store
+            .list_videos(key, anime_scope)
+            .await
+            .map(|value| value.map(|items| serde_json::to_value(items).unwrap_or_default())),
+        ResourceKind::ReleaseDates => state
+            .store
+            .list_release_dates(key, anime_scope)
+            .await
+            .map(|value| value.map(|items| serde_json::to_value(items).unwrap_or_default())),
     };
     match result {
         Ok(Some(data)) => (StatusCode::OK, Json(serde_json::json!({"data": data}))).into_response(),
@@ -1636,6 +2151,75 @@ async fn scoped_resource(
 enum ResourceKind {
     Credits,
     Images,
+    Translations,
+    AlternateTitles,
+    ExternalIds,
+    Videos,
+    ReleaseDates,
+}
+
+async fn movie_resource(
+    state: CatalogApiState,
+    raw_id: String,
+    query: Option<String>,
+    request_id: Option<Extension<RequestId>>,
+    kind: ResourceKind,
+) -> Response {
+    scoped_resource(
+        state,
+        raw_id,
+        query,
+        request_id,
+        MediaType::Movie,
+        kind,
+        AnimeScope::OnlyNonAnime,
+    )
+    .await
+}
+
+async fn tv_resource(
+    state: CatalogApiState,
+    raw_id: String,
+    query: Option<String>,
+    request_id: Option<Extension<RequestId>>,
+    kind: ResourceKind,
+) -> Response {
+    scoped_resource(
+        state,
+        raw_id,
+        query,
+        request_id,
+        MediaType::Tv,
+        kind,
+        AnimeScope::OnlyNonAnime,
+    )
+    .await
+}
+
+async fn anime_resource(
+    state: CatalogApiState,
+    raw_media_type: String,
+    raw_id: String,
+    query: Option<String>,
+    request_id: Option<Extension<RequestId>>,
+    kind: ResourceKind,
+) -> Response {
+    let Ok(media_type) = MediaType::from_str(&raw_media_type) else {
+        return error_response(
+            CatalogApiError::InvalidQuery,
+            &request_id_string(request_id),
+        );
+    };
+    scoped_resource(
+        state,
+        raw_id,
+        query,
+        request_id,
+        media_type,
+        kind,
+        AnimeScope::OnlyAnime,
+    )
+    .await
 }
 
 fn image_response(
@@ -1667,6 +2251,31 @@ fn image_response(
         "url".to_owned(),
         serde_json::Value::String(local.or(remote).unwrap_or_default()),
     );
+    if let Some(variants) = object
+        .get_mut("variants")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for variant in variants {
+            let Some(variant_object) = variant.as_object_mut() else {
+                continue;
+            };
+            let local = if allow_local_media {
+                variant_object
+                    .get("storagePath")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|path| tmdb_media::is_public_relative(path))
+                    .map(|path| match media_base_url {
+                        Some(base) => format!("{}/{}", base.trim_end_matches('/'), path),
+                        None => format!("/media/{path}"),
+                    })
+            } else {
+                None
+            };
+            if let Some(local) = local {
+                variant_object.insert("url".to_owned(), serde_json::Value::String(local));
+            }
+        }
+    }
     value
 }
 
@@ -1759,6 +2368,195 @@ async fn anime_images(
         media_type,
         ResourceKind::Images,
         AnimeScope::OnlyAnime,
+    )
+    .await
+}
+
+async fn movie_translations(
+    Extension(state): Extension<CatalogApiState>,
+    Path(raw_id): Path<String>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    movie_resource(state, raw_id, query, request_id, ResourceKind::Translations).await
+}
+
+async fn movie_alternate_titles(
+    Extension(state): Extension<CatalogApiState>,
+    Path(raw_id): Path<String>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    movie_resource(
+        state,
+        raw_id,
+        query,
+        request_id,
+        ResourceKind::AlternateTitles,
+    )
+    .await
+}
+
+async fn movie_external_ids(
+    Extension(state): Extension<CatalogApiState>,
+    Path(raw_id): Path<String>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    movie_resource(state, raw_id, query, request_id, ResourceKind::ExternalIds).await
+}
+
+async fn movie_videos(
+    Extension(state): Extension<CatalogApiState>,
+    Path(raw_id): Path<String>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    movie_resource(state, raw_id, query, request_id, ResourceKind::Videos).await
+}
+
+async fn movie_release_dates(
+    Extension(state): Extension<CatalogApiState>,
+    Path(raw_id): Path<String>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    movie_resource(state, raw_id, query, request_id, ResourceKind::ReleaseDates).await
+}
+
+async fn tv_translations(
+    Extension(state): Extension<CatalogApiState>,
+    Path(raw_id): Path<String>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    tv_resource(state, raw_id, query, request_id, ResourceKind::Translations).await
+}
+
+async fn tv_alternate_titles(
+    Extension(state): Extension<CatalogApiState>,
+    Path(raw_id): Path<String>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    tv_resource(
+        state,
+        raw_id,
+        query,
+        request_id,
+        ResourceKind::AlternateTitles,
+    )
+    .await
+}
+
+async fn tv_external_ids(
+    Extension(state): Extension<CatalogApiState>,
+    Path(raw_id): Path<String>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    tv_resource(state, raw_id, query, request_id, ResourceKind::ExternalIds).await
+}
+
+async fn tv_videos(
+    Extension(state): Extension<CatalogApiState>,
+    Path(raw_id): Path<String>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    tv_resource(state, raw_id, query, request_id, ResourceKind::Videos).await
+}
+
+async fn tv_release_dates(
+    Extension(state): Extension<CatalogApiState>,
+    Path(raw_id): Path<String>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    tv_resource(state, raw_id, query, request_id, ResourceKind::ReleaseDates).await
+}
+
+async fn anime_translations(
+    Extension(state): Extension<CatalogApiState>,
+    Path((raw_media_type, raw_id)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    anime_resource(
+        state,
+        raw_media_type,
+        raw_id,
+        query,
+        request_id,
+        ResourceKind::Translations,
+    )
+    .await
+}
+
+async fn anime_alternate_titles(
+    Extension(state): Extension<CatalogApiState>,
+    Path((raw_media_type, raw_id)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    anime_resource(
+        state,
+        raw_media_type,
+        raw_id,
+        query,
+        request_id,
+        ResourceKind::AlternateTitles,
+    )
+    .await
+}
+
+async fn anime_external_ids(
+    Extension(state): Extension<CatalogApiState>,
+    Path((raw_media_type, raw_id)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    anime_resource(
+        state,
+        raw_media_type,
+        raw_id,
+        query,
+        request_id,
+        ResourceKind::ExternalIds,
+    )
+    .await
+}
+
+async fn anime_videos(
+    Extension(state): Extension<CatalogApiState>,
+    Path((raw_media_type, raw_id)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    anime_resource(
+        state,
+        raw_media_type,
+        raw_id,
+        query,
+        request_id,
+        ResourceKind::Videos,
+    )
+    .await
+}
+
+async fn anime_release_dates(
+    Extension(state): Extension<CatalogApiState>,
+    Path((raw_media_type, raw_id)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    anime_resource(
+        state,
+        raw_media_type,
+        raw_id,
+        query,
+        request_id,
+        ResourceKind::ReleaseDates,
     )
     .await
 }

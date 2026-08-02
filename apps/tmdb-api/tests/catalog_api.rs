@@ -7,10 +7,14 @@ use axum::{
     http::{Request, StatusCode},
 };
 use serde_json::Value;
-use tmdb_api::{ApiState, CatalogApiStore, ReadinessProbe, build_catalog_router, build_router};
+use tmdb_api::{
+    ApiState, CatalogApiStore, ReadinessProbe, build_catalog_router,
+    build_catalog_router_with_media, build_router,
+};
 use tmdb_db::{
-    AnimeScope, CatalogDetail, CatalogError, CatalogImageAsset, CatalogMovieDetails, CatalogPage,
-    CatalogRecentPage, CatalogTitle, CatalogTopPage, PopularCursor, RecentCursor, TopCursor,
+    AnimeScope, CatalogDetail, CatalogError, CatalogImageAsset, CatalogImageVariant,
+    CatalogMovieDetails, CatalogPage, CatalogRecentPage, CatalogTitle, CatalogTopPage,
+    PopularCursor, RecentCursor, TopCursor,
 };
 use tmdb_domain::{MediaType, TitleKey};
 use tower::ServiceExt;
@@ -137,7 +141,7 @@ impl ReadinessProbe for ReadyProbe {
     async fn check(&self) -> Result<tmdb_db::ReadinessReport, tmdb_api::ProbeError> {
         Ok(tmdb_db::ReadinessReport {
             postgres_major: 18,
-            schema_revision: "0015".to_owned(),
+            schema_revision: "0026".to_owned(),
             extensions: vec![
                 "pg_stat_statements".to_owned(),
                 "pg_trgm".to_owned(),
@@ -150,6 +154,14 @@ impl ReadinessProbe for ReadyProbe {
 fn app(store: &FakeStore) -> Router {
     build_router(ApiState::from_probe(ReadyProbe))
         .merge(build_catalog_router(Arc::new(store.clone())))
+}
+
+fn app_with_local_media(store: &FakeStore) -> Router {
+    build_router(ApiState::from_probe(ReadyProbe)).merge(build_catalog_router_with_media(
+        Arc::new(store.clone()),
+        true,
+        Some("https://mirror.example/media".to_owned()),
+    ))
 }
 
 async fn get(
@@ -258,6 +270,15 @@ async fn anime_image_route_returns_anime_assets_and_ordinary_route_stays_isolate
             sha256: Some("a".repeat(64)),
             status: "ready".to_owned(),
             iso_639_1: None,
+            variants: vec![CatalogImageVariant {
+                variant_key: "webp_w320".to_owned(),
+                storage_path: "anime/movie/123/cover-w320.webp".to_owned(),
+                mime_type: "image/webp".to_owned(),
+                width: 320,
+                height: 480,
+                file_size_bytes: 4_321,
+                sha256: "b".repeat(64),
+            }],
         }]);
 
     let response = get(app(&store), "/anime/movie/123/images").await?;
@@ -267,6 +288,17 @@ async fn anime_image_route_returns_anime_assets_and_ordinary_route_stays_isolate
     assert_eq!(
         json["data"][0]["url"],
         "https://image.tmdb.org/t/p/w500/anime-poster.jpg"
+    );
+    let response = get(app_with_local_media(&store), "/anime/movie/123/images").await?;
+    let body = axum::body::to_bytes(response.into_body(), 1_000_000).await?;
+    let json: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        json["data"][0]["url"],
+        "https://mirror.example/media/anime/movie/123/cover.jpg"
+    );
+    assert_eq!(
+        json["data"][0]["variants"][0]["url"],
+        "https://mirror.example/media/anime/movie/123/cover-w320.webp"
     );
 
     let response = get(app(&store), "/movies/123/images").await?;
@@ -374,6 +406,45 @@ async fn invalid_limits_and_media_route_anime_flags_are_problem_details()
             Some("application/problem+json")
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn versioned_catalog_routes_are_exact_aliases_and_publish_openapi()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = FakeStore::default();
+    let response = get(app(&store), "/v1/movies?limit=3").await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let calls = store
+        .popular
+        .lock()
+        .map_err(|_| "store lock poisoned")?
+        .clone();
+    assert_eq!(
+        calls,
+        vec![(Some(MediaType::Movie), AnimeScope::OnlyNonAnime, 3)]
+    );
+
+    let response = get(app(&store), "/v1/openapi.json").await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await?;
+    let document: Value = serde_json::from_slice(&body)?;
+    assert_eq!(document["openapi"], "3.1.0");
+    assert!(document["paths"].get("/v1/anime").is_some());
+    assert!(document["paths"].get("/v1/health/live").is_some());
+    assert!(
+        document["paths"]
+            .get("/v1/trending/{trend_window}")
+            .is_some()
+    );
+    assert!(
+        document["paths"]
+            .get("/v1/movies/{tmdb_id}/translations")
+            .is_some()
+    );
+
+    let response = get(app(&store), "/v1/health/live").await?;
+    assert_eq!(response.status(), StatusCode::OK);
     Ok(())
 }
 

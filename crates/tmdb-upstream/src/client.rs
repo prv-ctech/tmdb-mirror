@@ -14,7 +14,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 
 use crate::policy::{PolicyError, RequestGate, RetryPolicy};
-use crate::{ChangeHistory, ChangePage, TmdbMovie, TmdbSeason, TmdbTv};
+use crate::{ChangeHistory, ChangePage, TmdbMovie, TmdbSeason, TmdbTrendingPage, TmdbTv};
 
 /// Hard upper bound for one streamed daily export download.
 pub const MAX_DAILY_EXPORT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -142,7 +142,11 @@ impl TmdbClient {
         }
         self.fetch_json(
             &format!("movie/{tmdb_id}"),
-            &[("append_to_response", "keywords,credits".to_owned())],
+            &[ (
+                "append_to_response",
+                "keywords,credits,translations,alternative_titles,external_ids,videos,release_dates"
+                    .to_owned(),
+            )],
             true,
         )
         .await
@@ -159,7 +163,11 @@ impl TmdbClient {
         }
         self.fetch_json(
             &format!("tv/{tmdb_id}"),
-            &[("append_to_response", "keywords,credits".to_owned())],
+            &[ (
+                "append_to_response",
+                "keywords,credits,translations,alternative_titles,external_ids,videos,content_ratings"
+                    .to_owned(),
+            )],
             true,
         )
         .await
@@ -201,6 +209,27 @@ impl TmdbClient {
         }
         let path = format!("{media_type}/changes");
         self.fetch_json(&path, &[("page", page.to_string())], true)
+            .await
+    }
+
+    /// Fetches the first page of a typed TMDB trending feed.
+    ///
+    /// The caller must select one concrete movie/TV namespace and either the
+    /// current `day` or `week` window. This avoids an ambiguous mixed feed and
+    /// keeps the returned rank deterministic for persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_trending(
+        &self,
+        media_type: MediaType,
+        trend_window: &str,
+    ) -> Result<TmdbTrendingPage, TmdbClientError> {
+        if !matches!(trend_window, "day" | "week") {
+            return Err(TmdbClientError::InvalidPath);
+        }
+        self.fetch_json(&format!("trending/{media_type}/{trend_window}"), &[], true)
             .await
     }
 

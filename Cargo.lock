@@ -2220,6 +2220,7 @@ dependencies = [
  "tmdb-config",
  "tmdb-db",
  "tmdb-domain",
+ "tmdb-jobs",
  "tmdb-media",
  "tmdb-observability",
  "tokio",
@@ -2254,6 +2255,7 @@ dependencies = [
  "tmdb-config",
  "tmdb-domain",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -2286,6 +2288,7 @@ dependencies = [
  "tmdb-observability",
  "tokio",
  "tokio-util",
+ "tower",
  "tower-http 0.7.0",
  "tracing",
  "uuid",

@@ -1,13 +1,14 @@
 use std::time::Duration;
 
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use tmdb_domain::MediaType;
 use tmdb_jobs::JobExecutionError;
 use tmdb_upstream::{
-    ChangePage, TmdbCollection, TmdbCompany, TmdbCredit, TmdbCredits, TmdbEpisode, TmdbGenre,
-    TmdbKeyword, TmdbMovie, TmdbNetwork, TmdbSeason, TmdbSeasonSummary, TmdbTv,
+    ChangePage, TmdbAlternateTitle, TmdbCollection, TmdbCompany, TmdbContentRating, TmdbCredit,
+    TmdbCredits, TmdbEpisode, TmdbExternalIds, TmdbGenre, TmdbKeyword, TmdbMovie, TmdbNetwork,
+    TmdbReleaseDateCountry, TmdbSeason, TmdbSeasonSummary, TmdbTranslation, TmdbTv, TmdbVideo,
 };
 use uuid::Uuid;
 
@@ -22,6 +23,10 @@ use super::{contains_anime_keyword, normalize_language, parse_source_date, sourc
 
 /// Persists a movie and optionally creates local-media jobs in the same
 /// catalog transaction.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one transaction must keep title, facets, artwork jobs, and the sorted lock set atomic"
+)]
 pub(crate) async fn persist_movie_with_options(
     pool: &PgPool,
     movie: &TmdbMovie,
@@ -100,6 +105,21 @@ pub(crate) async fn persist_movie_with_options(
         title_id,
         movie.belongs_to_collection.as_ref(),
         allow_local_media,
+    )
+    .await?;
+    replace_common_parity_facets(
+        &mut transaction,
+        title_id,
+        movie.translations.translations.as_slice(),
+        movie.alternate_titles.as_slice(),
+        &movie.external_ids,
+        movie.videos.results.as_slice(),
+    )
+    .await?;
+    replace_movie_release_dates(
+        &mut transaction,
+        title_id,
+        movie.release_dates.results.as_slice(),
     )
     .await?;
     enqueue_title_images(
@@ -214,6 +234,21 @@ pub(crate) async fn persist_tv_with_options(
         &mut transaction,
         title_id,
         series.original_language.as_deref(),
+    )
+    .await?;
+    replace_common_parity_facets(
+        &mut transaction,
+        title_id,
+        series.translations.translations.as_slice(),
+        series.alternate_titles.as_slice(),
+        &series.external_ids,
+        series.videos.results.as_slice(),
+    )
+    .await?;
+    replace_tv_certifications(
+        &mut transaction,
+        title_id,
+        series.content_ratings.results.as_slice(),
     )
     .await?;
     enqueue_title_images(
@@ -1047,6 +1082,248 @@ async fn replace_collection(
     .await
     .map_err(database_error)?;
     Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the shared parity facets intentionally use one transaction so replacement cannot expose a partial title"
+)]
+async fn replace_common_parity_facets(
+    transaction: &mut Transaction<'_, Postgres>,
+    title_id: i64,
+    translations: &[TmdbTranslation],
+    alternate_titles: &[TmdbAlternateTitle],
+    external_ids: &TmdbExternalIds,
+    videos: &[TmdbVideo],
+) -> Result<(), JobExecutionError> {
+    sqlx::query("DELETE FROM catalog.title_translations WHERE title_id = $1")
+        .bind(title_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+    for translation in translations {
+        let Some(language_code) = normalized_language(translation.iso_639_1.as_deref()) else {
+            continue;
+        };
+        let country_code =
+            normalized_country(translation.iso_3166_1.as_deref()).unwrap_or_default();
+        let name = bounded_text(
+            translation
+                .data
+                .title
+                .as_deref()
+                .or(translation.data.name.as_deref()),
+            2_048,
+        );
+        let overview = bounded_text(translation.data.overview.as_deref(), 32_768);
+        let tagline = bounded_text(translation.data.tagline.as_deref(), 2_048);
+        let homepage = bounded_text(translation.data.homepage.as_deref(), 2_048);
+        sqlx::query(
+            "INSERT INTO catalog.title_translations (
+                 title_id, language_code, country_code, name, overview, tagline, homepage
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (title_id, language_code, country_code) DO UPDATE SET
+                 name = EXCLUDED.name,
+                 overview = EXCLUDED.overview,
+                 tagline = EXCLUDED.tagline,
+                 homepage = EXCLUDED.homepage,
+                 updated_at = clock_timestamp()",
+        )
+        .bind(title_id)
+        .bind(language_code)
+        .bind(country_code)
+        .bind(name)
+        .bind(overview)
+        .bind(tagline)
+        .bind(homepage)
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+    }
+
+    sqlx::query("DELETE FROM catalog.title_alternate_titles WHERE title_id = $1")
+        .bind(title_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+    for alternate in alternate_titles {
+        let Some(title) = bounded_text(alternate.title.as_deref(), 2_048) else {
+            continue;
+        };
+        let country_code = normalized_country(alternate.iso_3166_1.as_deref()).unwrap_or_default();
+        let title_type = bounded_text(alternate.title_type.as_deref(), 128).unwrap_or_default();
+        sqlx::query(
+            "INSERT INTO catalog.title_alternate_titles (title_id, title, country_code, title_type)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (title_id, title, country_code, title_type) DO UPDATE
+             SET updated_at = clock_timestamp()",
+        )
+        .bind(title_id)
+        .bind(title)
+        .bind(country_code)
+        .bind(title_type)
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+    }
+
+    sqlx::query(
+        "INSERT INTO catalog.title_external_ids (
+             title_id, imdb_id, tvdb_id, wikidata_id, facebook_id, instagram_id, twitter_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (title_id) DO UPDATE SET
+             imdb_id = EXCLUDED.imdb_id,
+             tvdb_id = EXCLUDED.tvdb_id,
+             wikidata_id = EXCLUDED.wikidata_id,
+             facebook_id = EXCLUDED.facebook_id,
+             instagram_id = EXCLUDED.instagram_id,
+             twitter_id = EXCLUDED.twitter_id,
+             updated_at = clock_timestamp()",
+    )
+    .bind(title_id)
+    .bind(bounded_text(external_ids.imdb_id.as_deref(), 128))
+    .bind(bounded_text(external_ids.tvdb_id.as_deref(), 128))
+    .bind(bounded_text(external_ids.wikidata_id.as_deref(), 128))
+    .bind(bounded_text(external_ids.facebook_id.as_deref(), 128))
+    .bind(bounded_text(external_ids.instagram_id.as_deref(), 128))
+    .bind(bounded_text(external_ids.twitter_id.as_deref(), 128))
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+
+    sqlx::query("DELETE FROM catalog.title_videos WHERE title_id = $1")
+        .bind(title_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+    for video in videos {
+        let (Some(video_key), Some(site)) = (
+            bounded_text(video.key.as_deref(), 128),
+            bounded_text(video.site.as_deref(), 64),
+        ) else {
+            continue;
+        };
+        sqlx::query(
+            "INSERT INTO catalog.title_videos (
+                 title_id, video_key, site, video_type, name, official,
+                 language_code, country_code, published_at, size
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(title_id)
+        .bind(video_key)
+        .bind(site)
+        .bind(bounded_text(video.video_type.as_deref(), 128))
+        .bind(bounded_text(video.name.as_deref(), 2_048))
+        .bind(video.official)
+        .bind(normalized_language(video.iso_639_1.as_deref()))
+        .bind(normalized_country(video.iso_3166_1.as_deref()))
+        .bind(parse_source_timestamp(video.published_at.as_deref()))
+        .bind(video.size.map(i32::from))
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+async fn replace_movie_release_dates(
+    transaction: &mut Transaction<'_, Postgres>,
+    title_id: i64,
+    countries: &[TmdbReleaseDateCountry],
+) -> Result<(), JobExecutionError> {
+    sqlx::query("DELETE FROM catalog.title_release_dates WHERE title_id = $1")
+        .bind(title_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+    for country in countries {
+        let Some(country_code) = normalized_country(country.iso_3166_1.as_deref()) else {
+            continue;
+        };
+        for release in &country.release_dates {
+            let release_type = release.release_type.map(i16::from);
+            if release_type.is_some_and(|value| !(1..=16).contains(&value)) {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO catalog.title_release_dates (
+                     title_id, country_code, release_date, certification, release_type, note
+                 ) VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT ON CONSTRAINT title_release_dates_identity_unique DO UPDATE
+                 SET updated_at = clock_timestamp()",
+            )
+            .bind(title_id)
+            .bind(&country_code)
+            .bind(parse_source_timestamp(release.release_date.as_deref()))
+            .bind(bounded_text(release.certification.as_deref(), 64))
+            .bind(release_type)
+            .bind(bounded_text(release.note.as_deref(), 2_048))
+            .execute(&mut **transaction)
+            .await
+            .map_err(database_error)?;
+        }
+    }
+    Ok(())
+}
+
+async fn replace_tv_certifications(
+    transaction: &mut Transaction<'_, Postgres>,
+    title_id: i64,
+    ratings: &[TmdbContentRating],
+) -> Result<(), JobExecutionError> {
+    sqlx::query("DELETE FROM catalog.title_release_dates WHERE title_id = $1")
+        .bind(title_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+    for rating in ratings {
+        let Some(country_code) = normalized_country(rating.iso_3166_1.as_deref()) else {
+            continue;
+        };
+        sqlx::query(
+            "INSERT INTO catalog.title_release_dates (title_id, country_code, certification)
+             VALUES ($1, $2, $3)
+             ON CONFLICT ON CONSTRAINT title_release_dates_identity_unique DO UPDATE
+             SET updated_at = clock_timestamp()",
+        )
+        .bind(title_id)
+        .bind(country_code)
+        .bind(bounded_text(rating.rating.as_deref(), 64))
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+fn bounded_text(value: Option<&str>, maximum: usize) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()
+            && value.chars().count() <= maximum
+            && !value.chars().any(char::is_control))
+        .then(|| value.to_owned())
+    })
+}
+
+fn normalized_language(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    ((2..=3).contains(&value.len())
+        && value.is_ascii()
+        && value.bytes().all(|byte| byte.is_ascii_alphabetic()))
+    .then(|| value.to_ascii_lowercase())
+}
+
+fn normalized_country(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    (value.len() == 2 && value.is_ascii() && value.bytes().all(|byte| byte.is_ascii_alphabetic()))
+        .then(|| value.to_ascii_uppercase())
+}
+
+fn parse_source_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
+    value
+        .and_then(|value| DateTime::parse_from_rfc3339(value.trim()).ok())
+        .map(|value| value.with_timezone(&Utc))
 }
 
 fn database_error(_: sqlx::Error) -> JobExecutionError {

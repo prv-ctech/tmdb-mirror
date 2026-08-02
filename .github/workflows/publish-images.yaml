@@ -3,10 +3,11 @@ name: Publish container images
 on:
   push:
     branches: [main]
+    tags: ['v*.*.*']
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 concurrency:
@@ -35,6 +36,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Refuse to overwrite an immutable release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          APP_IMAGE: ${{ env.REGISTRY }}/${{ github.repository }}
+          POSTGRES_IMAGE: ${{ env.REGISTRY }}/${{ github.repository }}-postgres
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tags must be immutable vX.Y.Z tags." >&2
+            exit 1
+          fi
+          for image in "$APP_IMAGE" "$POSTGRES_IMAGE"; do
+            if docker buildx imagetools inspect "${image}:${RELEASE_TAG}" >/dev/null 2>&1; then
+              echo "Refusing to overwrite existing immutable image tag: ${image}:${RELEASE_TAG}" >&2
+              exit 1
+            fi
+          done
+
       - name: Create application image metadata
         id: app
         uses: docker/metadata-action@v5
@@ -42,9 +61,11 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ github.repository }}
           tags: |
             type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            type=ref,event=tag
             type=sha,prefix=sha-
 
       - name: Build and publish application image
+        id: app-build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -63,9 +84,11 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ github.repository }}-postgres
           tags: |
             type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            type=ref,event=tag
             type=sha,prefix=sha-
 
       - name: Build and publish PostgreSQL image
+        id: postgres-build
         uses: docker/build-push-action@v6
         with:
           context: ./infra/postgres
@@ -76,3 +99,48 @@ jobs:
           labels: ${{ steps.postgres.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Render digest-pinned release Compose
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          APP_IMAGE: ${{ env.REGISTRY }}/${{ github.repository }}@${{ steps.app-build.outputs.digest }}
+          POSTGRES_IMAGE: ${{ env.REGISTRY }}/${{ github.repository }}-postgres@${{ steps.postgres-build.outputs.digest }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          source = Path("deploy/compose.release.yaml")
+          destination = Path(f"tmdb-mirror-{os.environ['RELEASE_TAG']}.compose.yaml")
+          rendered = source.read_text(encoding="utf-8")
+          replacements = {
+              "__TMDB_MIRROR_APP_IMAGE__": os.environ["APP_IMAGE"],
+              "__TMDB_MIRROR_POSTGRES_IMAGE__": os.environ["POSTGRES_IMAGE"],
+          }
+          for marker, image in replacements.items():
+              if marker not in rendered or "@sha256:" not in image:
+                  raise SystemExit(f"invalid release Compose marker: {marker}")
+              rendered = rendered.replace(marker, image)
+          if "__TMDB_MIRROR_" in rendered or "build:" in rendered:
+              raise SystemExit("release Compose was not fully rendered")
+          destination.write_text(rendered, encoding="utf-8")
+          PY
+
+      - name: Upload digest-pinned release Compose
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmdb-mirror-${{ github.ref_name }}-compose
+          path: tmdb-mirror-${{ github.ref_name }}.compose.yaml
+          if-no-files-found: error
+
+      - name: Publish GitHub release asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" "tmdb-mirror-${RELEASE_TAG}.compose.yaml" \
+            --title "$RELEASE_TAG" \
+            --generate-notes

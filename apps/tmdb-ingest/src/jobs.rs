@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use chrono::NaiveDate;
+use chrono::{Days, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -11,6 +11,7 @@ use tmdb_domain::MediaType;
 use tmdb_jobs::{ClaimedJob, JobError, JobExecutionError, JobExecutor, JobRepository, NewJob};
 use tmdb_upstream::{
     DailyExportParser, MAX_DAILY_EXPORT_BYTES, TmdbClient, TmdbClientError, TmdbKeyword,
+    TmdbTrendingItem,
 };
 
 #[path = "catalog_locks.rs"]
@@ -28,6 +29,12 @@ pub const REFRESH_SEASON_JOB: &str = "ingest.refresh_season";
 pub const CHANGES_SYNC_JOB: &str = "ingest.changes_sync";
 /// Versioned durable job names accepted by the ingestion worker.
 pub const DAILY_EXPORT_JOB: &str = "ingest.daily_export";
+/// Refresh a typed TMDB trending window into the durable ranking table.
+pub const TRENDING_REFRESH_JOB: &str = "ingest.trending";
+/// Explicit administrative catalog scan coordinator. It is never enqueued by restart.
+pub const ADMIN_SCAN_JOB: &str = "admin.scan";
+/// Fixed allowlisted catalog statistics maintenance.
+pub const ADMIN_ANALYZE_JOB: &str = "admin.analyze";
 /// Current payload version for all ingestion jobs.
 pub const INGEST_PAYLOAD_VERSION: i32 = 1;
 const INGEST_JOB_TYPES: &[&str] = &[
@@ -36,6 +43,9 @@ const INGEST_JOB_TYPES: &[&str] = &[
     REFRESH_SEASON_JOB,
     CHANGES_SYNC_JOB,
     DAILY_EXPORT_JOB,
+    TRENDING_REFRESH_JOB,
+    ADMIN_SCAN_JOB,
+    ADMIN_ANALYZE_JOB,
 ];
 const DAILY_EXPORT_REFRESH_PRIORITY: i16 = -100;
 
@@ -66,6 +76,28 @@ struct DailyExportPayload {
     url: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct TrendingPayload {
+    media_type: MediaType,
+    trend_window: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminScanMode {
+    Full,
+    Missing,
+    Changes,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AdminScanPayload {
+    mode: AdminScanMode,
+    media_types: Vec<MediaType>,
+}
+
 /// A validated, idempotent ingestion job payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IngestJob {
@@ -79,6 +111,18 @@ pub enum IngestJob {
     ChangesSync { media_type: MediaType, page: u32 },
     /// Fetch and parse one daily ID export.
     DailyExport { media_type: MediaType, url: String },
+    /// Refresh a named trending window for a single public media namespace.
+    Trending {
+        media_type: MediaType,
+        trend_window: String,
+    },
+    /// Expand one explicit operational scan into safely bounded ingest jobs.
+    AdminScan {
+        mode: AdminScanMode,
+        media_types: Vec<MediaType>,
+    },
+    /// Analyze only the fixed catalog/search relation allowlist.
+    AdminAnalyze,
 }
 
 impl IngestJob {
@@ -101,6 +145,14 @@ impl IngestJob {
                 let digest = digest.finalize();
                 format!("{DAILY_EXPORT_JOB}:{media_type}:{digest:x}")
             }
+            Self::Trending {
+                media_type,
+                trend_window,
+            } => format!("{TRENDING_REFRESH_JOB}:{media_type}:{trend_window}"),
+            Self::AdminScan { mode, media_types } => {
+                format!("{ADMIN_SCAN_JOB}:{mode:?}:{media_types:?}")
+            }
+            Self::AdminAnalyze => ADMIN_ANALYZE_JOB.to_owned(),
         }
     }
 }
@@ -160,6 +212,34 @@ pub fn parse_job(
                 url: payload.url,
             })
         }
+        TRENDING_REFRESH_JOB => {
+            let payload: TrendingPayload = parse_payload(payload)?;
+            if !matches!(payload.trend_window.as_str(), "day" | "week") {
+                return Err(JobPayloadError::InvalidValue);
+            }
+            Ok(IngestJob::Trending {
+                media_type: payload.media_type,
+                trend_window: payload.trend_window,
+            })
+        }
+        ADMIN_SCAN_JOB => {
+            let payload: AdminScanPayload = parse_payload(payload)?;
+            if payload.media_types.is_empty()
+                || payload.media_types.len() > 2
+                || payload
+                    .media_types
+                    .windows(2)
+                    .any(|pair| pair[0] == pair[1])
+            {
+                return Err(JobPayloadError::InvalidValue);
+            }
+            Ok(IngestJob::AdminScan {
+                mode: payload.mode,
+                media_types: payload.media_types,
+            })
+        }
+        ADMIN_ANALYZE_JOB if payload == &serde_json::json!({}) => Ok(IngestJob::AdminAnalyze),
+        ADMIN_ANALYZE_JOB => Err(JobPayloadError::InvalidPayload),
         _ => Err(JobPayloadError::UnknownJobType),
     }
 }
@@ -267,6 +347,24 @@ impl IngestExecutor {
         self.export_max_bytes = export_max_bytes;
         Ok(self)
     }
+
+    async fn record_upstream_state(&self, state: &'static str) {
+        let Some(database) = &self.database else {
+            return;
+        };
+        if sqlx::query("SELECT ops.record_component_heartbeat('upstream', $1)")
+            .bind(state)
+            .execute(database)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                event = "component_heartbeat_failed",
+                component = "upstream",
+                error_code = "database_unavailable",
+            );
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -283,8 +381,12 @@ impl JobExecutor for IngestExecutor {
         match parsed {
             IngestJob::RefreshMovie { tmdb_id } => {
                 let movie = match self.client.fetch_movie(tmdb_id).await {
-                    Ok(movie) => movie,
+                    Ok(movie) => {
+                        self.record_upstream_state("ready").await;
+                        movie
+                    }
                     Err(TmdbClientError::NotFound) => {
+                        self.record_upstream_state("ready").await;
                         tracing::debug!(
                             event = "upstream_item_skipped",
                             operation = "movie_detail",
@@ -300,6 +402,7 @@ impl JobExecutor for IngestExecutor {
                         }));
                     }
                     Err(error) => {
+                        self.record_upstream_state("degraded").await;
                         log_upstream_failure("movie_detail", "movie", tmdb_id, None, &error);
                         return Err(map_upstream_error(&error));
                     }
@@ -320,8 +423,12 @@ impl JobExecutor for IngestExecutor {
             }
             IngestJob::RefreshTv { tmdb_id } => {
                 let series = match self.client.fetch_tv(tmdb_id).await {
-                    Ok(series) => series,
+                    Ok(series) => {
+                        self.record_upstream_state("ready").await;
+                        series
+                    }
                     Err(TmdbClientError::NotFound) => {
+                        self.record_upstream_state("ready").await;
                         tracing::debug!(
                             event = "upstream_item_skipped",
                             operation = "tv_detail",
@@ -337,6 +444,7 @@ impl JobExecutor for IngestExecutor {
                         }));
                     }
                     Err(error) => {
+                        self.record_upstream_state("degraded").await;
                         log_upstream_failure("tv_detail", "tv", tmdb_id, None, &error);
                         return Err(map_upstream_error(&error));
                     }
@@ -356,21 +464,24 @@ impl JobExecutor for IngestExecutor {
                 }))
             }
             IngestJob::ChangesSync { media_type, page } => {
-                let change_page =
-                    self.client
-                        .fetch_changes(media_type, page)
-                        .await
-                        .map_err(|error| {
-                            tracing::warn!(
-                                event = "upstream_request_failed",
-                                operation = "changes_page",
-                                media_type = media_type_name(media_type),
-                                page,
-                                failure_reason = upstream_error_reason(&error),
-                                http_status = upstream_http_status(&error),
-                            );
-                            map_upstream_error(&error)
-                        })?;
+                let change_page = match self.client.fetch_changes(media_type, page).await {
+                    Ok(change_page) => {
+                        self.record_upstream_state("ready").await;
+                        change_page
+                    }
+                    Err(error) => {
+                        self.record_upstream_state("degraded").await;
+                        tracing::warn!(
+                            event = "upstream_request_failed",
+                            operation = "changes_page",
+                            media_type = media_type_name(media_type),
+                            page,
+                            failure_reason = upstream_error_reason(&error),
+                            http_status = upstream_http_status(&error),
+                        );
+                        return Err(map_upstream_error(&error));
+                    }
+                };
                 let changed_ids: Vec<u64> = change_page
                     .results
                     .iter()
@@ -421,8 +532,12 @@ impl JobExecutor for IngestExecutor {
                 season_number,
             } => {
                 let season = match self.client.fetch_season(tv_id, season_number).await {
-                    Ok(season) => season,
+                    Ok(season) => {
+                        self.record_upstream_state("ready").await;
+                        season
+                    }
                     Err(TmdbClientError::NotFound) => {
+                        self.record_upstream_state("ready").await;
                         tracing::debug!(
                             event = "upstream_item_skipped",
                             operation = "season_detail",
@@ -440,6 +555,7 @@ impl JobExecutor for IngestExecutor {
                         }));
                     }
                     Err(error) => {
+                        self.record_upstream_state("degraded").await;
                         log_upstream_failure(
                             "season_detail",
                             "tv",
@@ -477,11 +593,17 @@ impl JobExecutor for IngestExecutor {
                     .map_err(|_| {
                         JobExecutionError::retry("export_storage", Duration::from_secs(30))
                     })?;
-                let download = self
+                let download = match self
                     .client
                     .fetch_daily_export_to_file(&url, &destination, self.export_max_bytes)
                     .await
-                    .map_err(|error| {
+                {
+                    Ok(download) => {
+                        self.record_upstream_state("ready").await;
+                        download
+                    }
+                    Err(error) => {
+                        self.record_upstream_state("degraded").await;
                         tracing::warn!(
                             event = "upstream_request_failed",
                             operation = "daily_export",
@@ -489,8 +611,9 @@ impl JobExecutor for IngestExecutor {
                             failure_reason = upstream_error_reason(&error),
                             http_status = upstream_http_status(&error),
                         );
-                        map_upstream_error(&error)
-                    })?;
+                        return Err(map_upstream_error(&error));
+                    }
+                };
                 let queue_summary = if let Some(database) = &self.database {
                     enqueue_daily_export_refresh_jobs(
                         database,
@@ -522,8 +645,295 @@ impl JobExecutor for IngestExecutor {
                     "sha256": hex_digest(&download.sha256)
                 }))
             }
+            IngestJob::Trending {
+                media_type,
+                trend_window,
+            } => {
+                let Some(database) = &self.database else {
+                    return Err(JobExecutionError::retry(
+                        "database_unavailable",
+                        Duration::from_secs(5),
+                    ));
+                };
+                let trend_page = match self.client.fetch_trending(media_type, &trend_window).await {
+                    Ok(page) => {
+                        self.record_upstream_state("ready").await;
+                        page
+                    }
+                    Err(error) => {
+                        self.record_upstream_state("degraded").await;
+                        tracing::warn!(
+                            event = "upstream_request_failed",
+                            operation = "trending",
+                            media_type = media_type_name(media_type),
+                            trend_window,
+                            failure_reason = upstream_error_reason(&error),
+                            http_status = upstream_http_status(&error),
+                        );
+                        return Err(map_upstream_error(&error));
+                    }
+                };
+                let persisted =
+                    persist_trending(database, media_type, &trend_window, &trend_page.results)
+                        .await?;
+                Ok(serde_json::json!({
+                    "media_type": media_type,
+                    "trend_window": trend_window,
+                    "upstream_items": trend_page.results.len(),
+                    "persisted": persisted,
+                    "dedup_key": dedup_key,
+                }))
+            }
+            IngestJob::AdminScan { mode, media_types } => {
+                let Some(database) = &self.database else {
+                    return Err(JobExecutionError::retry(
+                        "database_unavailable",
+                        Duration::from_secs(5),
+                    ));
+                };
+                let queued = match mode {
+                    AdminScanMode::Full => {
+                        let export_date = Utc::now()
+                            .date_naive()
+                            .checked_sub_days(Days::new(1))
+                            .ok_or_else(|| JobExecutionError::dead_letter("invalid_payload"))?;
+                        let mut queued = 0_usize;
+                        for &media_type in &media_types {
+                            let job = full_export_job(media_type, export_date)?;
+                            if !JobRepository::new(database.clone())
+                                .submit(job)
+                                .await
+                                .map_err(|_| {
+                                    JobExecutionError::retry(
+                                        "database_unavailable",
+                                        Duration::from_secs(5),
+                                    )
+                                })?
+                                .was_duplicate()
+                            {
+                                queued = queued.saturating_add(1);
+                            }
+                        }
+                        queued
+                    }
+                    AdminScanMode::Changes => {
+                        let mut queued = 0_usize;
+                        for media_type in &media_types {
+                            let job = NewJob::new(
+                                CHANGES_SYNC_JOB,
+                                INGEST_PAYLOAD_VERSION,
+                                serde_json::json!({"media_type": media_type, "page": 1}),
+                                &format!("{CHANGES_SYNC_JOB}:{media_type}:1"),
+                            )
+                            .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+                            if !JobRepository::new(database.clone())
+                                .submit(job)
+                                .await
+                                .map_err(|_| {
+                                    JobExecutionError::retry(
+                                        "database_unavailable",
+                                        Duration::from_secs(5),
+                                    )
+                                })?
+                                .was_duplicate()
+                            {
+                                queued = queued.saturating_add(1);
+                            }
+                        }
+                        queued
+                    }
+                    AdminScanMode::Missing => {
+                        enqueue_missing_catalog_refresh_jobs(database, &media_types).await?
+                    }
+                };
+                Ok(serde_json::json!({
+                    "mode": mode,
+                    "media_types": media_types,
+                    "queued": queued,
+                    "dedup_key": dedup_key
+                }))
+            }
+            IngestJob::AdminAnalyze => {
+                let Some(database) = &self.database else {
+                    return Err(JobExecutionError::retry(
+                        "database_unavailable",
+                        Duration::from_secs(5),
+                    ));
+                };
+                analyze_catalog(database).await?;
+                Ok(serde_json::json!({
+                    "analyzed": [
+                        "catalog.titles",
+                        "catalog.movie_details",
+                        "catalog.tv_details",
+                        "catalog.title_credits",
+                        "search.search_documents"
+                    ],
+                    "dedup_key": dedup_key
+                }))
+            }
         }
     }
+}
+
+fn full_export_job(
+    media_type: MediaType,
+    export_date: NaiveDate,
+) -> Result<NewJob, JobExecutionError> {
+    let (media_type_name, file_prefix) = match media_type {
+        MediaType::Movie => ("movie", "movie_ids"),
+        MediaType::Tv => ("tv", "tv_series_ids"),
+    };
+    let date_text = export_date.format("%m_%d_%Y").to_string();
+    NewJob::new(
+        DAILY_EXPORT_JOB,
+        INGEST_PAYLOAD_VERSION,
+        serde_json::json!({
+            "media_type": media_type_name,
+            "url": format!("https://files.tmdb.org/p/exports/{file_prefix}_{date_text}.json.gz")
+        }),
+        &format!("{DAILY_EXPORT_JOB}:{media_type_name}:{date_text}"),
+    )
+    .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))
+}
+
+async fn enqueue_missing_catalog_refresh_jobs(
+    database: &PgPool,
+    media_types: &[MediaType],
+) -> Result<usize, JobExecutionError> {
+    const MAX_MISSING_REFRESHES: i64 = 10_000;
+    let repository = JobRepository::new(database.clone());
+    let mut queued = 0_usize;
+    for media_type in media_types {
+        let media_type_name = media_type_name(*media_type);
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT tmdb_id
+               FROM catalog.titles
+              WHERE media_type = $1
+                AND active
+                AND (source_updated_at IS NULL OR display_title IS NULL)
+              ORDER BY id
+              LIMIT $2",
+        )
+        .bind(media_type_name)
+        .bind(MAX_MISSING_REFRESHES)
+        .fetch_all(database)
+        .await
+        .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+        for tmdb_id in ids {
+            let tmdb_id = u32::try_from(tmdb_id)
+                .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+            let job_type = match media_type {
+                MediaType::Movie => REFRESH_MOVIE_JOB,
+                MediaType::Tv => REFRESH_TV_JOB,
+            };
+            let job = NewJob::new(
+                job_type,
+                INGEST_PAYLOAD_VERSION,
+                serde_json::json!({"tmdb_id": tmdb_id}),
+                &format!("{job_type}:{tmdb_id}"),
+            )
+            .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+            if !repository
+                .submit(job)
+                .await
+                .map_err(|_| {
+                    JobExecutionError::retry("database_unavailable", Duration::from_secs(5))
+                })?
+                .was_duplicate()
+            {
+                queued = queued.saturating_add(1);
+            }
+        }
+    }
+    Ok(queued)
+}
+
+async fn analyze_catalog(database: &PgPool) -> Result<(), JobExecutionError> {
+    // These are compile-time literals, not caller-controlled relation names.
+    for statement in [
+        "ANALYZE catalog.titles",
+        "ANALYZE catalog.movie_details",
+        "ANALYZE catalog.tv_details",
+        "ANALYZE catalog.title_credits",
+        "ANALYZE search.search_documents",
+    ] {
+        sqlx::query(statement)
+            .execute(database)
+            .await
+            .map_err(|_| {
+                JobExecutionError::retry("database_unavailable", Duration::from_secs(5))
+            })?;
+    }
+    Ok(())
+}
+
+async fn persist_trending(
+    database: &PgPool,
+    media_type: MediaType,
+    trend_window: &str,
+    items: &[TmdbTrendingItem],
+) -> Result<usize, JobExecutionError> {
+    if !matches!(trend_window, "day" | "week") || items.len() > 100 {
+        return Err(JobExecutionError::dead_letter("invalid_payload"));
+    }
+    let collected_for = Utc::now().date_naive();
+    let mut transaction = database
+        .begin()
+        .await
+        .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    // Replace the complete scope inside this transaction. A successful TMDB
+    // response is authoritative for its window; keeping same-day rows would
+    // surface titles that disappeared from the later response. If insertion
+    // fails, the transaction rolls back and preserves the prior list.
+    sqlx::query(
+        "DELETE FROM catalog.title_trends
+          WHERE trend_window = $1
+            AND media_type = $2",
+    )
+    .bind(trend_window)
+    .bind(media_type_name(media_type))
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    let mut persisted = 0_usize;
+    for (offset, item) in items.iter().enumerate() {
+        let tmdb_id = source_id(item.id)?;
+        let rank = i32::try_from(offset + 1)
+            .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+        let score = item.popularity.filter(|score| score.is_finite());
+        let affected = sqlx::query(
+            "INSERT INTO catalog.title_trends (
+                 trend_window, media_type, title_id, rank, score, collected_for, updated_at
+             )
+             SELECT $1, $2, title.id, $3, $4, $5, clock_timestamp()
+               FROM catalog.titles AS title
+              WHERE title.media_type = $2
+                AND title.tmdb_id = $6
+                AND title.active
+             ON CONFLICT (trend_window, media_type, title_id) DO UPDATE
+             SET rank = EXCLUDED.rank,
+                 score = EXCLUDED.score,
+                 collected_for = EXCLUDED.collected_for,
+                 updated_at = clock_timestamp()",
+        )
+        .bind(trend_window)
+        .bind(media_type_name(media_type))
+        .bind(rank)
+        .bind(score)
+        .bind(collected_for)
+        .bind(tmdb_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?
+        .rows_affected();
+        persisted = persisted.saturating_add(usize::try_from(affected).unwrap_or(0));
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    Ok(persisted)
 }
 
 fn hex_digest(value: &[u8; 32]) -> String {
@@ -903,6 +1313,52 @@ mod tests {
         .fetch_all(&pool)
         .await?;
         assert_eq!(ids, [52]);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn trending_refresh_replaces_the_complete_current_window(
+        pool: PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        sqlx::query(
+            "INSERT INTO catalog.titles (media_type, tmdb_id, display_title)
+             VALUES ('movie', 101, 'First trend'), ('movie', 102, 'Second trend')",
+        )
+        .execute(&pool)
+        .await?;
+
+        persist_trending(
+            &pool,
+            MediaType::Movie,
+            "day",
+            &[TmdbTrendingItem {
+                id: 101,
+                popularity: Some(10.0),
+            }],
+        )
+        .await?;
+        persist_trending(
+            &pool,
+            MediaType::Movie,
+            "day",
+            &[TmdbTrendingItem {
+                id: 102,
+                popularity: Some(20.0),
+            }],
+        )
+        .await?;
+
+        let trends: Vec<(i64, i32)> = sqlx::query_as(
+            "SELECT title.tmdb_id, trend.rank
+               FROM catalog.title_trends AS trend
+               JOIN catalog.titles AS title ON title.id = trend.title_id
+              WHERE trend.media_type = 'movie'
+                AND trend.trend_window = 'day'
+              ORDER BY trend.rank",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(trends, vec![(102, 1)]);
         Ok(())
     }
 }

@@ -18,6 +18,7 @@ sqlx.workspace = true
 tmdb-config = { path = "../../crates/tmdb-config" }
 tmdb-db = { path = "../../crates/tmdb-db" }
 tmdb-domain = { path = "../../crates/tmdb-domain" }
+tmdb-jobs = { path = "../../crates/tmdb-jobs" }
 tmdb-media = { path = "../../crates/tmdb-media" }
 tmdb-observability = { path = "../../crates/tmdb-observability" }
 tokio.workspace = true

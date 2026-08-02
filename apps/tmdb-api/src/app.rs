@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use axum::{
     Router,
     body::Body,
-    extract::{Extension, MatchedPath, Request, State},
+    extract::{DefaultBodyLimit, Extension, MatchedPath, Request, State},
     http::{
         StatusCode,
         header::{self, HeaderName, HeaderValue},
@@ -32,7 +32,7 @@ use tmdb_observability::{
     HttpRequestLabels, HttpRequestLog, Listener, MethodClass, Metrics, StatusClass,
 };
 
-use crate::{health, problem};
+use crate::{admin_api, health, problem};
 
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -155,7 +155,11 @@ fn build_router_inner(
     let request_id = HeaderName::from_static("x-request-id");
     let mut router = Router::new()
         .route("/health/live", get(health::live))
-        .route("/health/ready", get(health::ready));
+        .route("/health/ready", get(health::ready))
+        // Keep every public health surface available through the stable v1
+        // prefix as well as the original unversioned compatibility paths.
+        .route("/v1/health/live", get(health::live))
+        .route("/v1/health/ready", get(health::ready));
     if include_test_routes {
         router = router
             .route("/__test/panic", get(test_panic))
@@ -228,7 +232,20 @@ pub fn build_admin_router(metrics: Metrics) -> Router {
 /// Builds the administrative router and enables bearer/API-key authentication when configured.
 /// Passing `None` preserves the unauthenticated in-process development/test behavior.
 pub fn build_admin_router_with_auth(metrics: Metrics, api_key: Option<SecretString>) -> Router {
-    build_admin_router_with_auth_and_timeout(metrics, api_key, REQUEST_TIMEOUT)
+    build_admin_router_inner(metrics, api_key, None, REQUEST_TIMEOUT)
+}
+
+/// Builds the private administrative router with authenticated operational routes.
+///
+/// Operations remain unavailable unless this explicit constructor receives a durable store.
+/// This keeps the metrics-only compatibility router usable by narrow tests and development
+/// tools without accidentally exposing write handlers on another listener.
+pub fn build_admin_router_with_operations_and_auth(
+    metrics: Metrics,
+    api_key: Option<SecretString>,
+    operations: Arc<dyn admin_api::AdminApiStore>,
+) -> Router {
+    build_admin_router_inner(metrics, api_key, Some(operations), REQUEST_TIMEOUT)
 }
 
 /// Build the administrative router with an explicit request deadline.
@@ -244,13 +261,31 @@ pub fn build_admin_router_with_auth_and_timeout(
     api_key: Option<SecretString>,
     request_timeout: Duration,
 ) -> Router {
-    let state = AdminState { metrics };
+    build_admin_router_inner(metrics, api_key, None, request_timeout)
+}
+
+fn build_admin_router_inner(
+    metrics: Metrics,
+    api_key: Option<SecretString>,
+    operations: Option<Arc<dyn admin_api::AdminApiStore>>,
+    request_timeout: Duration,
+) -> Router {
+    let state = AdminState {
+        metrics,
+        operations,
+    };
     let middleware_metrics = state.metrics.clone();
-    Router::new()
-        .route("/metrics", get(metrics_handler))
+    let mut router = Router::<AdminState>::new().route("/metrics", get(metrics_handler));
+    if state.operations.is_some() {
+        router = admin_api::register_routes(router);
+    }
+    router
         .fallback(problem::not_found)
         .method_not_allowed_fallback(problem::method_not_allowed)
         .with_state(state.clone())
+        // Administrative JSON is deliberately tiny: every write request has
+        // a fixed shape and is persisted as a bounded durable job payload.
+        .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(CompressionLayer::new().zstd(true))
         .layer(middleware::from_fn(
             move |mut request: Request, next: Next| {
@@ -337,9 +372,20 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
-#[derive(Clone, Debug)]
-struct AdminState {
-    metrics: Metrics,
+#[derive(Clone)]
+pub(crate) struct AdminState {
+    pub(crate) metrics: Metrics,
+    pub(crate) operations: Option<Arc<dyn admin_api::AdminApiStore>>,
+}
+
+impl std::fmt::Debug for AdminState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AdminState")
+            .field("metrics", &self.metrics)
+            .field("operations_enabled", &self.operations.is_some())
+            .finish()
+    }
 }
 
 async fn metrics_handler(
@@ -347,6 +393,17 @@ async fn metrics_handler(
     request_id: Option<Extension<RequestId>>,
 ) -> Response {
     let request_id = request_id.map_or_else(String::new, |value| value.0.0);
+    if let Some(operations) = &state.operations {
+        match operations.status().await {
+            Ok(status) => admin_api::record_status_metrics(&state.metrics, &status),
+            Err(_) => {
+                tracing::warn!(
+                    event = "metrics_operational_snapshot_unavailable",
+                    outcome = "admin_dependency_unavailable"
+                );
+            }
+        }
+    }
     match state.metrics.encode() {
         Ok(body) => Response::builder()
             .status(StatusCode::OK)

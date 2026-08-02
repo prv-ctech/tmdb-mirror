@@ -74,7 +74,7 @@ impl ReadinessProbe for FakeProbe {
 fn report() -> ReadinessReport {
     ReadinessReport {
         postgres_major: 18,
-        schema_revision: "0015".to_owned(),
+        schema_revision: "0026".to_owned(),
         extensions: vec![
             "pg_stat_statements".to_owned(),
             "pg_trgm".to_owned(),

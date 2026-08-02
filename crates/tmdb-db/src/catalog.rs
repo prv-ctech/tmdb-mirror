@@ -391,6 +391,89 @@ pub struct CatalogImageAsset {
     pub sha256: Option<String>,
     pub status: String,
     pub iso_639_1: Option<String>,
+    /// Verified local JPEG/WebP representations, ordered by stable variant key.
+    pub variants: Vec<CatalogImageVariant>,
+}
+
+/// One local image representation available for responsive clients.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogImageVariant {
+    pub variant_key: String,
+    pub storage_path: String,
+    pub mime_type: String,
+    pub width: i32,
+    pub height: i32,
+    pub file_size_bytes: i64,
+    pub sha256: String,
+}
+
+/// A localized title translation from TMDB's translations facet.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogTranslation {
+    pub language_code: String,
+    pub country_code: String,
+    pub name: Option<String>,
+    pub overview: Option<String>,
+    pub tagline: Option<String>,
+    pub homepage: Option<String>,
+}
+
+/// A regional or typed alternate title.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogAlternateTitle {
+    pub title: String,
+    pub country_code: String,
+    pub title_type: String,
+}
+
+/// Safe, known external identifiers. No provider credentials or URLs are exposed.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogExternalIds {
+    pub imdb_id: Option<String>,
+    pub tvdb_id: Option<String>,
+    pub wikidata_id: Option<String>,
+    pub facebook_id: Option<String>,
+    pub instagram_id: Option<String>,
+    pub twitter_id: Option<String>,
+}
+
+/// A public trailer, teaser, clip, or other video reference.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogVideo {
+    pub key: String,
+    pub site: String,
+    pub video_type: Option<String>,
+    pub name: Option<String>,
+    pub official: bool,
+    pub language_code: Option<String>,
+    pub country_code: Option<String>,
+    pub published_at: Option<DateTime<Utc>>,
+    pub size: Option<i32>,
+}
+
+/// A regional release date or television content rating/certification.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogReleaseDate {
+    pub country_code: String,
+    pub release_date: Option<DateTime<Utc>>,
+    pub certification: Option<String>,
+    pub release_type: Option<i16>,
+    pub note: Option<String>,
+}
+
+/// One ordered trend row with the title record needed by a consuming application.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogTrend {
+    pub rank: i32,
+    pub score: Option<f64>,
+    pub title: CatalogTitle,
 }
 
 /// A canonical collection resource.
@@ -1412,8 +1495,283 @@ impl CatalogRepository {
         let Some(title_id) = title_id else {
             return Ok(None);
         };
-        let rows = sqlx::query_as::<_, ImageRow>("SELECT id, image_kind, source, source_key, source_url, storage_path, mime_type, width, height, file_size_bytes, sha256, status, iso_639_1 FROM assets.image_assets WHERE title_id = $1 ORDER BY image_kind, id").bind(title_id).fetch_all(&self.pool).await.map_err(|_| CatalogError::Query)?;
+        let rows = sqlx::query_as::<_, ImageRow>(
+            "SELECT asset.id, asset.image_kind, asset.source, asset.source_key,
+                    asset.source_url, asset.storage_path, asset.mime_type, asset.width,
+                    asset.height, asset.file_size_bytes, asset.sha256, asset.status,
+                    asset.iso_639_1,
+                    COALESCE(
+                        pg_catalog.jsonb_agg(
+                            pg_catalog.jsonb_build_object(
+                                'variant_key', variant.variant_key,
+                                'storage_path', variant.storage_path,
+                                'mime_type', variant.mime_type,
+                                'width', variant.width,
+                                'height', variant.height,
+                                'file_size_bytes', variant.file_size_bytes,
+                                'sha256', variant.sha256
+                            ) ORDER BY variant.variant_key
+                        ) FILTER (WHERE variant.image_asset_id IS NOT NULL),
+                        '[]'::jsonb
+                    ) AS variants
+               FROM assets.image_assets AS asset
+               LEFT JOIN assets.image_variants AS variant
+                 ON variant.image_asset_id = asset.id
+              WHERE asset.title_id = $1
+              GROUP BY asset.id
+              ORDER BY asset.image_kind, asset.id",
+        )
+        .bind(title_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| CatalogError::Query)?;
         Ok(Some(rows.into_iter().map(Into::into).collect()))
+    }
+
+    /// Lists localized title translations in a title's public isolation scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::Query`] when the catalog cannot be read.
+    pub async fn list_translations(
+        &self,
+        key: TitleKey,
+        anime_scope: AnimeScope,
+    ) -> Result<Option<Vec<CatalogTranslation>>, CatalogError> {
+        let Some(title_id) = self.scoped_title_id(key, anime_scope).await? else {
+            return Ok(None);
+        };
+        sqlx::query_as::<_, TranslationRow>(
+            "SELECT language_code, country_code, name, overview, tagline, homepage
+               FROM catalog.title_translations
+              WHERE title_id = $1
+              ORDER BY language_code, country_code",
+        )
+        .bind(title_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| Some(rows.into_iter().map(Into::into).collect()))
+        .map_err(|_| CatalogError::Query)
+    }
+
+    /// Lists bounded regional alternate titles in a title's public scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::Query`] when the catalog cannot be read.
+    pub async fn list_alternate_titles(
+        &self,
+        key: TitleKey,
+        anime_scope: AnimeScope,
+    ) -> Result<Option<Vec<CatalogAlternateTitle>>, CatalogError> {
+        let Some(title_id) = self.scoped_title_id(key, anime_scope).await? else {
+            return Ok(None);
+        };
+        sqlx::query_as::<_, AlternateTitleRow>(
+            "SELECT title, country_code, title_type
+               FROM catalog.title_alternate_titles
+              WHERE title_id = $1
+              ORDER BY country_code, title_type, title
+              LIMIT 500",
+        )
+        .bind(title_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| Some(rows.into_iter().map(Into::into).collect()))
+        .map_err(|_| CatalogError::Query)
+    }
+
+    /// Reads known external identifiers without exposing provider credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::Query`] when the catalog cannot be read.
+    pub async fn external_ids(
+        &self,
+        key: TitleKey,
+        anime_scope: AnimeScope,
+    ) -> Result<Option<CatalogExternalIds>, CatalogError> {
+        let Some(title_id) = self.scoped_title_id(key, anime_scope).await? else {
+            return Ok(None);
+        };
+        sqlx::query_as::<_, ExternalIdsRow>(
+            "SELECT imdb_id AS imdb, tvdb_id AS tvdb, wikidata_id AS wikidata,
+                    facebook_id AS facebook, instagram_id AS instagram, twitter_id AS twitter
+               FROM catalog.title_external_ids
+              WHERE title_id = $1",
+        )
+        .bind(title_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| Some(row.map_or_else(CatalogExternalIds::default, Into::into)))
+        .map_err(|_| CatalogError::Query)
+    }
+
+    /// Lists public video references in deterministic provider/date order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::Query`] when the catalog cannot be read.
+    pub async fn list_videos(
+        &self,
+        key: TitleKey,
+        anime_scope: AnimeScope,
+    ) -> Result<Option<Vec<CatalogVideo>>, CatalogError> {
+        let Some(title_id) = self.scoped_title_id(key, anime_scope).await? else {
+            return Ok(None);
+        };
+        sqlx::query_as::<_, VideoRow>(
+            "SELECT video_key, site, video_type, name, official, language_code,
+                    country_code, published_at, size
+               FROM catalog.title_videos
+              WHERE title_id = $1
+              ORDER BY official DESC, published_at DESC NULLS LAST, site, video_key
+              LIMIT 500",
+        )
+        .bind(title_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| Some(rows.into_iter().map(Into::into).collect()))
+        .map_err(|_| CatalogError::Query)
+    }
+
+    /// Lists movie release dates or TV regional certifications in public scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::Query`] when the catalog cannot be read.
+    pub async fn list_release_dates(
+        &self,
+        key: TitleKey,
+        anime_scope: AnimeScope,
+    ) -> Result<Option<Vec<CatalogReleaseDate>>, CatalogError> {
+        let Some(title_id) = self.scoped_title_id(key, anime_scope).await? else {
+            return Ok(None);
+        };
+        sqlx::query_as::<_, ReleaseDateRow>(
+            "SELECT country_code, release_date, certification, release_type, note
+               FROM catalog.title_release_dates
+              WHERE title_id = $1
+              ORDER BY country_code, release_date DESC NULLS LAST, release_type, id
+              LIMIT 1_000",
+        )
+        .bind(title_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| Some(rows.into_iter().map(Into::into).collect()))
+        .map_err(|_| CatalogError::Query)
+    }
+
+    /// Lists a current TMDB trend window while enforcing the requested partition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::InvalidInput`] for unsupported windows or limits,
+    /// and [`CatalogError::Query`] when the catalog cannot be read.
+    pub async fn list_trending(
+        &self,
+        trend_window: &str,
+        media_type: Option<MediaType>,
+        anime_scope: AnimeScope,
+        limit: u16,
+    ) -> Result<Vec<CatalogTrend>, CatalogError> {
+        if !matches!(trend_window, "day" | "week") || !(1..=100).contains(&limit) {
+            return Err(CatalogError::InvalidInput);
+        }
+        let statement = format!(
+            "SELECT trend.rank, trend.score,
+                    title.id, title.media_type, title.tmdb_id, title.display_title,
+                    title.original_title, title.overview, title.popularity, title.vote_average,
+                    title.vote_count,
+                    CASE WHEN title.media_type = 'movie' THEN title.release_date
+                         ELSE title.first_air_date END AS release_date,
+                    title.is_anime
+               FROM catalog.title_trends AS trend
+               JOIN catalog.titles AS title ON title.id = trend.title_id
+              WHERE trend.trend_window = $1
+                AND ($2::text IS NULL OR trend.media_type = $2)
+                AND title.active
+                AND {scope}
+              ORDER BY trend.rank, title.id
+              LIMIT $3",
+            scope = anime_scope.qualified_predicate(),
+        );
+        let rows = sqlx::query_as::<_, TrendRow>(sqlx::AssertSqlSafe(statement))
+            .bind(trend_window)
+            .bind(media_type.map(|value| value.to_string()))
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| CatalogError::Query)?;
+        rows.into_iter().map(TrendRow::try_into_model).collect()
+    }
+
+    /// Lists date-bound movie or television calendar records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::InvalidInput`] for an invalid date range or
+    /// limit, and [`CatalogError::Query`] when the catalog cannot be read.
+    pub async fn list_calendar(
+        &self,
+        media_type: MediaType,
+        anime_scope: AnimeScope,
+        start: NaiveDate,
+        end: NaiveDate,
+        limit: u16,
+    ) -> Result<Vec<CatalogTitle>, CatalogError> {
+        if start > end
+            || end.signed_duration_since(start).num_days() > 366
+            || !(1..=100).contains(&limit)
+        {
+            return Err(CatalogError::InvalidInput);
+        }
+        let statement = format!(
+            "SELECT title.id, title.media_type, title.tmdb_id, title.display_title,
+                    title.original_title, title.overview, title.popularity, title.vote_average,
+                    title.vote_count,
+                    CASE WHEN title.media_type = 'movie' THEN title.release_date
+                         ELSE title.first_air_date END AS release_date,
+                    title.is_anime
+               FROM catalog.titles AS title
+              WHERE title.active
+                AND title.media_type = $1
+                AND CASE WHEN title.media_type = 'movie' THEN title.release_date
+                         ELSE title.first_air_date END BETWEEN $2 AND $3
+                AND {scope}
+              ORDER BY CASE WHEN title.media_type = 'movie' THEN title.release_date
+                            ELSE title.first_air_date END, title.id
+              LIMIT $4",
+            scope = anime_scope.qualified_predicate(),
+        );
+        let rows = sqlx::query_as::<_, TitleRow>(sqlx::AssertSqlSafe(statement))
+            .bind(media_type.to_string())
+            .bind(start)
+            .bind(end)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| CatalogError::Query)?;
+        rows.into_iter().map(TitleRow::try_into_title).collect()
+    }
+
+    async fn scoped_title_id(
+        &self,
+        key: TitleKey,
+        anime_scope: AnimeScope,
+    ) -> Result<Option<i64>, CatalogError> {
+        let statement = format!(
+            "SELECT id
+               FROM catalog.titles
+              WHERE media_type = $1 AND tmdb_id = $2 AND active AND {scope}",
+            scope = anime_scope.predicate(),
+        );
+        sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
+            .bind(key.media_type().to_string())
+            .bind(i64::from(key.tmdb_id().get()))
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| CatalogError::Query)
     }
 
     /// Lists active titles in deterministic popularity order with optional indexed filters.
@@ -2340,6 +2698,18 @@ struct ImageRow {
     sha256: Option<String>,
     status: String,
     iso_639_1: Option<String>,
+    variants: Json<Vec<ImageVariantRow>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ImageVariantRow {
+    variant_key: String,
+    storage_path: String,
+    mime_type: String,
+    width: i32,
+    height: i32,
+    file_size_bytes: i64,
+    sha256: String,
 }
 impl From<ImageRow> for CatalogImageAsset {
     fn from(row: ImageRow) -> Self {
@@ -2357,7 +2727,175 @@ impl From<ImageRow> for CatalogImageAsset {
             sha256: row.sha256,
             status: row.status,
             iso_639_1: row.iso_639_1,
+            variants: row
+                .variants
+                .0
+                .into_iter()
+                .map(|variant| CatalogImageVariant {
+                    variant_key: variant.variant_key,
+                    storage_path: variant.storage_path,
+                    mime_type: variant.mime_type,
+                    width: variant.width,
+                    height: variant.height,
+                    file_size_bytes: variant.file_size_bytes,
+                    sha256: variant.sha256,
+                })
+                .collect(),
         }
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct TranslationRow {
+    language_code: String,
+    country_code: String,
+    name: Option<String>,
+    overview: Option<String>,
+    tagline: Option<String>,
+    homepage: Option<String>,
+}
+
+impl From<TranslationRow> for CatalogTranslation {
+    fn from(row: TranslationRow) -> Self {
+        Self {
+            language_code: row.language_code,
+            country_code: row.country_code,
+            name: row.name,
+            overview: row.overview,
+            tagline: row.tagline,
+            homepage: row.homepage,
+        }
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct AlternateTitleRow {
+    title: String,
+    country_code: String,
+    title_type: String,
+}
+
+impl From<AlternateTitleRow> for CatalogAlternateTitle {
+    fn from(row: AlternateTitleRow) -> Self {
+        Self {
+            title: row.title,
+            country_code: row.country_code,
+            title_type: row.title_type,
+        }
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct ExternalIdsRow {
+    imdb: Option<String>,
+    tvdb: Option<String>,
+    wikidata: Option<String>,
+    facebook: Option<String>,
+    instagram: Option<String>,
+    twitter: Option<String>,
+}
+
+impl From<ExternalIdsRow> for CatalogExternalIds {
+    fn from(row: ExternalIdsRow) -> Self {
+        Self {
+            imdb_id: row.imdb,
+            tvdb_id: row.tvdb,
+            wikidata_id: row.wikidata,
+            facebook_id: row.facebook,
+            instagram_id: row.instagram,
+            twitter_id: row.twitter,
+        }
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct VideoRow {
+    video_key: String,
+    site: String,
+    video_type: Option<String>,
+    name: Option<String>,
+    official: bool,
+    language_code: Option<String>,
+    country_code: Option<String>,
+    published_at: Option<DateTime<Utc>>,
+    size: Option<i32>,
+}
+
+impl From<VideoRow> for CatalogVideo {
+    fn from(row: VideoRow) -> Self {
+        Self {
+            key: row.video_key,
+            site: row.site,
+            video_type: row.video_type,
+            name: row.name,
+            official: row.official,
+            language_code: row.language_code,
+            country_code: row.country_code,
+            published_at: row.published_at,
+            size: row.size,
+        }
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct ReleaseDateRow {
+    country_code: String,
+    release_date: Option<DateTime<Utc>>,
+    certification: Option<String>,
+    release_type: Option<i16>,
+    note: Option<String>,
+}
+
+impl From<ReleaseDateRow> for CatalogReleaseDate {
+    fn from(row: ReleaseDateRow) -> Self {
+        Self {
+            country_code: row.country_code,
+            release_date: row.release_date,
+            certification: row.certification,
+            release_type: row.release_type,
+            note: row.note,
+        }
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct TrendRow {
+    rank: i32,
+    score: Option<f64>,
+    id: i64,
+    media_type: String,
+    tmdb_id: i64,
+    display_title: Option<String>,
+    original_title: Option<String>,
+    overview: Option<String>,
+    popularity: Option<f64>,
+    vote_average: Option<f64>,
+    vote_count: Option<i64>,
+    release_date: Option<NaiveDate>,
+    is_anime: bool,
+}
+
+impl TrendRow {
+    fn try_into_model(self) -> Result<CatalogTrend, CatalogError> {
+        let title = TitleRow {
+            id: self.id,
+            media_type: self.media_type,
+            tmdb_id: self.tmdb_id,
+            display_title: self.display_title,
+            original_title: self.original_title,
+            overview: self.overview,
+            popularity: self.popularity,
+            vote_average: self.vote_average,
+            vote_count: self.vote_count,
+            release_date: self.release_date,
+            is_anime: self.is_anime,
+        }
+        .try_into_title()?;
+        Ok(CatalogTrend {
+            rank: self.rank,
+            score: self.score,
+            title,
+        })
     }
 }
 

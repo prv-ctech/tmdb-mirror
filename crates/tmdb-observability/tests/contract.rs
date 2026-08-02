@@ -5,8 +5,8 @@ use std::{
 };
 
 use tmdb_observability::{
-    HttpRequestLabels, HttpRequestLog, Listener, LogFormat, MethodClass, Metrics,
-    ReadinessFailureReason, StatusClass,
+    CatalogScope, Component, ComponentState, HttpRequestLabels, HttpRequestLog, Listener,
+    LogFormat, MethodClass, Metrics, QueueState, ReadinessFailureReason, StatusClass,
 };
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -123,5 +123,33 @@ fn histogram_samples_have_exact_count_and_bounded_route() -> Result<(), Box<dyn 
     assert!(encoded.contains("tmdb_http_request_duration_seconds_count"));
     assert!(encoded.contains("tmdb_http_request_duration_seconds_count{listener=\"public\",method=\"GET\",route=\"<unmatched>\",status_class=\"2xx\"} 1"));
     assert!(!encoded.contains("query=secret"));
+    Ok(())
+}
+
+#[test]
+fn operational_metrics_are_bounded_and_expose_worker_media_queue_and_backup_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let metrics = Metrics::new("tmdb-api", "0.1.0", "test-revision");
+    metrics.set_component_state(Component::Worker, ComponentState::Ready);
+    metrics.set_component_state(Component::Media, ComponentState::Stale);
+    metrics.set_component_state(Component::Upstream, ComponentState::Degraded);
+    metrics.set_component_state(Component::Backup, ComponentState::Ready);
+    metrics.set_queue_depth("ingest.trending", QueueState::Queued, 7);
+    metrics.set_queue_depth("image.download", QueueState::Running, 2);
+    metrics.set_queue_depth("unbounded.untrusted.job", QueueState::DeadLetter, 1);
+    metrics.set_catalog_count(CatalogScope::Movies, 10);
+    metrics.set_backup_timestamps(Some(1_700_000_000), None);
+
+    let encoded = metrics.encode()?;
+    assert!(encoded.contains("tmdb_component_state"));
+    assert!(encoded.contains("component=\"worker\",state=\"ready\"} 1"));
+    assert!(encoded.contains("component=\"media\",state=\"stale\"} 1"));
+    assert!(encoded.contains("tmdb_queue_depth"));
+    assert!(encoded.contains("job_type=\"ingest.trending\",state=\"queued\"} 7"));
+    assert!(encoded.contains("job_type=\"image.download\",state=\"running\"} 2"));
+    assert!(encoded.contains("job_type=\"other\",state=\"dead_letter\"} 1"));
+    assert!(encoded.contains("tmdb_catalog_titles"));
+    assert!(encoded.contains("scope=\"movies\"} 10"));
+    assert!(encoded.contains("tmdb_backup_last_success_timestamp_seconds 1700000000"));
     Ok(())
 }

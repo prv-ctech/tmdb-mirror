@@ -47,7 +47,7 @@ foreach ($line in Get-Content -LiteralPath $envPath) {
 $requiredKeys = @(
     'TMDB_ENVIRONMENT', 'POSTGRES_DB', 'POSTGRES_USER', 'POSTGRES_PASSWORD',
     'TMDB_READ_ACCESS_TOKEN', 'TMDB_ADMIN_API_KEY', 'ALLOW_LOCAL_MEDIA',
-    'TMDB_MEDIA_BASE_URL'
+    'TMDB_MEDIA_BASE_URL', 'TZ'
 )
 foreach ($key in $requiredKeys) {
     if (-not $entries.ContainsKey($key) -or [string]::IsNullOrWhiteSpace($entries[$key])) {
@@ -67,6 +67,15 @@ $unsupportedDatabaseKeys = @(
 foreach ($key in $unsupportedDatabaseKeys) {
     if ($entries.ContainsKey($key) -or $entries.ContainsKey("${key}_FILE")) {
         throw "Unsupported database setting: $key. Use POSTGRES_DB, POSTGRES_USER, and POSTGRES_PASSWORD."
+    }
+}
+
+$unsupportedStorageKeys = @(
+    'TMDB_MEDIA_HOST_ROOT', 'TMDB_WORK_HOST_ROOT', 'TMDB_MEDIA_ROOT', 'TMDB_WORK_ROOT'
+)
+foreach ($key in $unsupportedStorageKeys) {
+    if ($entries.ContainsKey($key) -or $entries.ContainsKey("${key}_FILE")) {
+        throw "Unsupported filesystem-root setting: $key. Mount the fixed /config or /media container path instead."
     }
 }
 
@@ -91,6 +100,18 @@ if ($composeText -match 'pg_isready\s+-U\s+tmdb_owner|pg_isready\s+.*-d\s+tmdb')
 }
 if ($composeText -notmatch '\$\$POSTGRES_USER' -or $composeText -notmatch '\$\$POSTGRES_DB') {
     throw 'PostgreSQL health checks must interpolate POSTGRES_USER and POSTGRES_DB inside the container.'
+}
+foreach ($setting in @('wal_level=replica', 'archive_mode=on', 'archive_command=pgbackrest --stanza=tmdb archive-push %p')) {
+    if ($composeText -notmatch [regex]::Escape($setting)) {
+        throw "PostgreSQL PITR setting is missing: $setting"
+    }
+}
+if ($composeText -match '(?m)^\s*-\s*["'']?[^\s"'']*:8081') {
+    throw 'The private admin listener must not be published to a host port.'
+}
+if ($composeText -notmatch 'prv-network:' -or $composeText -notmatch 'name:\s*prv\.network' -or
+    $composeText -notmatch 'tmdb-mirror-api') {
+    throw 'The API must expose the private admin listener only through the existing prv.network alias.'
 }
 
 # The worker and media service must use the bounded root-only preparer, which

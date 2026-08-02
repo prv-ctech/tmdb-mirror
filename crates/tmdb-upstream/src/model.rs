@@ -69,6 +69,21 @@ pub struct TmdbMovie {
     /// Cast and crew returned by the `credits` append.
     #[serde(default)]
     pub credits: TmdbCredits,
+    /// Localized title and overview records returned by `translations`.
+    #[serde(default)]
+    pub translations: TmdbTranslations,
+    /// Regional/type-specific alternate titles returned by `alternative_titles`.
+    #[serde(default, deserialize_with = "deserialize_alternate_titles")]
+    pub alternate_titles: Vec<TmdbAlternateTitle>,
+    /// Known provider identifiers returned by `external_ids`.
+    #[serde(default)]
+    pub external_ids: TmdbExternalIds,
+    /// Public trailers, teasers, clips, and other provider videos.
+    #[serde(default)]
+    pub videos: TmdbVideos,
+    /// Regional release dates and certifications returned by `release_dates`.
+    #[serde(default)]
+    pub release_dates: TmdbReleaseDates,
 }
 
 /// A television-series response returned by the TMDB details endpoint.
@@ -130,6 +145,178 @@ pub struct TmdbTv {
     /// Cast and crew returned by the `credits` append.
     #[serde(default)]
     pub credits: TmdbCredits,
+    /// Localized title and overview records returned by `translations`.
+    #[serde(default)]
+    pub translations: TmdbTranslations,
+    /// Regional/type-specific alternate titles returned by `alternative_titles`.
+    #[serde(default, deserialize_with = "deserialize_alternate_titles")]
+    pub alternate_titles: Vec<TmdbAlternateTitle>,
+    /// Known provider identifiers returned by `external_ids`.
+    #[serde(default)]
+    pub external_ids: TmdbExternalIds,
+    /// Public trailers, teasers, clips, and other provider videos.
+    #[serde(default)]
+    pub videos: TmdbVideos,
+    /// TV content ratings returned by `content_ratings`.
+    #[serde(default)]
+    pub content_ratings: TmdbContentRatings,
+}
+
+/// Wrapper returned by TMDB's `translations` append.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TmdbTranslations {
+    #[serde(default)]
+    pub translations: Vec<TmdbTranslation>,
+}
+
+/// One localized translation and its regional applicability.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TmdbTranslation {
+    #[serde(default)]
+    pub iso_639_1: Option<String>,
+    #[serde(default)]
+    pub iso_3166_1: Option<String>,
+    #[serde(default)]
+    pub data: TmdbTranslationData,
+}
+
+/// Translatable title metadata within one TMDB translation record.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TmdbTranslationData {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub overview: Option<String>,
+    #[serde(default)]
+    pub tagline: Option<String>,
+    #[serde(default)]
+    pub homepage: Option<String>,
+}
+
+/// A title variant that may be regional and/or classified by TMDB.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TmdbAlternateTitle {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub iso_3166_1: Option<String>,
+    #[serde(default, rename = "type")]
+    pub title_type: Option<String>,
+}
+
+/// TMDB's known identifiers for a movie or television series.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TmdbExternalIds {
+    #[serde(default)]
+    pub imdb_id: Option<String>,
+    #[serde(default)]
+    pub tvdb_id: Option<String>,
+    #[serde(default)]
+    pub wikidata_id: Option<String>,
+    #[serde(default)]
+    pub facebook_id: Option<String>,
+    #[serde(default)]
+    pub instagram_id: Option<String>,
+    #[serde(default)]
+    pub twitter_id: Option<String>,
+}
+
+/// Wrapper returned by TMDB's `videos` append.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TmdbVideos {
+    #[serde(default)]
+    pub results: Vec<TmdbVideo>,
+}
+
+/// One public video reference from TMDB.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TmdbVideo {
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub site: Option<String>,
+    #[serde(default, rename = "type")]
+    pub video_type: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub official: bool,
+    #[serde(default)]
+    pub iso_639_1: Option<String>,
+    #[serde(default)]
+    pub iso_3166_1: Option<String>,
+    #[serde(default)]
+    pub published_at: Option<String>,
+    #[serde(default)]
+    pub size: Option<u16>,
+}
+
+/// Movie regional release-date wrapper returned by TMDB.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TmdbReleaseDates {
+    #[serde(default)]
+    pub results: Vec<TmdbReleaseDateCountry>,
+}
+
+/// One country's movie release-date group.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TmdbReleaseDateCountry {
+    #[serde(default)]
+    pub iso_3166_1: Option<String>,
+    #[serde(default)]
+    pub release_dates: Vec<TmdbReleaseDate>,
+}
+
+/// One movie release date/certification record.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TmdbReleaseDate {
+    #[serde(default)]
+    pub certification: Option<String>,
+    #[serde(default)]
+    pub release_date: Option<String>,
+    #[serde(default, rename = "type")]
+    pub release_type: Option<u8>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// TV regional content-rating wrapper returned by TMDB.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TmdbContentRatings {
+    #[serde(default)]
+    pub results: Vec<TmdbContentRating>,
+}
+
+/// One TV certification record.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TmdbContentRating {
+    #[serde(default)]
+    pub iso_3166_1: Option<String>,
+    #[serde(default)]
+    pub rating: Option<String>,
+}
+
+/// A compact row returned by TMDB's trending movie/TV feeds.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TmdbTrendingItem {
+    /// TMDB entity identifier in the endpoint's media namespace.
+    pub id: u64,
+    /// TMDB's current popularity score, when supplied.
+    #[serde(default)]
+    pub popularity: Option<f64>,
+}
+
+/// One page of an explicitly selected TMDB trending feed.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TmdbTrendingPage {
+    #[serde(default)]
+    pub page: u32,
+    #[serde(default)]
+    pub total_pages: u32,
+    #[serde(default)]
+    pub results: Vec<TmdbTrendingItem>,
 }
 
 /// Cast and crew lists from a TMDB details response.
@@ -295,6 +482,26 @@ where
     let value = match value {
         serde_json::Value::Object(mut object) => object
             .remove("keywords")
+            .or_else(|| object.remove("results"))
+            .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+        value => value,
+    };
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_alternate_titles<'de, D>(
+    deserializer: D,
+) -> Result<Vec<TmdbAlternateTitle>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let value = match value {
+        serde_json::Value::Object(mut object) => object
+            .remove("titles")
             .or_else(|| object.remove("results"))
             .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
         value => value,

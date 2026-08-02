@@ -5,8 +5,8 @@ use std::sync::{
 
 use anyhow::Context;
 use tmdb_api::{
-    ApiState, DatabaseReadinessProbe, ShutdownError, build_admin_router_with_auth, build_router,
-    shutdown_signal, supervise_shutdown,
+    ApiState, DatabaseAdminStore, DatabaseReadinessProbe, ShutdownError,
+    build_admin_router_with_operations_and_auth, build_router, shutdown_signal, supervise_shutdown,
 };
 use tmdb_config::{AppConfig, EnvSource};
 use tmdb_db::{CatalogRepository, PoolPolicy, connect_direct};
@@ -21,21 +21,25 @@ async fn main() -> anyhow::Result<()> {
     let allow_local_media = load_bool("ALLOW_LOCAL_MEDIA")?;
     let media_base_url = load_optional_string("TMDB_MEDIA_BASE_URL")?;
     let local_media_url_configured = media_base_url.is_some();
-    let pool = connect_direct(&config.database, PoolPolicy::ReadOnly)
+    let read_pool = connect_direct(&config.database, PoolPolicy::ReadOnly)
         .await
         .map_err(|error| anyhow::anyhow!(error))
         .context("connect API read pool")?;
+    let write_pool = connect_direct(&config.database, PoolPolicy::ReadWrite)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("connect API administrative write pool")?;
 
     let metrics = Metrics::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"), "unknown");
     let state = ApiState::new(
         Arc::new(DatabaseReadinessProbe::new(
-            pool.clone(),
+            read_pool.clone(),
             config.database.username.clone(),
         )),
         metrics.clone(),
     );
     let catalog_router = tmdb_api::build_catalog_router_with_media(
-        Arc::new(CatalogRepository::new(pool)),
+        Arc::new(CatalogRepository::new(read_pool.clone())),
         allow_local_media,
         media_base_url,
     );
@@ -76,7 +80,11 @@ async fn main() -> anyhow::Result<()> {
         .into_future();
     let admin_server = axum::serve(
         admin_listener,
-        build_admin_router_with_auth(metrics, config.admin_api_key),
+        build_admin_router_with_operations_and_auth(
+            metrics,
+            config.admin_api_key,
+            Arc::new(DatabaseAdminStore::new(read_pool, write_pool)),
+        ),
     )
     .with_graceful_shutdown(cancellation.clone().cancelled_owned())
     .into_future();

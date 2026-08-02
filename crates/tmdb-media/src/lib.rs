@@ -25,7 +25,12 @@ pub const RAW_ROOT: &str = "/config/raw";
 pub const LOG_ROOT: &str = "/config/logs";
 /// General worker scratch directory below [`CONFIG_ROOT`].
 pub const WORK_ROOT: &str = "/config/work";
-/// Worker backup/checkpoint directory below [`CONFIG_ROOT`].
+/// PostgreSQL-owned pgBackRest parent directory below [`CONFIG_ROOT`].
+///
+/// Application workers deliberately do not prepare or write this path. The
+/// The `PostgreSQL` entrypoint creates `/config/backups/pgbackrest` as the
+/// only backup repository and keeps that child owned by the `PostgreSQL` OS
+/// user.
 pub const BACKUP_ROOT: &str = "/config/backups";
 
 /// Fixed service role whose writable directories must be ready before startup.
@@ -56,7 +61,7 @@ pub enum RuntimeStoragePath {
     ConfigWork,
     /// `/config/raw`
     ConfigRaw,
-    /// `/config/backups`
+    /// `/config/backups` (PostgreSQL-owned; not included in worker preflight)
     ConfigBackups,
     /// `/config/logs`
     ConfigLogs,
@@ -212,7 +217,6 @@ impl RuntimeStorageError {
 const WORKER_RUNTIME_PATHS: &[RuntimeStoragePath] = &[
     RuntimeStoragePath::ConfigWork,
     RuntimeStoragePath::ConfigRaw,
-    RuntimeStoragePath::ConfigBackups,
     RuntimeStoragePath::ConfigLogs,
 ];
 const MEDIA_RUNTIME_PATHS: &[RuntimeStoragePath] = &[
@@ -596,9 +600,13 @@ mod tests {
 
         prepare_runtime_storage_at(RuntimeStorageRole::Worker, &config, &media)?;
 
-        for child in ["work", "raw", "backups", "logs"] {
+        for child in ["work", "raw", "logs"] {
             assert!(config.join(child).is_dir(), "missing {child}");
         }
+        assert!(
+            !config.join("backups").exists(),
+            "the main worker must not prepare PostgreSQL's backup parent"
+        );
         assert!(!media.exists());
         Ok(())
     }

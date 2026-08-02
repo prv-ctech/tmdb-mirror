@@ -73,7 +73,6 @@ case "${1:-}" in
         prepare_mount_root worker /config
         prepare_directory worker /config/work
         prepare_directory worker /config/raw
-        prepare_directory worker /config/backups
         prepare_directory worker /config/logs
         shift
         drop_privileges_and_exec worker /usr/local/bin/tmdb-worker "$@"

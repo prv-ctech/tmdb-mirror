@@ -50,13 +50,49 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-scan.ps1 -Q
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-collect.ps1
 ```
 
-`stress-http.ps1` reports every request, throughput, status counts, and p50,
-p95, and p99 latency. `stress-scan.ps1` streams and counts the complete daily
-movie and TV ID exports, while its queue limit deliberately bounds detail
-refresh work. When no explicit `-Date` is supplied, it uses the latest matching
-movie/TV export published by TMDB (up to seven days back). Increase the queue
-limit only after validating the token, rate limit, worker concurrency, and
-database capacity.
+`stress-http.ps1` remains a functional smoke check. The canonical load test is
+the ephemeral k6 container described below. `stress-scan.ps1` streams and
+counts the complete daily movie and TV ID exports, while its queue limit
+deliberately bounds detail refresh work. When no explicit `-Date` is supplied,
+it uses the latest matching movie/TV export published by TMDB (up to seven days
+back). Increase the queue limit only after validating the token, rate limit,
+worker concurrency, and database capacity.
+
+## k6 performance run
+
+The k6 runner is not part of the production stack. It starts a short-lived,
+digest-pinned k6 container and exits nonzero when any threshold fails. The
+default full profile runs four endpoint-specific 100-client checks and one
+100,000-request mixed burn:
+
+```powershell
+$env:TMDB_K6_ADMIN_API_KEY = '<your admin key>'
+./scripts/k6/run.ps1 `
+  -Profile full `
+  -BaseUrl http://127.0.0.1:18080 `
+  -ComposeFile deploy/compose.stress.yaml `
+  -ComposeEnvFile .stress-runtime/tmdb_stress_test/compose.env `
+  -ComposeProjectName tmdb_stress_test `
+  -AdminMetricsUrl http://127.0.0.1:18081/metrics
+```
+
+For a representative full catalog, pass four known paths rather than relying
+on synthetic defaults:
+
+```powershell
+./scripts/k6/run.ps1 -Profile full -BaseUrl http://<unraid-host>:9001 `
+  -MetadataPath /v1/movies/<known-id> `
+  -ListPath '/v1/movies?limit=20' `
+  -SearchPath '/v1/search?q=matrix&limit=20' `
+  -FilterPath '/v1/movies?genreId=<known-genre>&limit=20'
+```
+
+Metadata/list p95 must be at most 50 ms; indexed filter/search p95 must be at
+most 150 ms; all request/check/count thresholds require zero unexpected
+failures. On a failure, the runner writes redacted k6 output plus Docker
+resource data, PostgreSQL waits, `pg_stat_statements`, representative query
+plans, and bounded application pool/queue/component metrics under the ignored
+`.stress-runtime/k6/` directory.
 
 The resilience check restarts the media worker and stops PostgreSQL long enough
 to require an API readiness failure, then verifies recovery. Its JSON and log

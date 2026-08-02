@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
-use image::ImageFormat as RasterFormat;
+use image::{GenericImageView, ImageFormat as RasterFormat, imageops::FilterType};
 use reqwest::redirect::Policy;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
@@ -43,8 +43,10 @@ const MAX_PATH_CHARS: usize = 512;
 const MAX_SOURCE_URL_CHARS: usize = 2_048;
 const MAX_LANGUAGE_CHARS: usize = 32;
 const MAX_REVISION_CHARS: usize = 128;
+const MAX_ASSET_INDEX: u16 = 99;
 const MAX_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_IMAGE_PIXELS: u64 = 67_108_864;
+const RESPONSIVE_WIDTHS: &[u32] = &[320, 640, 1_280];
 
 /// Entity class represented by an image job.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -120,6 +122,16 @@ pub struct ImageJobPayload {
     /// Parent TV TMDB identifier for season and episode assets.
     #[serde(default)]
     pub title_tmdb_id: Option<i64>,
+    /// Stable one-based source-image position for deterministic gallery names.
+    ///
+    /// Version-one jobs written before this field existed deserialize as the
+    /// primary asset (`1`), so a deployed queue does not need a migration.
+    #[serde(default = "default_asset_index")]
+    pub asset_index: u16,
+}
+
+const fn default_asset_index() -> u16 {
+    1
 }
 
 impl ImageJobPayload {
@@ -154,6 +166,7 @@ impl ImageJobPayload {
             season_number: None,
             episode_number: None,
             title_tmdb_id: None,
+            asset_index: default_asset_index(),
         };
         payload.validate_common()?;
         if !matches!(
@@ -180,6 +193,18 @@ impl ImageJobPayload {
         self.title_tmdb_id = Some(title_tmdb_id);
         self.season_number = Some(season_number);
         self.episode_number = episode_number;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Selects a deterministic non-primary gallery position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImagePayloadError::InvalidAssetIndex`] for zero or an
+    /// unbounded position. The fixed upper bound keeps path fan-out bounded.
+    pub fn with_asset_index(mut self, asset_index: u16) -> Result<Self, ImagePayloadError> {
+        self.asset_index = asset_index;
         self.validate()?;
         Ok(self)
     }
@@ -237,6 +262,9 @@ impl ImageJobPayload {
         }
         if self.entity_id <= 0 {
             return Err(ImagePayloadError::InvalidEntityId);
+        }
+        if !(1..=MAX_ASSET_INDEX).contains(&self.asset_index) {
+            return Err(ImagePayloadError::InvalidAssetIndex);
         }
         validate_tmdb_path(&self.tmdb_path)?;
         let source = parse_source_url(&self.source_url)?;
@@ -362,6 +390,9 @@ pub enum ImagePayloadError {
     /// An episode number was supplied for a non-episode or was invalid.
     #[error("image episode number is invalid")]
     InvalidEpisodeNumber,
+    /// The source image position was not a bounded positive number.
+    #[error("image asset index is invalid")]
+    InvalidAssetIndex,
 }
 
 fn validate_tmdb_path(value: &str) -> Result<(), ImagePayloadError> {
@@ -943,6 +974,30 @@ pub struct ImageMetadata {
     pub storage_path: String,
     /// Direct or Trawl retrieval path.
     pub source: ImageSource,
+    /// Verified public representations of this image, including the primary
+    /// JPEG stored in [`Self::storage_path`].
+    #[serde(default)]
+    pub variants: Vec<ImageVariantMetadata>,
+}
+
+/// One verified public JPEG or WebP representation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageVariantMetadata {
+    /// Stable bounded key such as `jpeg_full` or `webp_w640`.
+    pub key: String,
+    /// Safe relative path below the fixed `/media` root.
+    pub storage_path: String,
+    /// Canonical public MIME type.
+    pub mime_type: String,
+    /// Encoded byte size of this representation.
+    pub byte_size: u64,
+    /// Decoded display width of this representation.
+    pub width: u32,
+    /// Decoded display height of this representation.
+    pub height: u32,
+    /// SHA-256 of the public representation, not the private source master.
+    pub sha256: String,
 }
 
 /// Publication outcome.  `deduplicated` means the destination already held
@@ -1137,6 +1192,10 @@ impl ImageStore {
     /// # Errors
     ///
     /// Returns [`StorageError`] when scratch or permanent publication fails.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the two publication layouts must share one validated atomic-publication boundary"
+    )]
     pub async fn publish(
         &self,
         payload: &ImageJobPayload,
@@ -1153,7 +1212,7 @@ impl ImageStore {
         tokio::fs::create_dir_all(&scratch_dir)
             .await
             .map_err(|error| StorageError::io(StorageOperation::PrepareScratchDirectory, error))?;
-        let (relative, public_mime, public_bytes, result) = match self.layout {
+        let publication = match self.layout {
             StorageLayout::ContentAddressed => {
                 let relative = Self::relative_path(digest);
                 let destination = self.image_root.join(&relative);
@@ -1163,18 +1222,19 @@ impl ImageStore {
                     .publish_inner(&scratch, &destination, &image.body, digest)
                     .await;
                 let _ = tokio::fs::remove_file(&scratch).await;
-                (
+                PublicPublication {
                     relative,
-                    image.mime_type.clone(),
-                    image.body.clone(),
-                    result?,
-                )
+                    mime_type: image.mime_type.clone(),
+                    byte_size: image.body.len() as u64,
+                    width: image.width,
+                    height: image.height,
+                    sha256: digest.as_hex(),
+                    outcome: result?,
+                    variants: Vec::new(),
+                }
             }
             StorageLayout::Semantic => {
-                let relative = semantic_path(payload, "image/jpeg")
-                    .map_err(|()| StorageError::InvalidPayload)?;
-                let destination = self.image_root.join(&relative);
-                let (jpeg, webp) = tokio::task::spawn_blocking({
+                let derivatives = tokio::task::spawn_blocking({
                     let body = image.body.clone();
                     move || encode_derivatives(&body)
                 })
@@ -1195,33 +1255,56 @@ impl ImageStore {
                     .publish_inner(&master_scratch, &master_destination, &image.body, digest)
                     .await?;
                 let _ = tokio::fs::remove_file(&master_scratch).await;
-                let webp_relative = semantic_path(payload, "image/webp")
-                    .map_err(|()| StorageError::InvalidPayload)?;
-                let webp_destination = self.image_root.join(webp_relative);
-                let webp_scratch =
-                    scratch_dir.join(format!(".webp-{}.{}.part", digest.as_hex(), Uuid::now_v7()));
-                let _ = self
-                    .publish_inner(
-                        &webp_scratch,
-                        &webp_destination,
-                        &webp,
-                        ImageDigest::of(&webp),
+                let mut primary = None;
+                let mut variants = Vec::with_capacity(derivatives.len());
+                for derivative in derivatives {
+                    let relative = semantic_derivative_path(
+                        payload,
+                        derivative.mime_type,
+                        derivative.width_hint,
                     )
-                    .await?;
-                let _ = tokio::fs::remove_file(&webp_scratch).await;
-                let public_scratch = scratch_dir.join(format!(
-                    ".public-{}.{}.part",
-                    digest.as_hex(),
-                    Uuid::now_v7()
-                ));
-                let result = self
-                    .publish_inner(&public_scratch, &destination, &jpeg, ImageDigest::of(&jpeg))
-                    .await;
-                let _ = tokio::fs::remove_file(&public_scratch).await;
-                (relative, "image/jpeg".to_owned(), jpeg, result?)
+                    .map_err(|()| StorageError::InvalidPayload)?;
+                    let destination = self.image_root.join(&relative);
+                    let derivative_digest = ImageDigest::of(&derivative.bytes);
+                    let scratch = scratch_dir.join(format!(
+                        ".derivative-{}-{}.{}.part",
+                        derivative.key,
+                        digest.as_hex(),
+                        Uuid::now_v7()
+                    ));
+                    let outcome = self
+                        .publish_inner(&scratch, &destination, &derivative.bytes, derivative_digest)
+                        .await;
+                    let _ = tokio::fs::remove_file(&scratch).await;
+                    let outcome = outcome?;
+                    let variant = ImageVariantMetadata {
+                        key: derivative.key.to_owned(),
+                        storage_path: relative.to_string_lossy().replace('\\', "/"),
+                        mime_type: derivative.mime_type.to_owned(),
+                        byte_size: derivative.bytes.len() as u64,
+                        width: derivative.width,
+                        height: derivative.height,
+                        sha256: derivative_digest.as_hex(),
+                    };
+                    if derivative.key == "jpeg_full" {
+                        primary = Some((variant.clone(), outcome));
+                    }
+                    variants.push(variant);
+                }
+                let (primary, result) = primary.ok_or(StorageError::Derivative)?;
+                PublicPublication {
+                    relative: PathBuf::from(&primary.storage_path),
+                    mime_type: primary.mime_type.clone(),
+                    byte_size: primary.byte_size,
+                    width: primary.width,
+                    height: primary.height,
+                    sha256: primary.sha256.clone(),
+                    outcome: result,
+                    variants,
+                }
             }
         };
-        let deduplicated = matches!(result, PublishOutcome::AlreadyPresent);
+        let deduplicated = matches!(publication.outcome, PublishOutcome::AlreadyPresent);
         Ok(StoredImage {
             metadata: ImageMetadata {
                 entity_type: payload.entity_type,
@@ -1231,13 +1314,14 @@ impl ImageStore {
                 language: payload.language.clone(),
                 source_revision: payload.source_revision.clone(),
                 source_url: payload.source_url.clone(),
-                mime_type: public_mime,
-                byte_size: public_bytes.len() as u64,
-                width: image.width,
-                height: image.height,
-                sha256: digest.as_hex(),
-                storage_path: relative.to_string_lossy().replace('\\', "/"),
+                mime_type: publication.mime_type,
+                byte_size: publication.byte_size,
+                width: publication.width,
+                height: publication.height,
+                sha256: publication.sha256,
+                storage_path: publication.relative.to_string_lossy().replace('\\', "/"),
                 source: image.source,
+                variants: publication.variants,
             },
             deduplicated,
         })
@@ -1348,21 +1432,31 @@ fn semantic_path(payload: &ImageJobPayload, mime_type: &str) -> Result<PathBuf, 
         _ => return Err(()),
     };
     let variant = match payload.kind {
-        ImageKind::Poster | ImageKind::Other => AssetVariant::Cover { index: 1 },
-        ImageKind::Backdrop | ImageKind::Banner => AssetVariant::Banner { index: 1 },
-        ImageKind::Profile => AssetVariant::Profile { index: 1 },
-        ImageKind::Logo => AssetVariant::Logo { index: 1 },
+        ImageKind::Poster | ImageKind::Other => AssetVariant::Cover {
+            index: payload.asset_index,
+        },
+        ImageKind::Backdrop | ImageKind::Banner => AssetVariant::Banner {
+            index: payload.asset_index,
+        },
+        ImageKind::Profile => AssetVariant::Profile {
+            index: payload.asset_index,
+        },
+        ImageKind::Logo => AssetVariant::Logo {
+            index: payload.asset_index,
+        },
         ImageKind::Still => match payload.entity_type {
             ImageEntityType::Season => AssetVariant::Season {
                 season: payload.season_number.ok_or(())?,
-                index: 1,
+                index: payload.asset_index,
             },
             ImageEntityType::Episode => AssetVariant::Episode {
                 season: payload.season_number.ok_or(())?,
                 episode: payload.episode_number.ok_or(())?,
-                index: 1,
+                index: payload.asset_index,
             },
-            _ => AssetVariant::Banner { index: 1 },
+            _ => AssetVariant::Banner {
+                index: payload.asset_index,
+            },
         },
     };
     match payload.entity_type {
@@ -1420,17 +1514,122 @@ fn semantic_path(payload: &ImageJobPayload, mime_type: &str) -> Result<PathBuf, 
     }
 }
 
-fn encode_derivatives(body: &[u8]) -> Result<(Vec<u8>, Vec<u8>), StorageError> {
+fn semantic_derivative_path(
+    payload: &ImageJobPayload,
+    mime_type: &str,
+    width_hint: Option<u32>,
+) -> Result<PathBuf, ()> {
+    let path = semantic_path(payload, mime_type)?;
+    let Some(width) = width_hint else {
+        return Ok(path);
+    };
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or(())?;
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .ok_or(())?;
+    let filename = format!("{stem}-w{width}.{extension}");
+    Ok(path.with_file_name(filename))
+}
+
+#[derive(Clone, Debug)]
+struct EncodedDerivative {
+    key: &'static str,
+    mime_type: &'static str,
+    width_hint: Option<u32>,
+    width: u32,
+    height: u32,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct PublicPublication {
+    relative: PathBuf,
+    mime_type: String,
+    byte_size: u64,
+    width: u32,
+    height: u32,
+    sha256: String,
+    outcome: PublishOutcome,
+    variants: Vec<ImageVariantMetadata>,
+}
+
+fn encode_derivatives(body: &[u8]) -> Result<Vec<EncodedDerivative>, StorageError> {
     let decoded = image::load_from_memory(body).map_err(|_| StorageError::Derivative)?;
+    let (width, height) = decoded.dimensions();
+    let mut derivatives = Vec::with_capacity(2 + RESPONSIVE_WIDTHS.len() * 2);
+    push_encoded_pair(&mut derivatives, &decoded, width, height, None)?;
+    for target_width in RESPONSIVE_WIDTHS {
+        if width <= *target_width {
+            continue;
+        }
+        let resized = decoded.resize(*target_width, u32::MAX, FilterType::Lanczos3);
+        let (resized_width, resized_height) = resized.dimensions();
+        push_encoded_pair(
+            &mut derivatives,
+            &resized,
+            resized_width,
+            resized_height,
+            Some(*target_width),
+        )?;
+    }
+    Ok(derivatives)
+}
+
+fn push_encoded_pair(
+    derivatives: &mut Vec<EncodedDerivative>,
+    decoded: &image::DynamicImage,
+    width: u32,
+    height: u32,
+    width_hint: Option<u32>,
+) -> Result<(), StorageError> {
+    let suffix = match width_hint {
+        Some(320) => "w320",
+        Some(640) => "w640",
+        Some(1_280) => "w1280",
+        Some(_) => return Err(StorageError::Derivative),
+        None => "full",
+    };
     let mut jpeg = Cursor::new(Vec::new());
     decoded
         .write_to(&mut jpeg, RasterFormat::Jpeg)
         .map_err(|_| StorageError::Derivative)?;
+    derivatives.push(EncodedDerivative {
+        key: match suffix {
+            "full" => "jpeg_full",
+            "w320" => "jpeg_w320",
+            "w640" => "jpeg_w640",
+            "w1280" => "jpeg_w1280",
+            _ => return Err(StorageError::Derivative),
+        },
+        mime_type: "image/jpeg",
+        width_hint,
+        width,
+        height,
+        bytes: jpeg.into_inner(),
+    });
     let mut webp = Cursor::new(Vec::new());
     decoded
         .write_to(&mut webp, RasterFormat::WebP)
         .map_err(|_| StorageError::Derivative)?;
-    Ok((jpeg.into_inner(), webp.into_inner()))
+    derivatives.push(EncodedDerivative {
+        key: match suffix {
+            "full" => "webp_full",
+            "w320" => "webp_w320",
+            "w640" => "webp_w640",
+            "w1280" => "webp_w1280",
+            _ => return Err(StorageError::Derivative),
+        },
+        mime_type: "image/webp",
+        width_hint,
+        width,
+        height,
+        bytes: webp.into_inner(),
+    });
+    Ok(())
 }
 
 async fn file_matches_digest(path: &Path, expected: ImageDigest) -> Result<bool, StorageError> {
@@ -2323,6 +2522,76 @@ mod tests {
         assert!(
             images.path().join(".masters/sha256/89/72").exists()
                 || images.path().join(".masters").exists()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn semantic_store_generates_real_responsive_derivatives()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let work = tempfile::tempdir()?;
+        let images = tempfile::tempdir()?;
+        let store = ImageStore::with_semantic_layout(work.path().join("work"), images.path())?;
+        let job = payload()?.with_asset_index(2)?;
+        let mut source = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1_600, 900).write_to(&mut source, RasterFormat::Png)?;
+        let source = source.into_inner();
+        let image = DownloadedImage {
+            body: source.clone(),
+            mime_type: "image/png".to_owned(),
+            final_url: job.source_url()?,
+            source: ImageSource::Direct,
+            digest: ImageDigest::of(&source),
+            width: 1_600,
+            height: 900,
+        };
+
+        let stored = store.publish(&job, &image).await?;
+        assert_eq!(stored.metadata.storage_path, "movies/123/cover-02.jpg");
+        assert_eq!(stored.metadata.variants.len(), 8);
+        assert!(
+            stored
+                .metadata
+                .variants
+                .iter()
+                .any(
+                    |variant| variant.storage_path == "movies/123/cover-02-w320.jpg"
+                        && variant.width == 320
+                        && variant.height == 180
+                )
+        );
+        assert!(
+            stored
+                .metadata
+                .variants
+                .iter()
+                .any(
+                    |variant| variant.storage_path == "movies/123/cover-02-w1280.webp"
+                        && variant.width == 1_280
+                        && variant.height == 720
+                )
+        );
+        for variant in &stored.metadata.variants {
+            let decoded = image::load_from_memory(
+                &tokio::fs::read(images.path().join(&variant.storage_path)).await?,
+            )?;
+            assert_eq!(decoded.dimensions(), (variant.width, variant.height));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gallery_index_is_bounded_and_backward_compatible() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let job = payload()?;
+        assert_eq!(job.asset_index, 1);
+        assert_eq!(
+            job.with_asset_index(0),
+            Err(ImagePayloadError::InvalidAssetIndex)
+        );
+        assert_eq!(
+            payload()?.with_asset_index(MAX_ASSET_INDEX + 1),
+            Err(ImagePayloadError::InvalidAssetIndex)
         );
         Ok(())
     }

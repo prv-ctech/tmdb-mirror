@@ -1,9 +1,14 @@
-use std::path::{Component, Path};
+use std::{
+    collections::BTreeSet,
+    path::{Component, Path},
+};
 
 use sqlx::{PgPool, Postgres, Transaction};
 use thiserror::Error;
 
-use crate::image::{ImageEntityType, ImageJobPayload, ImageKind, ImageMetadata};
+use crate::image::{
+    ImageEntityType, ImageJobPayload, ImageKind, ImageMetadata, ImageVariantMetadata,
+};
 
 /// Sanitized failures from the image metadata transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
@@ -17,9 +22,6 @@ pub(crate) enum PersistError {
     /// A supplied image language is not present in the catalog dictionary.
     #[error("image language is not ready")]
     LanguageNotFound,
-    /// A source path is already attached to a different catalog owner.
-    #[error("image source is attached to a different owner")]
-    OwnerConflict,
     /// The database rejected the transaction.
     #[error("image metadata transaction failed")]
     Database,
@@ -56,7 +58,7 @@ pub(crate) async fn persist_ready(
     let height = i32::try_from(metadata.height).map_err(|_| PersistError::InvalidPayload)?;
     let file_size = i64::try_from(metadata.byte_size).map_err(|_| PersistError::InvalidPayload)?;
 
-    let result = sqlx::query(
+    let asset_id: i64 = sqlx::query_scalar(
         "INSERT INTO assets.image_assets (
              title_id, person_id, company_id, network_id, collection_id, season_id, episode_id,
              image_kind, source, source_key, source_url, storage_path, mime_type,
@@ -87,7 +89,8 @@ pub(crate) async fn persist_ready(
              status = 'ready',
              iso_639_1 = EXCLUDED.iso_639_1,
              downloaded_at = clock_timestamp(),
-             updated_at = clock_timestamp()",
+             updated_at = clock_timestamp()
+         RETURNING id",
     )
     .bind(owner.title)
     .bind(owner.person)
@@ -106,17 +109,50 @@ pub(crate) async fn persist_ready(
     .bind(file_size)
     .bind(&metadata.sha256)
     .bind(language)
-    .execute(&mut *transaction)
+    .fetch_one(&mut *transaction)
     .await
     .map_err(|_| PersistError::Database)?;
-
-    if result.rows_affected() != 1 {
-        return Err(PersistError::OwnerConflict);
-    }
+    replace_variants(&mut transaction, asset_id, &metadata.variants).await?;
     transaction
         .commit()
         .await
         .map_err(|_| PersistError::Database)
+}
+
+async fn replace_variants(
+    transaction: &mut Transaction<'_, Postgres>,
+    image_asset_id: i64,
+    variants: &[ImageVariantMetadata],
+) -> Result<(), PersistError> {
+    sqlx::query("DELETE FROM assets.image_variants WHERE image_asset_id = $1")
+        .bind(image_asset_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| PersistError::Database)?;
+    for variant in variants {
+        let width = i32::try_from(variant.width).map_err(|_| PersistError::InvalidPayload)?;
+        let height = i32::try_from(variant.height).map_err(|_| PersistError::InvalidPayload)?;
+        let file_size =
+            i64::try_from(variant.byte_size).map_err(|_| PersistError::InvalidPayload)?;
+        sqlx::query(
+            "INSERT INTO assets.image_variants (
+                 image_asset_id, variant_key, storage_path, mime_type,
+                 width, height, file_size_bytes, sha256, updated_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, clock_timestamp())",
+        )
+        .bind(image_asset_id)
+        .bind(&variant.key)
+        .bind(&variant.storage_path)
+        .bind(&variant.mime_type)
+        .bind(width)
+        .bind(height)
+        .bind(file_size)
+        .bind(&variant.sha256)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| PersistError::Database)?;
+    }
+    Ok(())
 }
 
 fn validate_metadata(
@@ -146,10 +182,54 @@ fn validate_metadata(
             .chars()
             .all(|value| value.is_ascii_hexdigit())
         || !safe_storage_path(&metadata.storage_path)
+        || !valid_variants(metadata)
     {
         return Err(PersistError::InvalidPayload);
     }
     Ok(())
+}
+
+fn valid_variants(metadata: &ImageMetadata) -> bool {
+    if metadata.variants.len() > 8 {
+        return false;
+    }
+    let mut keys = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    for variant in &metadata.variants {
+        if !valid_variant(variant)
+            || !keys.insert(variant.key.as_str())
+            || !paths.insert(variant.storage_path.as_str())
+        {
+            return false;
+        }
+    }
+    // Empty is retained for legacy content-addressed records and focused
+    // metadata tests. Semantic publication always includes the primary JPEG.
+    metadata.variants.is_empty()
+        || metadata.variants.iter().any(|variant| {
+            variant.storage_path == metadata.storage_path
+                && variant.mime_type == metadata.mime_type
+                && variant.byte_size == metadata.byte_size
+                && variant.width == metadata.width
+                && variant.height == metadata.height
+                && variant.sha256 == metadata.sha256
+        })
+}
+
+fn valid_variant(variant: &ImageVariantMetadata) -> bool {
+    !variant.key.is_empty()
+        && variant.key.len() <= 64
+        && variant
+            .key
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        && matches!(variant.mime_type.as_str(), "image/jpeg" | "image/webp")
+        && variant.byte_size > 0
+        && variant.width > 0
+        && variant.height > 0
+        && variant.sha256.len() == 64
+        && variant.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && safe_storage_path(&variant.storage_path)
 }
 
 fn safe_storage_path(value: &str) -> bool {
@@ -176,10 +256,11 @@ async fn resolve_owner(
             };
             sqlx::query_scalar(
                 "SELECT id FROM catalog.titles
-                  WHERE media_type = $1 AND tmdb_id = $2 AND active",
+                  WHERE media_type = $1 AND tmdb_id = $2 AND active AND is_anime = $3",
             )
             .bind(media_type)
             .bind(payload.entity_id)
+            .bind(payload.anime)
             .fetch_optional(&mut **transaction)
             .await
             .map_err(|_| PersistError::Database)?
@@ -216,9 +297,15 @@ async fn resolve_owner(
             "SELECT season.id
                FROM catalog.seasons AS season
                JOIN catalog.titles AS title ON title.id = season.title_id
-              WHERE season.id = $1 AND title.active",
+              WHERE season.id = $1
+                AND title.media_type = 'tv'
+                AND title.tmdb_id = $2
+                AND title.active
+                AND title.is_anime = $3",
         )
         .bind(payload.entity_id)
+        .bind(payload.title_tmdb_id)
+        .bind(payload.anime)
         .fetch_optional(&mut **transaction)
         .await
         .map_err(|_| PersistError::Database)?,
@@ -226,9 +313,15 @@ async fn resolve_owner(
             "SELECT episode.id
                FROM catalog.episodes AS episode
                JOIN catalog.titles AS title ON title.id = episode.title_id
-              WHERE episode.id = $1 AND title.active",
+              WHERE episode.id = $1
+                AND title.media_type = 'tv'
+                AND title.tmdb_id = $2
+                AND title.active
+                AND title.is_anime = $3",
         )
         .bind(payload.entity_id)
+        .bind(payload.title_tmdb_id)
+        .bind(payload.anime)
         .fetch_optional(&mut **transaction)
         .await
         .map_err(|_| PersistError::Database)?,
@@ -319,6 +412,7 @@ mod tests {
             sha256: "a".repeat(64),
             storage_path: storage_path.to_owned(),
             source: ImageSource::Direct,
+            variants: Vec::new(),
         }
     }
 
@@ -381,6 +475,88 @@ mod tests {
         .fetch_one(&pool)
         .await?;
         assert_eq!(storage_path, second.storage_path);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn verified_public_variants_replace_prior_variant_metadata(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO catalog.titles (media_type, tmdb_id, display_title, active)
+             VALUES ('movie', 43, 'Variant test', true)",
+        )
+        .execute(&pool)
+        .await?;
+        let payload = ImageJobPayload::new(
+            ImageEntityType::Movie,
+            43,
+            ImageKind::Poster,
+            "/variant-poster.jpg",
+            "https://image.tmdb.org/t/p/original/variant-poster.jpg",
+            None,
+            None,
+        )
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let mut image = metadata(&payload, "movies/43/cover.jpg");
+        image.mime_type = "image/jpeg".to_owned();
+        image.byte_size = 71;
+        image.sha256 = "b".repeat(64);
+        image.variants = vec![ImageVariantMetadata {
+            key: "jpeg_full".to_owned(),
+            storage_path: image.storage_path.clone(),
+            mime_type: image.mime_type.clone(),
+            byte_size: image.byte_size,
+            width: image.width,
+            height: image.height,
+            sha256: image.sha256.clone(),
+        }];
+        persist_ready(&pool, &payload, &image)
+            .await
+            .map_err(persist_error)?;
+
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT variant_key, storage_path, sha256
+               FROM assets.image_variants
+              ORDER BY variant_key",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(
+            rows,
+            vec![(
+                "jpeg_full".to_owned(),
+                "movies/43/cover.jpg".to_owned(),
+                "b".repeat(64),
+            )]
+        );
+
+        image.variants.push(ImageVariantMetadata {
+            key: "webp_full".to_owned(),
+            storage_path: "movies/43/cover.webp".to_owned(),
+            mime_type: "image/webp".to_owned(),
+            byte_size: 53,
+            width: 1,
+            height: 1,
+            sha256: "c".repeat(64),
+        });
+        persist_ready(&pool, &payload, &image)
+            .await
+            .map_err(persist_error)?;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT variant_key, storage_path
+               FROM assets.image_variants
+              ORDER BY variant_key",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(
+            rows,
+            vec![
+                ("jpeg_full".to_owned(), "movies/43/cover.jpg".to_owned()),
+                ("webp_full".to_owned(), "movies/43/cover.webp".to_owned()),
+            ]
+        );
         Ok(())
     }
 
@@ -481,6 +657,75 @@ mod tests {
                 (301, "tv/100/season1-episode2.jpg".to_owned()),
             ]
         );
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn title_partition_and_parent_identity_are_verified_before_persisting(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let title_id: i64 = sqlx::query_scalar(
+            "INSERT INTO catalog.titles (media_type, tmdb_id, display_title, is_anime, active)
+             VALUES ('tv', 700, 'Ownership fixture', false, true)
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO catalog.seasons (id, title_id, media_type, season_number)
+             VALUES (701, $1, 'tv', 1)",
+        )
+        .bind(title_id)
+        .execute(&pool)
+        .await?;
+
+        let anime_mismatch = ImageJobPayload::new_scoped(
+            ImageEntityType::Tv,
+            700,
+            ImageKind::Poster,
+            "/ownership-tv.jpg",
+            "https://image.tmdb.org/t/p/original/ownership-tv.jpg",
+            None,
+            None,
+            true,
+            None,
+            None,
+        )
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        assert_eq!(
+            persist_ready(
+                &pool,
+                &anime_mismatch,
+                &metadata(&anime_mismatch, "anime/tv/700/cover.jpg"),
+            )
+            .await,
+            Err(PersistError::OwnerNotFound)
+        );
+
+        let wrong_parent = ImageJobPayload::new(
+            ImageEntityType::Season,
+            701,
+            ImageKind::Still,
+            "/ownership-season.jpg",
+            "https://image.tmdb.org/t/p/original/ownership-season.jpg",
+            None,
+            None,
+        )
+        .and_then(|payload| payload.with_tv_position(701, 1, None))
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        assert_eq!(
+            persist_ready(
+                &pool,
+                &wrong_parent,
+                &metadata(&wrong_parent, "tv/701/season1.jpg"),
+            )
+            .await,
+            Err(PersistError::OwnerNotFound)
+        );
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM assets.image_assets")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(count, 0);
         Ok(())
     }
 }

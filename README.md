@@ -1,92 +1,61 @@
-# TMDB Clone
+# TMDB Mirror
 
-Rust/PostgreSQL 18 TMDB catalog mirror with fast search, anime separation, and
-local image storage.
+Rust + PostgreSQL 18 mirror of TMDB metadata with fast catalog search, strict
+anime isolation, local responsive image storage, and four production
+containers: PostgreSQL, API, main worker, and media worker.
 
-## API
-
-Use the API listener as your app's base URL:
-
-```text
-http://<server-host>:8080
-```
-
-The complete route and query-parameter reference is in
-[docs/api.md](docs/api.md). Catalog routes do not require a client key.
-
-Examples:
-
-```text
-GET /movies?limit=20
-GET /movies/{tmdb_id}
-GET /tv/{tmdb_id}
-GET /anime?q=One%20Piece&type=tv
-GET /search?q=matrix
-GET /anime/movie/{tmdb_id}/images
-GET /anime/tv/{tmdb_id}/images
-```
-
-`/metrics` is on the private admin listener and requires the application key
-through `X-API-Key` or a Bearer header. Do not expose the admin listener
-publicly.
-
-Local images are served from port `8090`. Set `TMDB_MEDIA_BASE_URL` to a URL
-reachable by your app, for example `http://<server-host>:8090/media`.
-The single media container runs four bounded download workers by default;
-adjust `TMDB_IMAGE_WORKER_CONCURRENCY` between 1 and 32 if needed.
-The main worker runs up to eight ingestion loops, automatically bounded by
-`TMDB_MAX_CONNECTIONS` and the TMDB rate limit.
-
-## Deploy
-
-The stack has four containers: PostgreSQL, API, main worker, and media worker.
-GitHub Actions publishes the two Linux AMD64 images to GHCR, so a deployment
-only needs the Compose file and `.env`—not a repository checkout or Dockerfile.
-The same `.env` is passed to every container once through `env_file`; there is
-no second copy of each setting in the Compose YAML.
+## Run
 
 ```powershell
 Copy-Item .env.example .env
-docker compose -f docker-compose-example.yaml config --services
 docker compose -f docker-compose-example.yaml pull
 docker compose -f docker-compose-example.yaml up -d
 ```
 
-Replace the angle-bracket values in `.env`, especially the TMDB read token and
-the admin API key. Edit the host side of the PostgreSQL, `/config`, and `/media`
-bind mounts in `docker-compose-example.yaml`; the paths on the right are fixed
-inside the containers.
+Set the TMDB read token, PostgreSQL password, and admin API key in `.env`.
+`POSTGRES_DB` and `POSTGRES_USER` are configurable and used directly by every
+service; no duplicate `DATABASE_*` settings exist. Container paths are fixed:
+`/config` for cache/exports/logs and `/media` for final media. Choose host
+paths only in Compose or Unraid mounts.
 
-`POSTGRES_DB` and `POSTGRES_USER` are your names to choose. The stack reads
-them directly from `.env`; do not add duplicate `DATABASE_*` settings.
+The public API is `http://<host>:8080`; local media is normally
+`http://<host>:8090/media`. The private admin listener is not host-published:
+containers on `prv.network` use `http://tmdb-mirror-api:8081`.
 
-The production template is also a full four-service file (not an include):
+## API
 
-```powershell
-docker compose -f deploy/compose.production.yaml pull
-docker compose -f deploy/compose.production.yaml up -d
+Public paths have compatible unversioned and `/v1` forms:
+
+```text
+GET /v1/movies?genreId=28&language=en
+GET /v1/tv/{tmdb_id}
+GET /v1/anime?q=one%20piece
+GET /v1/search?q=matrix
+GET /v1/openapi.json
 ```
 
-The application only uses `/media` and `/config` inside containers. Set
-`TMDB_TRAWL_BASE_URL` only when an existing Trawl instance is available.
+Movie/TV routes never return anime. Anime routes search both anime movies and
+TV unless `type=movie` or `type=tv` is given. See [API reference](docs/api.md).
 
-## Stress test
+Admin uses `X-API-Key` or Bearer authentication and supports status, durable
+job history, explicit scans, cancellation/retry, non-destructive media audits,
+allowlisted analyze jobs, and full/differential backup requests. Admin writes
+require `Idempotency-Key` and return `202 Accepted` jobs.
 
-The disposable harness keeps generated data under `.stress-runtime/`. Copy the
-ignored local template once; it holds the TMDB v4 read token, v3 API key, and
-optional Trawl URL.
+## Operations
 
-```powershell
-Copy-Item secrets.txt.example secrets.txt
-./scripts/stress-tmdb-auth.ps1
-./scripts/stress-bootstrap.ps1
-./scripts/stress-http.ps1 -Concurrency 100 -RequestsPerWorker 50
-./scripts/stress-artwork.ps1
-./scripts/stress-media-assets.ps1
-./scripts/stress-trawl.ps1
-./scripts/stress-resilience.ps1
-./scripts/stress-collect.ps1
-```
+`TZ=America/New_York` controls schedules and readable log timestamps; persisted
+timestamps remain UTC. pgBackRest lives inside PostgreSQL and stores its local
+repository only at `/config/backups/pgbackrest`. See
+[backup and recovery](docs/backup-recovery.md).
 
-Run `./scripts/verify-repository-hygiene.ps1` before committing. Keep your
-`.env`, `secrets.txt`, and generated runtime artifacts out of Git.
+The optional k6 runner is an ephemeral test container, not a fifth production
+service. Run [stress testing](docs/stress-testing.md) deliberately before a
+release. GitHub publishes rolling `main`, immutable `vX.Y.Z` images, and a
+digest-pinned release Compose artifact; details are in [release notes](docs/release.md).
+
+## TMDB attribution
+
+The consuming application must display TMDB’s required attribution: “This
+product uses the TMDB API but is not endorsed or certified by TMDB.” See
+[TMDB’s attribution requirements](https://developer.themoviedb.org/docs/faq).

@@ -20,20 +20,21 @@ async fn catalog_migration_exposes_shared_titles_dimensions_and_search_projectio
     assert_eq!(
         versions,
         [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26,
         ]
     );
 
     let revision: String = sqlx::query_scalar("SELECT schema_revision FROM ops.readiness")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(revision, "0015");
+    assert_eq!(revision, "0026");
 
     let objects: Vec<String> = sqlx::query_scalar(
         "SELECT format('%I.%I', n.nspname, c.relname)
            FROM pg_class AS c
            JOIN pg_namespace AS n ON n.oid = c.relnamespace
-          WHERE n.nspname IN ('catalog', 'search')
+          WHERE n.nspname IN ('catalog', 'search', 'assets')
             AND c.relkind IN ('r', 'p', 'v', 'm')
           ORDER BY 1",
     )
@@ -59,6 +60,13 @@ async fn catalog_migration_exposes_shared_titles_dimensions_and_search_projectio
         "catalog.title_languages",
         "catalog.title_countries",
         "catalog.title_collections",
+        "catalog.title_translations",
+        "catalog.title_alternate_titles",
+        "catalog.title_external_ids",
+        "catalog.title_videos",
+        "catalog.title_release_dates",
+        "catalog.title_trends",
+        "assets.image_variants",
         "search.search_documents",
     ] {
         assert!(
@@ -123,6 +131,55 @@ async fn catalog_migration_exposes_shared_titles_dimensions_and_search_projectio
                 .await?;
         assert!(installed, "required index {index_name} is missing");
     }
+    Ok(())
+}
+
+#[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+async fn repository_returns_verified_image_variant_metadata_with_the_parent_asset(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let title_id = insert_title(&pool, "movie", 91_001, "Image Fixture", 1.0, false).await?;
+    let asset_id: i64 = sqlx::query_scalar(
+        "INSERT INTO assets.image_assets (
+             title_id, image_kind, source_key, storage_path, mime_type,
+             width, height, file_size_bytes, sha256, status, downloaded_at
+         ) VALUES (
+             $1, 'poster', 'movie:91001:poster:primary', 'movies/91001/cover.jpg', 'image/jpeg',
+             1200, 1800, 1200, repeat('a', 64), 'ready', clock_timestamp()
+         ) RETURNING id",
+    )
+    .bind(title_id)
+    .fetch_one(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO assets.image_variants (
+             image_asset_id, variant_key, storage_path, mime_type,
+             width, height, file_size_bytes, sha256
+         ) VALUES
+             ($1, 'jpeg_full', 'movies/91001/cover.jpg', 'image/jpeg', 1200, 1800, 1200, repeat('a', 64)),
+             ($1, 'webp_w320', 'movies/91001/cover-w320.webp', 'image/webp', 320, 480, 320, repeat('b', 64))",
+    )
+    .bind(asset_id)
+    .execute(&pool)
+    .await?;
+
+    let key = TitleKey::new(
+        MediaType::Movie,
+        NonZeroU32::new(91_001).ok_or_else(|| test_error("fixture ID must be nonzero"))?,
+    );
+    let images = CatalogRepository::new(pool)
+        .list_images(key, AnimeScope::OnlyNonAnime)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| test_error("title images were not found"))?;
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].variants.len(), 2);
+    assert_eq!(images[0].variants[0].variant_key, "jpeg_full");
+    assert_eq!(images[0].variants[1].variant_key, "webp_w320");
+    assert_eq!(
+        images[0].variants[1].storage_path,
+        "movies/91001/cover-w320.webp"
+    );
     Ok(())
 }
 

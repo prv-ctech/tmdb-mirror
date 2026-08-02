@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use chrono::{Days, NaiveDate, Utc};
+use chrono::{DateTime, Days, NaiveDate, Utc};
 use tmdb_config::{
     ConfigSource, EnvSource, Environment, load_secret_for_environment, load_shared_database,
 };
@@ -14,10 +14,13 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::jobs::{DAILY_EXPORT_JOB, INGEST_PAYLOAD_VERSION, IngestExecutor};
+use crate::jobs::{DAILY_EXPORT_JOB, INGEST_PAYLOAD_VERSION, IngestExecutor, TRENDING_REFRESH_JOB};
 
 const DAILY_EXPORT_REFRESH_PRIORITY: i16 = -100;
 const MAX_INGEST_WORKER_CONCURRENCY: usize = 8;
+const COMPONENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const TRENDING_DAY_REFRESH_SECONDS: i64 = 30 * 60;
+const TRENDING_WEEK_REFRESH_SECONDS: i64 = 6 * 60 * 60;
 
 /// Starts the direct-database ingestion worker shell.
 ///
@@ -65,7 +68,9 @@ pub async fn run() -> anyhow::Result<()> {
         }
         signal_cancellation.cancel();
     });
+    let heartbeat = spawn_component_heartbeat(pool.clone(), "worker", cancellation.clone());
     let result = worker.run(cancellation).await;
+    let _ = heartbeat.await;
     pool.close().await;
     result.map_err(|error| anyhow::anyhow!(error))
 }
@@ -116,9 +121,10 @@ pub async fn run_worker() -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!(error))
         .context("connect worker database")?;
     let daily_export_enabled = parse_or(source, "TMDB_ENABLE_DAILY_EXPORT", true)?;
-    if daily_export_enabled {
-        ensure_catalog_seed(&pool, previous_export_date()?).await?;
-    }
+    // A restart must not create an implicit full scan. Operators request one
+    // through POST /admin/v1/scans; the scheduler still handles its explicitly
+    // configured incremental/daily export cadence after the worker is ready.
+    tracing::info!(event = "catalog_seed_not_automatic", daily_export_enabled,);
     let executor = ingest_executor.with_database(pool.clone());
     let workers = ingest_worker_configs(worker_config, worker_concurrency)?
         .into_iter()
@@ -140,6 +146,7 @@ pub async fn run_worker() -> anyhow::Result<()> {
         }
         signal_cancellation.cancel();
     });
+    let heartbeat = spawn_component_heartbeat(pool.clone(), "worker", cancellation.clone());
     let scheduler_cancellation = cancellation.clone();
     let scheduler_pool = pool.clone();
     let scheduler =
@@ -149,8 +156,40 @@ pub async fn run_worker() -> anyhow::Result<()> {
     let result = run_ingest_workers(workers, cancellation.clone()).await;
     cancellation.cancel();
     let _ = scheduler.await;
+    let _ = heartbeat.await;
     pool.close().await;
     result.map_err(|error| anyhow::anyhow!(error))
+}
+
+fn spawn_component_heartbeat(
+    pool: sqlx::PgPool,
+    component: &'static str,
+    cancellation: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(COMPONENT_HEARTBEAT_INTERVAL);
+        loop {
+            tokio::select! {
+                () = cancellation.cancelled() => return,
+                _ = interval.tick() => {
+                    if sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+                        "SELECT ops.record_component_heartbeat($1, 'ready')",
+                    )
+                    .bind(component)
+                    .fetch_one(&pool)
+                    .await
+                    .is_err()
+                    {
+                        tracing::warn!(
+                            event = "component_heartbeat_failed",
+                            component,
+                            error_code = "database_unavailable",
+                        );
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn prepare_worker_storage() -> anyhow::Result<()> {
@@ -241,7 +280,16 @@ async fn scheduler_tick(
     interval_seconds: u64,
     daily_export_enabled: bool,
 ) -> anyhow::Result<()> {
-    let bucket = Utc::now().timestamp().div_euclid(
+    scheduler_tick_at(pool, interval_seconds, daily_export_enabled, Utc::now()).await
+}
+
+async fn scheduler_tick_at(
+    pool: &sqlx::PgPool,
+    interval_seconds: u64,
+    daily_export_enabled: bool,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let bucket = now.timestamp().div_euclid(
         i64::try_from(interval_seconds)
             .map_err(|_| anyhow::anyhow!("scheduler interval is too large"))?,
     );
@@ -260,6 +308,7 @@ async fn scheduler_tick(
         )?;
         JobRepository::new(pool.clone()).submit(job).await?;
     }
+    schedule_trending_jobs(pool, now).await?;
     if daily_export_enabled {
         // TMDB publishes the previous UTC day's exports.  The schedule key is
         // date-based, so a short scheduler interval cannot duplicate a job.
@@ -288,6 +337,29 @@ async fn scheduler_tick(
     )
     .fetch_one(pool)
     .await?;
+    Ok(())
+}
+
+async fn schedule_trending_jobs(pool: &sqlx::PgPool, now: DateTime<Utc>) -> anyhow::Result<()> {
+    for (trend_window, refresh_seconds) in [
+        ("day", TRENDING_DAY_REFRESH_SECONDS),
+        ("week", TRENDING_WEEK_REFRESH_SECONDS),
+    ] {
+        let bucket = now.timestamp().div_euclid(refresh_seconds);
+        for media_type in ["movie", "tv"] {
+            let schedule_key = format!("trending:{media_type}:{trend_window}");
+            if !claim_schedule_slot(pool, &schedule_key, &bucket.to_string()).await? {
+                continue;
+            }
+            let job = NewJob::new(
+                TRENDING_REFRESH_JOB,
+                INGEST_PAYLOAD_VERSION,
+                serde_json::json!({"media_type": media_type, "trend_window": trend_window}),
+                &format!("{TRENDING_REFRESH_JOB}:{media_type}:{trend_window}:{bucket}"),
+            )?;
+            JobRepository::new(pool.clone()).submit(job).await?;
+        }
+    }
     Ok(())
 }
 
@@ -431,6 +503,7 @@ fn previous_export_date() -> anyhow::Result<NaiveDate> {
         .ok_or_else(|| anyhow::anyhow!("scheduler date underflow"))
 }
 
+#[cfg(test)]
 async fn ensure_catalog_seed(pool: &sqlx::PgPool, export_date: NaiveDate) -> anyhow::Result<usize> {
     let date_text = export_date.format("%m_%d_%Y").to_string();
     let repository = JobRepository::new(pool.clone());
@@ -450,6 +523,7 @@ async fn ensure_catalog_seed(pool: &sqlx::PgPool, export_date: NaiveDate) -> any
     Ok(submitted)
 }
 
+#[cfg(test)]
 async fn catalog_seed_needed(pool: &sqlx::PgPool, media_type: &str) -> anyhow::Result<bool> {
     sqlx::query_scalar(
         "SELECT NOT EXISTS (
@@ -532,6 +606,44 @@ mod tests {
         .execute(&pool)
         .await?;
         assert_eq!(ensure_catalog_seed(&pool, export_date).await?, 0);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn scheduler_enqueues_each_trending_scope_once_per_refresh_window(
+        pool: PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-02T12:00:00Z")?.to_utc();
+
+        scheduler_tick_at(&pool, 60, false, now).await?;
+        scheduler_tick_at(&pool, 60, false, now).await?;
+
+        let jobs: Vec<(Value, String)> = sqlx::query_as(
+            "SELECT payload, dedup_key
+               FROM ops.jobs
+              WHERE job_type = 'ingest.trending'
+              ORDER BY payload ->> 'media_type', payload ->> 'trend_window'",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(jobs.len(), 4);
+        assert_eq!(
+            jobs[0].0,
+            serde_json::json!({"media_type": "movie", "trend_window": "day"})
+        );
+        assert_eq!(
+            jobs[1].0,
+            serde_json::json!({"media_type": "movie", "trend_window": "week"})
+        );
+        assert_eq!(
+            jobs[2].0,
+            serde_json::json!({"media_type": "tv", "trend_window": "day"})
+        );
+        assert_eq!(
+            jobs[3].0,
+            serde_json::json!({"media_type": "tv", "trend_window": "week"})
+        );
+        assert_ne!(jobs[0].1, jobs[1].1);
         Ok(())
     }
 
