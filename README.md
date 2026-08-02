@@ -11,21 +11,24 @@ Use the API listener as your app's base URL:
 http://<server-host>:8080
 ```
 
+The complete route and query-parameter reference is in
+[docs/api.md](docs/api.md). Catalog routes do not require a client key.
+
 Examples:
 
 ```text
 GET /movies?limit=20
 GET /movies/{tmdb_id}
 GET /tv/{tmdb_id}
-GET /anime?query=One%20Piece
+GET /anime?q=One%20Piece&type=tv
 GET /search?q=matrix
 GET /anime/movie/{tmdb_id}/images
 GET /anime/tv/{tmdb_id}/images
 ```
 
-Catalog routes do not require a client key. `/metrics` is on the private admin
-listener and requires the application key through `X-API-Key` or a Bearer
-header. Do not expose the admin listener publicly.
+`/metrics` is on the private admin listener and requires the application key
+through `X-API-Key` or a Bearer header. Do not expose the admin listener
+publicly.
 
 Local images are served from port `8090`. Set `TMDB_MEDIA_BASE_URL` to a URL
 reachable by your app, for example `http://<server-host>:8090/media`.

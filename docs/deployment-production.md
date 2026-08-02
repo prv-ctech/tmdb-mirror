@@ -50,6 +50,9 @@ that `.env` file outside source control. It contains the single PostgreSQL
 password, TMDB read token, and admin API key used by the stack. The same file is
 passed to all four containers through `env_file`.
 
+Each key has an inline description in `.env.example`. The public, admin, and
+media routes are listed in [api.md](api.md).
+
 ```powershell
 Copy-Item .env.example .env
 ./scripts/validate-production-compose.ps1 -EnvFile .env -ComposeFile deploy/compose.compact.yaml
