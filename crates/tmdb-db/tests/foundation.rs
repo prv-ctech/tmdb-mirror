@@ -549,7 +549,7 @@ async fn readiness_rejects_an_extra_successful_migration(owner_pool: PgPool) -> 
     sqlx::query(
         "INSERT INTO ops._sqlx_migrations(
              version, description, installed_on, success, checksum, execution_time
-         ) VALUES (18, 'unexpected', clock_timestamp(), true, decode('00', 'hex'), 0)",
+         ) VALUES (20, 'unexpected', clock_timestamp(), true, decode('00', 'hex'), 0)",
     )
     .execute(&owner_pool)
     .await?;
@@ -561,7 +561,7 @@ async fn readiness_rejects_a_failed_migration_row(owner_pool: PgPool) -> sqlx::R
     sqlx::query(
         "INSERT INTO ops._sqlx_migrations(
              version, description, installed_on, success, checksum, execution_time
-         ) VALUES (18, 'failed', clock_timestamp(), false, decode('00', 'hex'), 0)",
+         ) VALUES (20, 'failed', clock_timestamp(), false, decode('00', 'hex'), 0)",
     )
     .execute(&owner_pool)
     .await?;
@@ -728,7 +728,9 @@ async fn representative_version_one_database_upgrades_through_two_three_and_four
     .await?;
     assert_eq!(
         upgraded_versions,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+        [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+        ]
     );
 
     let preserved: (String, String, Option<String>, String, String) = sqlx::query_as(
@@ -859,7 +861,7 @@ async fn representative_version_one_database_upgrades_through_two_three_and_four
         sqlx::query_scalar("SELECT count(*) FROM ops._sqlx_migrations WHERE success")
             .fetch_one(&owner_pool)
             .await?;
-    assert_eq!(repeat_count, 17);
+    assert_eq!(repeat_count, 19);
 
     sqlx::query(
         "INSERT INTO ops.job_type_registry(job_type, payload_version, enabled)
@@ -1071,7 +1073,7 @@ async fn round_one_three_database_is_repaired_by_four(owner_pool: PgPool) -> sql
         .await?;
     let migrator_pool = role_pool(&database, "migrator", PoolPolicy::Migrator).await?;
     let report = migrate(&migrator_pool).await.map_err(db_error)?;
-    assert_eq!(report.applied, 14);
+    assert_eq!(report.applied, 16);
 
     let versions: Vec<i64> = sqlx::query_scalar(
         "SELECT version FROM ops._sqlx_migrations WHERE success ORDER BY version",
@@ -1080,7 +1082,9 @@ async fn round_one_three_database_is_repaired_by_four(owner_pool: PgPool) -> sql
     .await?;
     assert_eq!(
         versions,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+        [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+        ]
     );
     let claimable_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (
@@ -1295,7 +1299,7 @@ async fn actual_migrator_applies_once_then_preserves_snapshot(
         .await?;
     let migrator_pool = role_pool(&database, "migrator", PoolPolicy::Migrator).await?;
 
-    assert_eq!(migrate(&migrator_pool).await.map_err(db_error)?.applied, 17);
+    assert_eq!(migrate(&migrator_pool).await.map_err(db_error)?.applied, 19);
     let first = foundation_snapshot(&migrator_pool).await?;
     assert_eq!(migrate(&migrator_pool).await.map_err(db_error)?.applied, 0);
     let second = foundation_snapshot(&migrator_pool).await?;
@@ -1395,7 +1399,7 @@ async fn concurrent_actual_migrators_report_exactly_one_application(
         second.map_err(db_error)?.applied,
     ];
     applied.sort_unstable();
-    assert_eq!(applied, [0, 17]);
+    assert_eq!(applied, [0, 19]);
 
     first_pool.close().await;
     second_pool.close().await;

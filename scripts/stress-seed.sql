@@ -223,7 +223,7 @@ SELECT :seed_base + value, 'poster', 'stress', 'poster-' || (:seed_base + value)
        'https://image.tmdb.org/t/p/w500/stress-' || value || '.jpg', 'pending'
 FROM generate_series(1, :seed_count) AS value
 WHERE value % 1000 = 0
-ON CONFLICT (source, source_key) DO NOTHING;
+ON CONFLICT (source, source_key, owner_type, owner_id) DO NOTHING;
 
 COMMIT;
 

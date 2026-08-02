@@ -68,7 +68,7 @@ pub(crate) async fn persist_ready(
              $13, $14, $15, $16, 'ready', $17,
              clock_timestamp(), clock_timestamp()
          )
-         ON CONFLICT (source, source_key) DO UPDATE SET
+         ON CONFLICT (source, source_key, owner_type, owner_id) DO UPDATE SET
              title_id = EXCLUDED.title_id,
              person_id = EXCLUDED.person_id,
              company_id = EXCLUDED.company_id,
@@ -87,14 +87,7 @@ pub(crate) async fn persist_ready(
              status = 'ready',
              iso_639_1 = EXCLUDED.iso_639_1,
              downloaded_at = clock_timestamp(),
-             updated_at = clock_timestamp()
-         WHERE assets.image_assets.title_id IS NOT DISTINCT FROM EXCLUDED.title_id
-           AND assets.image_assets.person_id IS NOT DISTINCT FROM EXCLUDED.person_id
-           AND assets.image_assets.company_id IS NOT DISTINCT FROM EXCLUDED.company_id
-           AND assets.image_assets.network_id IS NOT DISTINCT FROM EXCLUDED.network_id
-           AND assets.image_assets.collection_id IS NOT DISTINCT FROM EXCLUDED.collection_id
-           AND assets.image_assets.season_id IS NOT DISTINCT FROM EXCLUDED.season_id
-           AND assets.image_assets.episode_id IS NOT DISTINCT FROM EXCLUDED.episode_id",
+             updated_at = clock_timestamp()",
     )
     .bind(owner.title)
     .bind(owner.person)
@@ -406,6 +399,88 @@ mod tests {
             .fetch_one(&pool)
             .await?;
         assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn shared_episode_still_is_attached_to_each_episode_owner(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let title_id: i64 = sqlx::query_scalar(
+            "INSERT INTO catalog.titles (media_type, tmdb_id, display_title, active)
+             VALUES ('tv', 100, 'Shared still fixture', true)
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO catalog.seasons (id, title_id, media_type, season_number)
+             VALUES (200, $1, 'tv', 1)",
+        )
+        .bind(title_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO catalog.episodes (id, season_id, title_id, episode_number)
+             VALUES (300, 200, $1, 1), (301, 200, $1, 2)",
+        )
+        .bind(title_id)
+        .execute(&pool)
+        .await?;
+
+        let first = ImageJobPayload::new(
+            ImageEntityType::Episode,
+            300,
+            ImageKind::Still,
+            "/shared-still.jpg",
+            "https://image.tmdb.org/t/p/original/shared-still.jpg",
+            None,
+            None,
+        )
+        .and_then(|payload| payload.with_tv_position(100, 1, Some(1)))
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let second = ImageJobPayload::new(
+            ImageEntityType::Episode,
+            301,
+            ImageKind::Still,
+            "/shared-still.jpg",
+            "https://image.tmdb.org/t/p/original/shared-still.jpg",
+            None,
+            None,
+        )
+        .and_then(|payload| payload.with_tv_position(100, 1, Some(2)))
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+
+        persist_ready(
+            &pool,
+            &first,
+            &metadata(&first, "tv/100/season1-episode1.jpg"),
+        )
+        .await
+        .map_err(persist_error)?;
+        persist_ready(
+            &pool,
+            &second,
+            &metadata(&second, "tv/100/season1-episode2.jpg"),
+        )
+        .await
+        .map_err(persist_error)?;
+
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT episode_id, storage_path
+               FROM assets.image_assets
+              WHERE source = 'tmdb' AND source_key = '/shared-still.jpg'
+              ORDER BY episode_id",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(
+            rows,
+            vec![
+                (300, "tv/100/season1-episode1.jpg".to_owned()),
+                (301, "tv/100/season1-episode2.jpg".to_owned()),
+            ]
+        );
         Ok(())
     }
 }

@@ -19,6 +19,7 @@ use tmdb_jobs::{
     ClaimedJob, JobExecutionError, JobExecutor, JobRepository, Worker, WorkerConfig, WorkerId,
 };
 use tmdb_observability::{LogFormat, init_tracing};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -32,6 +33,7 @@ pub async fn run() -> anyhow::Result<()> {
     let environment = load_environment(source)?;
     let database = load_shared_database(&source, environment)?;
     let worker_config = load_worker_config(source, "tmdb-images")?;
+    let worker_concurrency = load_image_worker_concurrency(source)?;
     let store = load_image_store()?;
     let downloader = load_downloader(source)?;
     let allow_local_media = parse_or(source, "ALLOW_LOCAL_MEDIA", false)?;
@@ -42,16 +44,16 @@ pub async fn run() -> anyhow::Result<()> {
         .await
         .map_err(|error| anyhow::anyhow!(error))
         .context("connect image database")?;
-    let worker = Worker::new(
-        JobRepository::new(pool.clone()),
-        ImageExecutor {
-            downloader,
-            store,
-            pool: pool.clone(),
-            allow_local_media,
-        },
-        worker_config,
-    );
+    let executor = ImageExecutor {
+        downloader,
+        store,
+        pool: pool.clone(),
+        allow_local_media,
+    };
+    let workers = image_worker_configs(worker_config, worker_concurrency)?
+        .into_iter()
+        .map(|config| Worker::new(JobRepository::new(pool.clone()), executor.clone(), config))
+        .collect();
     let cancellation = CancellationToken::new();
     let signal_cancellation = cancellation.clone();
     tokio::spawn(async move {
@@ -72,15 +74,51 @@ pub async fn run() -> anyhow::Result<()> {
         )
         .await
     });
-    let result = worker.run(cancellation.clone()).await;
+    let result = run_workers(workers, cancellation.clone()).await;
     cancellation.cancel();
     if let Ok(Err(error)) = media_server.await {
         tracing::error!(event = "media_server_stopped", error = %error);
     }
     pool.close().await;
-    result.map_err(|error| anyhow::anyhow!(error))
+    result
 }
 
+async fn run_workers<E>(
+    workers: Vec<Worker<E>>,
+    cancellation: CancellationToken,
+) -> anyhow::Result<()>
+where
+    E: JobExecutor + 'static,
+{
+    let mut tasks = JoinSet::new();
+    for worker in workers {
+        let worker_cancellation = cancellation.clone();
+        tasks.spawn(async move { worker.run(worker_cancellation).await });
+    }
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) if cancellation.is_cancelled() => {}
+            Ok(Ok(())) => {
+                cancellation.cancel();
+                tasks.abort_all();
+                return Err(anyhow::anyhow!("image worker stopped unexpectedly"));
+            }
+            Ok(Err(error)) => {
+                cancellation.cancel();
+                tasks.abort_all();
+                return Err(anyhow::anyhow!(error));
+            }
+            Err(error) => {
+                cancellation.cancel();
+                tasks.abort_all();
+                return Err(anyhow::anyhow!("image worker task failed: {error}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
 struct ImageExecutor<T, F = Arc<dyn TrawlFallback>> {
     downloader: ImageDownloader<T, F>,
     store: ImageStore,
@@ -242,7 +280,10 @@ fn load_environment(source: EnvSource) -> anyhow::Result<Environment> {
 }
 
 fn load_worker_config(source: EnvSource, default_id: &str) -> anyhow::Result<WorkerConfig> {
-    let worker_id = match source.get("TMDB_WORKER_ID") {
+    let worker_id = match source
+        .get("TMDB_IMAGE_WORKER_ID")
+        .or_else(|| source.get("TMDB_WORKER_ID"))
+    {
         Some(value) => value.into_string().map_err(|_| {
             anyhow::anyhow!("configuration field TMDB_WORKER_ID is not valid Unicode")
         })?,
@@ -258,6 +299,38 @@ fn load_worker_config(source: EnvSource, default_id: &str) -> anyhow::Result<Wor
         Duration::from_millis(poll),
     )
     .map_err(|error| anyhow::anyhow!(error))
+}
+
+fn load_image_worker_concurrency(source: EnvSource) -> anyhow::Result<usize> {
+    let concurrency = parse_or(source, "TMDB_IMAGE_WORKER_CONCURRENCY", 4_usize)?;
+    if !(1..=32).contains(&concurrency) {
+        return Err(anyhow::anyhow!(
+            "TMDB_IMAGE_WORKER_CONCURRENCY must be between 1 and 32"
+        ));
+    }
+    Ok(concurrency)
+}
+
+fn image_worker_configs(
+    base: WorkerConfig,
+    concurrency: usize,
+) -> anyhow::Result<Vec<WorkerConfig>> {
+    if concurrency == 1 {
+        return Ok(vec![base]);
+    }
+    (0..concurrency)
+        .map(|index| {
+            let worker_id = WorkerId::new(&format!("{}-{}", base.worker_id.as_str(), index + 1))
+                .map_err(|error| anyhow::anyhow!(error))?;
+            WorkerConfig::try_new(
+                worker_id,
+                base.lease_duration,
+                base.heartbeat_interval,
+                base.idle_poll_interval,
+            )
+            .map_err(|error| anyhow::anyhow!(error))
+        })
+        .collect()
 }
 
 fn required(source: EnvSource, name: &str) -> anyhow::Result<String> {
@@ -303,6 +376,7 @@ async fn shutdown_signal() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::image::{ImageEntityType, ImageKind};
+    use std::time::Duration;
 
     #[test]
     fn image_job_dispatch_validates_version_and_payload() -> Result<(), Box<dyn std::error::Error>>
@@ -321,6 +395,47 @@ mod tests {
         assert!(parse_image_job("system.noop", 1, &json!({}))?.is_none());
         assert!(parse_image_job(crate::image::IMAGE_JOB_TYPE, 2, &value).is_err());
         assert!(parse_image_job(crate::image::IMAGE_JOB_TYPE, 1, &json!({})).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_image_workers_receive_distinct_lease_ids() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let base = WorkerConfig::try_new(
+            WorkerId::new("tmdb-media")?,
+            Duration::from_mins(1),
+            Duration::from_secs(15),
+            Duration::from_millis(500),
+        )?;
+        let configs = image_worker_configs(base, 4)?;
+        let worker_ids = configs
+            .iter()
+            .map(|config| config.worker_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            worker_ids,
+            vec![
+                "tmdb-media-1",
+                "tmdb-media-2",
+                "tmdb-media-3",
+                "tmdb-media-4",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn image_worker_concurrency_one_preserves_the_configured_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = WorkerConfig::try_new(
+            WorkerId::new("tmdb-media")?,
+            Duration::from_mins(1),
+            Duration::from_secs(15),
+            Duration::from_millis(500),
+        )?;
+        let configs = image_worker_configs(base, 1)?;
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].worker_id.as_str(), "tmdb-media");
         Ok(())
     }
 }

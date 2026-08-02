@@ -123,7 +123,10 @@ pub struct ImageJobPayload {
 }
 
 impl ImageJobPayload {
-    /// Validates and constructs an image job payload.
+    /// Constructs an image job payload.
+    ///
+    /// Season and episode payloads must be completed with
+    /// [`Self::with_tv_position`] before they can be serialized or executed.
     ///
     /// # Errors
     ///
@@ -152,7 +155,13 @@ impl ImageJobPayload {
             episode_number: None,
             title_tmdb_id: None,
         };
-        payload.validate()?;
+        payload.validate_common()?;
+        if !matches!(
+            entity_type,
+            ImageEntityType::Season | ImageEntityType::Episode
+        ) {
+            payload.validate_position()?;
+        }
         Ok(payload)
     }
 
@@ -218,12 +227,40 @@ impl ImageJobPayload {
     /// Returns [`ImagePayloadError`] for an unsupported version or unsafe
     /// payload field.
     pub fn validate(&self) -> Result<(), ImagePayloadError> {
+        self.validate_common()?;
+        self.validate_position()
+    }
+
+    fn validate_common(&self) -> Result<(), ImagePayloadError> {
         if self.schema_version != IMAGE_JOB_PAYLOAD_VERSION {
             return Err(ImagePayloadError::UnsupportedVersion);
         }
         if self.entity_id <= 0 {
             return Err(ImagePayloadError::InvalidEntityId);
         }
+        validate_tmdb_path(&self.tmdb_path)?;
+        let source = parse_source_url(&self.source_url)?;
+        if source.fragment().is_some() {
+            return Err(ImagePayloadError::InvalidSourceUrl);
+        }
+        if let Some(language) = &self.language {
+            validate_text(
+                language,
+                MAX_LANGUAGE_CHARS,
+                ImagePayloadError::InvalidLanguage,
+            )?;
+        }
+        if let Some(revision) = &self.source_revision {
+            validate_text(
+                revision,
+                MAX_REVISION_CHARS,
+                ImagePayloadError::InvalidSourceRevision,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_position(&self) -> Result<(), ImagePayloadError> {
         if matches!(
             self.entity_type,
             ImageEntityType::Season | ImageEntityType::Episode
@@ -255,25 +292,6 @@ impl ImageJobPayload {
         ) && self.title_tmdb_id.is_some()
         {
             return Err(ImagePayloadError::InvalidSeasonNumber);
-        }
-        validate_tmdb_path(&self.tmdb_path)?;
-        let source = parse_source_url(&self.source_url)?;
-        if source.fragment().is_some() {
-            return Err(ImagePayloadError::InvalidSourceUrl);
-        }
-        if let Some(language) = &self.language {
-            validate_text(
-                language,
-                MAX_LANGUAGE_CHARS,
-                ImagePayloadError::InvalidLanguage,
-            )?;
-        }
-        if let Some(revision) = &self.source_revision {
-            validate_text(
-                revision,
-                MAX_REVISION_CHARS,
-                ImagePayloadError::InvalidSourceRevision,
-            )?;
         }
         Ok(())
     }
@@ -2164,6 +2182,26 @@ mod tests {
             HttpTrawlFallback::new(url("http://trawl.test/?token=secret")?),
             Err(ImageError::InvalidTrawlUrl)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn positioned_episode_payload_is_valid_after_builder_completion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = ImageJobPayload::new(
+            ImageEntityType::Episode,
+            300,
+            ImageKind::Still,
+            "/shared-still.jpg",
+            "https://image.tmdb.org/t/p/original/shared-still.jpg",
+            None,
+            None,
+        )?
+        .with_tv_position(100, 1, Some(1))?;
+        assert_eq!(payload.title_tmdb_id, Some(100));
+        assert_eq!(payload.season_number, Some(1));
+        assert_eq!(payload.episode_number, Some(1));
+        assert!(payload.to_json().is_ok());
         Ok(())
     }
 

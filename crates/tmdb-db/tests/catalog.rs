@@ -19,7 +19,9 @@ async fn catalog_migration_exposes_shared_titles_dimensions_and_search_projectio
     .await?;
     assert_eq!(
         versions,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,]
+        [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+        ]
     );
 
     let revision: String = sqlx::query_scalar("SELECT schema_revision FROM ops.readiness")
@@ -765,12 +767,24 @@ async fn repository_discovery_filters_are_bounded_and_anime_scoped(
         sqlx::query_scalar("INSERT INTO catalog.tags(name) VALUES ('curated') RETURNING id")
             .fetch_one(&pool)
             .await?;
-    sqlx::query("INSERT INTO catalog.companies(id, name) VALUES (601, 'Filtered Studio')")
-        .execute(&pool)
-        .await?;
-    sqlx::query("INSERT INTO catalog.languages(iso_639_1, english_name) VALUES ('en', 'English')")
-        .execute(&pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO catalog.companies(id, name)
+         VALUES (601, 'Filtered Studio'), (602, 'Anime Studio')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO catalog.languages(iso_639_1, english_name)
+         VALUES ('en', 'English'), ('ja', 'Japanese')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO catalog.networks(id, name)
+         VALUES (801, 'Filtered Network'), (802, 'Anime Network')",
+    )
+    .execute(&pool)
+    .await?;
     sqlx::query("INSERT INTO catalog.people(id, name) VALUES (701, 'Filtered Actor')")
         .execute(&pool)
         .await?;
@@ -784,14 +798,33 @@ async fn repository_discovery_filters_are_bounded_and_anime_scoped(
         .bind(tag_id)
         .execute(&pool)
         .await?;
-    sqlx::query("INSERT INTO catalog.title_companies(title_id, company_id) VALUES ($1, 601)")
-        .bind(matching)
-        .execute(&pool)
-        .await?;
-    sqlx::query("INSERT INTO catalog.title_languages(title_id, language_id) VALUES ($1, 'en')")
-        .bind(matching)
-        .execute(&pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO catalog.title_companies(title_id, company_id)
+         VALUES ($1, 601), ($2, 601), ($3, 602)",
+    )
+    .bind(matching)
+    .bind(non_matching)
+    .bind(anime)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO catalog.title_languages(title_id, language_id)
+         VALUES ($1, 'en'), ($2, 'en'), ($3, 'ja')",
+    )
+    .bind(matching)
+    .bind(non_matching)
+    .bind(anime)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO catalog.title_networks(title_id, network_id)
+         VALUES ($1, 801), ($2, 801), ($3, 802)",
+    )
+    .bind(matching)
+    .bind(non_matching)
+    .bind(anime)
+    .execute(&pool)
+    .await?;
     sqlx::query("INSERT INTO catalog.title_credits(title_id, person_id, credit_id) VALUES ($1, 701, 'credit-701')")
         .bind(matching)
         .execute(&pool)
@@ -868,6 +901,66 @@ async fn repository_discovery_filters_are_bounded_and_anime_scoped(
             .map(|genre| genre.id)
             .collect::<Vec<_>>(),
         [28]
+    );
+    assert_eq!(
+        repository
+            .list_company_entities(None, AnimeScope::OnlyNonAnime, 10)
+            .await
+            .map_err(|_| test_error("company entities"))?
+            .iter()
+            .map(|company| company.id)
+            .collect::<Vec<_>>(),
+        [601]
+    );
+    assert_eq!(
+        repository
+            .list_company_entities(Some("filtered"), AnimeScope::OnlyNonAnime, 10)
+            .await
+            .map_err(|_| test_error("filtered company entities"))?
+            .iter()
+            .map(|company| company.id)
+            .collect::<Vec<_>>(),
+        [601]
+    );
+    assert_eq!(
+        repository
+            .list_network_entities(None, AnimeScope::OnlyNonAnime, 10)
+            .await
+            .map_err(|_| test_error("network entities"))?
+            .iter()
+            .map(|network| network.id)
+            .collect::<Vec<_>>(),
+        [801]
+    );
+    assert_eq!(
+        repository
+            .list_network_entities(Some("filtered"), AnimeScope::OnlyNonAnime, 10)
+            .await
+            .map_err(|_| test_error("filtered network entities"))?
+            .iter()
+            .map(|network| network.id)
+            .collect::<Vec<_>>(),
+        [801]
+    );
+    assert_eq!(
+        repository
+            .list_language_entities(None, AnimeScope::OnlyNonAnime, 10)
+            .await
+            .map_err(|_| test_error("language entities"))?
+            .iter()
+            .map(|language| language.iso_639_1.as_str())
+            .collect::<Vec<_>>(),
+        ["en"]
+    );
+    assert_eq!(
+        repository
+            .list_language_entities(Some("english"), AnimeScope::OnlyNonAnime, 10)
+            .await
+            .map_err(|_| test_error("filtered language entities"))?
+            .iter()
+            .map(|language| language.iso_639_1.as_str())
+            .collect::<Vec<_>>(),
+        ["en"]
     );
     assert!(matches!(
         repository

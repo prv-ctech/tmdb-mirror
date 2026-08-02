@@ -7,6 +7,7 @@ param(
     [int]$PostgresPort = 55433,
     [string]$TmdbReadToken = $env:TMDB_STRESS_READ_TOKEN,
     [string]$TrawlBaseUrl = $env:TMDB_STRESS_TRAWL_BASE_URL,
+    [string]$SecretsFile,
     [switch]$SkipBuild
 )
 
@@ -14,11 +15,24 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $repoRoot 'scripts/stress-secrets.ps1')
 $composeFile = Join-Path $repoRoot 'deploy/compose.stress.yaml'
 $runtimeRoot = Join-Path (Join-Path $repoRoot '.stress-runtime') $ProjectName
 $envFile = Join-Path $runtimeRoot 'compose.env'
 $metadataFile = Join-Path $runtimeRoot 'metadata.json'
 $appImage = 'tmdb-stress-app:local'
+
+if ([string]::IsNullOrWhiteSpace($SecretsFile)) {
+    $SecretsFile = Join-Path $repoRoot 'secrets.txt'
+}
+elseif (-not (Test-Path -LiteralPath $SecretsFile -PathType Leaf)) {
+    throw "Local stress secrets file is missing: $SecretsFile"
+}
+$localSecrets = Read-StressSecrets -Path $SecretsFile
+$TmdbReadToken = Resolve-StressSecret `
+    -Secrets $localSecrets -Name 'TMDB_STRESS_READ_TOKEN' -ExplicitValue $TmdbReadToken
+$TrawlBaseUrl = Resolve-StressSecret `
+    -Secrets $localSecrets -Name 'TMDB_STRESS_TRAWL_BASE_URL' -ExplicitValue $TrawlBaseUrl
 
 function Invoke-DockerChecked {
     param([Parameter(Mandatory)][string[]]$Arguments)
@@ -113,7 +127,7 @@ function Wait-Migrations {
                     '--username', 'tmdb_owner', '--dbname', 'tmdb', '-c',
                     "SELECT COALESCE(max(version), 0) FROM ops._sqlx_migrations WHERE success"
                 )).Trim()
-                if ([int]$version -ge 17) { return }
+                if ([int]$version -ge 19) { return }
             }
         }
         catch {
@@ -187,6 +201,7 @@ try {
         'TMDB_DAILY_EXPORT_MAX_BYTES=536870912',
         'TMDB_WORKER_ID=tmdb-stress-worker',
         'TMDB_IMAGE_WORKER_ID=tmdb-stress-media',
+        'TMDB_IMAGE_WORKER_CONCURRENCY=4',
         'TMDB_WORKER_LEASE_SECONDS=60',
         'TMDB_WORKER_HEARTBEAT_SECONDS=15',
         'TMDB_WORKER_IDLE_POLL_MS=100',
@@ -255,5 +270,6 @@ try {
 finally {
     $TmdbReadToken = $null
     $TrawlBaseUrl = $null
+    $localSecrets = $null
     if (Test-Path Env:TMDB_STRESS_READ_TOKEN) { Remove-Item Env:TMDB_STRESS_READ_TOKEN -ErrorAction SilentlyContinue }
 }

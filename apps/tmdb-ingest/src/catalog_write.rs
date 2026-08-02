@@ -1144,7 +1144,7 @@ async fn enqueue_image_job_with_position(
     .bind(IMAGE_JOB_TYPE)
     .bind(IMAGE_JOB_PAYLOAD_VERSION)
     .bind(payload)
-    .bind(0_i16)
+    .bind(image_job_priority(entity_type, kind))
     .bind(8_i32)
     .bind(Option::<chrono::DateTime<Utc>>::None)
     .bind(dedup_key)
@@ -1161,6 +1161,15 @@ fn valid_image_path(path: &str) -> bool {
         && !path.chars().any(char::is_control)
         && !path.contains('\\')
         && !path.split('/').any(|part| matches!(part, "." | ".."))
+}
+
+fn image_job_priority(entity_type: &str, kind: &str) -> i16 {
+    match (entity_type, kind) {
+        ("movie" | "tv", "poster" | "backdrop") => 100,
+        ("season" | "episode", _) => 50,
+        ("person" | "company" | "network" | "collection", _) => 25,
+        _ => 0,
+    }
 }
 
 fn digest_hex(value: &str) -> String {
@@ -1184,6 +1193,17 @@ mod tests {
 
     fn as_sqlx_error(error: &JobExecutionError) -> sqlx::Error {
         sqlx::Error::Protocol(error.to_string())
+    }
+
+    #[test]
+    fn primary_title_artwork_outranks_related_artwork() {
+        let title_priority = image_job_priority("movie", "poster");
+        assert_eq!(title_priority, image_job_priority("tv", "backdrop"));
+        assert!(title_priority > image_job_priority("season", "poster"));
+        assert!(title_priority > image_job_priority("episode", "still"));
+        assert!(title_priority > image_job_priority("person", "profile"));
+        assert!(title_priority > image_job_priority("network", "logo"));
+        assert!(title_priority > image_job_priority("collection", "poster"));
     }
 
     #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]

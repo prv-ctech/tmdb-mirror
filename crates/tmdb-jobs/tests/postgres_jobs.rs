@@ -56,7 +56,9 @@ async fn jobs_migration_has_exact_readiness_indexes_and_hardened_functions(
     .await?;
     assert_eq!(
         versions,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+        [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+        ]
     );
     let revision: String = sqlx::query_scalar("SELECT schema_revision FROM ops.readiness")
         .fetch_one(&pool)
@@ -586,7 +588,7 @@ async fn expired_lease_reclaims_and_wrong_or_expired_owners_cannot_mutate(
     ));
 
     sqlx::query(
-        "UPDATE ops.jobs SET lease_expires_at = clock_timestamp() - interval '1 microsecond'
+        "UPDATE ops.jobs SET lease_expires_at = clock_timestamp() - interval '1 second'
           WHERE id = $1",
     )
     .bind(submitted.job_id().as_uuid())

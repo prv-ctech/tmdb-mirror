@@ -951,15 +951,26 @@ impl CatalogRepository {
         {
             return Err(CatalogError::InvalidInput);
         }
-        let clause = if term.is_some() {
-            " AND company.name ILIKE '%' || $1 || '%'"
+        let term_clause = if term.is_some() {
+            "company.name ILIKE '%' || $1 || '%' AND "
         } else {
             ""
         };
         let limit_placeholder = if term.is_some() { "$2" } else { "$1" };
         let statement = format!(
-            "SELECT DISTINCT company.id, company.name, company.origin_country, company.logo_path FROM catalog.companies AS company JOIN catalog.title_companies AS relation ON relation.company_id = company.id JOIN catalog.titles AS title ON title.id = relation.title_id WHERE title.active AND {scope}{clause} ORDER BY company.id LIMIT {limit_placeholder}",
-            scope = anime_scope.predicate()
+            "SELECT company.id, company.name, company.origin_country, company.logo_path
+               FROM catalog.companies AS company
+              WHERE {term_clause}EXISTS (
+                    SELECT 1
+                      FROM catalog.title_companies AS relation
+                      JOIN catalog.titles AS title ON title.id = relation.title_id
+                     WHERE relation.company_id = company.id
+                       AND title.active
+                       AND {scope}
+              )
+              ORDER BY company.id
+              LIMIT {limit_placeholder}",
+            scope = anime_scope.qualified_predicate(),
         );
         let rows = if let Some(term) = term {
             sqlx::query_as::<_, CompanyRow>(sqlx::AssertSqlSafe(statement))
@@ -1003,15 +1014,26 @@ impl CatalogRepository {
         {
             return Err(CatalogError::InvalidInput);
         }
-        let clause = if term.is_some() {
-            " AND network.name ILIKE '%' || $1 || '%'"
+        let term_clause = if term.is_some() {
+            "network.name ILIKE '%' || $1 || '%' AND "
         } else {
             ""
         };
         let limit_placeholder = if term.is_some() { "$2" } else { "$1" };
         let statement = format!(
-            "SELECT DISTINCT network.id, network.name, network.origin_country, network.logo_path FROM catalog.networks AS network JOIN catalog.title_networks AS relation ON relation.network_id = network.id JOIN catalog.titles AS title ON title.id = relation.title_id WHERE title.active AND {scope}{clause} ORDER BY network.id LIMIT {limit_placeholder}",
-            scope = anime_scope.predicate()
+            "SELECT network.id, network.name, network.origin_country, network.logo_path
+               FROM catalog.networks AS network
+              WHERE {term_clause}EXISTS (
+                    SELECT 1
+                      FROM catalog.title_networks AS relation
+                      JOIN catalog.titles AS title ON title.id = relation.title_id
+                     WHERE relation.network_id = network.id
+                       AND title.active
+                       AND {scope}
+              )
+              ORDER BY network.id
+              LIMIT {limit_placeholder}",
+            scope = anime_scope.qualified_predicate(),
         );
         let rows = if let Some(term) = term {
             sqlx::query_as::<_, NetworkRow>(sqlx::AssertSqlSafe(statement))
@@ -1224,13 +1246,17 @@ impl CatalogRepository {
             return Err(CatalogError::InvalidInput);
         }
         let mut query = QueryBuilder::<Postgres>::new(
-            "SELECT DISTINCT language.iso_639_1, language.english_name, language.name
+            "SELECT language.iso_639_1, language.english_name, language.name
                FROM catalog.languages AS language
-               JOIN catalog.title_languages AS relation ON relation.language_id = language.iso_639_1
-               JOIN catalog.titles AS title ON title.id = relation.title_id
-              WHERE title.active AND ",
+              WHERE EXISTS (
+                    SELECT 1
+                      FROM catalog.title_languages AS relation
+                      JOIN catalog.titles AS title ON title.id = relation.title_id
+                     WHERE relation.language_id = language.iso_639_1
+                       AND title.active
+                       AND ",
         );
-        query.push(anime_scope.qualified_predicate());
+        query.push(anime_scope.qualified_predicate()).push(")");
         if let Some(term) = term {
             query
                 .push(" AND (lower(public.unaccent(coalesce(language.english_name, ''))) LIKE '%' || lower(public.unaccent(")

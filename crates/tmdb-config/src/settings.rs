@@ -179,6 +179,12 @@ fn load_prefixed_database(
 /// `TMDB_DB_*` values take precedence. `DATABASE_*` aliases and the standard
 /// `POSTGRES_*` names are accepted so a single Compose `env_file` can be used
 /// without repeating the same settings per service.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] when a selected setting is invalid, required
+/// database credentials are absent, or a development/example secret is used
+/// outside production.
 pub fn load_shared_database(
     source: &impl ConfigSource,
     environment: Environment,

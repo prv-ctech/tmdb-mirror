@@ -17,17 +17,16 @@ Host ports default to `55433` (PostgreSQL), `18080` (API), `18081` (admin), and
 
 ## Start
 
-Run from the repository root in PowerShell. Supply the TMDB read token through
-an environment variable or a process argument; the bootstrap script writes it
-to the ignored `.stress-runtime/<project>/compose.env` file, which is the single
+Run from the repository root in PowerShell. Copy `secrets.txt.example` to the
+ignored `secrets.txt`, fill in the TMDB v4 read token and v3 API key without
+quotation marks, and optionally set the Trawl URL. The bootstrap script writes
+only the v4 read token to `.stress-runtime/<project>/compose.env`, the single
 Compose environment file for the disposable project.
 
 ```powershell
-$env:TMDB_STRESS_READ_TOKEN = '<paste-tmdb-read-token>'
-$env:TMDB_STRESS_TRAWL_BASE_URL = 'http://<trawl-host>:8191'
+Copy-Item secrets.txt.example secrets.txt
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-tmdb-auth.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-bootstrap.ps1
-$env:TMDB_STRESS_READ_TOKEN = $null
-$env:TMDB_STRESS_TRAWL_BASE_URL = $null
 ```
 
 An existing Trawl instance can be used as the image challenge fallback through
@@ -39,6 +38,9 @@ second Trawl container.
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-seed.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-http.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-artwork.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-media-assets.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-trawl.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-resilience.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-scan.ps1 -QueueLimit 500
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-collect.ps1
@@ -47,23 +49,29 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-collect.ps1
 `stress-http.ps1` reports every request, throughput, status counts, and p50,
 p95, and p99 latency. `stress-scan.ps1` streams and counts the complete daily
 movie and TV ID exports, while its queue limit deliberately bounds detail
-refresh work. Increase that limit only after validating the token, rate limit,
-worker concurrency, and database capacity.
+refresh work. When no explicit `-Date` is supplied, it uses the latest matching
+movie/TV export published by TMDB (up to seven days back). Increase the queue
+limit only after validating the token, rate limit, worker concurrency, and
+database capacity.
 
 The resilience check restarts the media worker and stops PostgreSQL long enough
 to require an API readiness failure, then verifies recovery. Its JSON and log
 artifacts are written below the ignored runtime directory.
 
+`stress-media-assets.ps1` checks one live file for every media owner class,
+four internal media-worker lease IDs, shared source reuse, and zero dead-letter
+image jobs. `stress-trawl.ps1` verifies the configured existing Trawl instance
+without writing its URL or any credential to an artifact.
+
 ## Refresh a token without rebuilding
 
 ```powershell
-$env:TMDB_STRESS_READ_TOKEN = '<paste-new-tmdb-read-token>'
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-set-token.ps1
-$env:TMDB_STRESS_READ_TOKEN = $null
-docker compose --env-file .stress-runtime\tmdb_stress_test\compose.env --project-name tmdb_stress_test --file deploy\compose.stress.yaml restart worker
+docker compose --env-file .stress-runtime\tmdb_stress_test\compose.env --project-name tmdb_stress_test --file deploy\compose.stress.yaml up -d --force-recreate --no-deps worker
 ```
 
-Restart the ingest worker after changing the file so it reloads the token. The
+Docker restart alone does not reload an `env_file`; recreate the worker after
+changing the file. The
 supplied token must be valid before a detail-refresh run can populate
 metadata. If a token has been pasted into a chat, shell history, or logs, revoke
 it and issue a replacement before production use.

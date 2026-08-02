@@ -1,17 +1,29 @@
 [CmdletBinding()]
 param(
     [string]$ProjectName = 'tmdb_stress_test',
-    [string]$TmdbReadToken = $env:TMDB_STRESS_READ_TOKEN
+    [string]$TmdbReadToken = $env:TMDB_STRESS_READ_TOKEN,
+    [string]$SecretsFile
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+$repoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $repoRoot 'scripts/stress-secrets.ps1')
+if ([string]::IsNullOrWhiteSpace($SecretsFile)) {
+    $SecretsFile = Join-Path $repoRoot 'secrets.txt'
+}
+elseif (-not (Test-Path -LiteralPath $SecretsFile -PathType Leaf)) {
+    throw "Local stress secrets file is missing: $SecretsFile"
+}
+$localSecrets = Read-StressSecrets -Path $SecretsFile
+$TmdbReadToken = Resolve-StressSecret `
+    -Secrets $localSecrets -Name 'TMDB_STRESS_READ_TOKEN' -ExplicitValue $TmdbReadToken
+
 if ([string]::IsNullOrWhiteSpace($TmdbReadToken)) {
-    throw 'Provide the token through -TmdbReadToken or TMDB_STRESS_READ_TOKEN.'
+    throw 'Provide the token through -TmdbReadToken, TMDB_STRESS_READ_TOKEN, or the ignored secrets.txt file.'
 }
 
-$repoRoot = Split-Path -Parent $PSScriptRoot
 $runtimeRoot = Join-Path (Join-Path $repoRoot '.stress-runtime') $ProjectName
 $envFile = Join-Path $runtimeRoot 'compose.env'
 if (-not (Test-Path -LiteralPath $envFile -PathType Leaf)) {
@@ -32,8 +44,10 @@ try {
     $lines[$index] = "TMDB_READ_ACCESS_TOKEN=$($TmdbReadToken.Trim())"
     [IO.File]::WriteAllLines($envFile, $lines, [Text.UTF8Encoding]::new($false))
     Write-Output "Updated the isolated runtime token in $envFile (value not displayed)."
+    Write-Output 'Recreate the worker container so Docker reloads the env_file.'
 }
 finally {
     $TmdbReadToken = $null
+    $localSecrets = $null
     $env:TMDB_STRESS_READ_TOKEN = $null
 }

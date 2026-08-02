@@ -2,6 +2,7 @@
 param(
     [string]$ProjectName = 'tmdb_stress_test',
     [datetime]$Date = [DateTime]::UtcNow.Date,
+    [ValidateRange(0, 14)][int]$MaxLookbackDays = 7,
     [ValidateRange(0, 100000)][int]$QueueLimit = 500
 )
 
@@ -18,6 +19,7 @@ $resultRoot = Join-Path $runtimeRoot 'results'
 New-Item -ItemType Directory -Force -Path $exportRoot, $resultRoot | Out-Null
 $stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
 $composeArgs = @('compose', '--env-file', $envFile, '--project-name', $ProjectName, '--file', $composeFile)
+$dateWasExplicit = $PSBoundParameters.ContainsKey('Date')
 
 if (-not (Test-Path -LiteralPath $envFile -PathType Leaf)) {
     throw "Runtime environment is missing: $envFile. Run stress-bootstrap.ps1 first."
@@ -39,6 +41,14 @@ function Download-Export {
         if (-not $response.IsSuccessStatusCode) {
             $status = [int]$response.StatusCode
             $response.Dispose()
+            if ($status -in @(403, 404)) {
+                return [pscustomobject]@{
+                    available = $false
+                    media_type = $MediaType
+                    date = $dateText
+                    status = $status
+                }
+            }
             throw "TMDB export returned HTTP $status for $fileName"
         }
         $inputStream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
@@ -51,7 +61,14 @@ function Download-Export {
         }
     }
     finally { $client.Dispose() }
-    [pscustomobject]@{ media_type = $MediaType; date = $dateText; url = $url; host_path = $destination; file_name = $fileName }
+    [pscustomobject]@{
+        available = $true
+        media_type = $MediaType
+        date = $dateText
+        url = $url
+        host_path = $destination
+        file_name = $fileName
+    }
 }
 
 function Copy-ToWorkerVolume {
@@ -106,9 +123,42 @@ function Invoke-ScanCommand {
     return ($jsonLine[0].ToString() | ConvertFrom-Json)
 }
 
+$downloads = @{}
+$selectedDate = $null
+$attemptedDates = [System.Collections.Generic.List[object]]::new()
+for ($offset = 0; $offset -le $MaxLookbackDays; $offset++) {
+    $candidateDate = $Date.Date.AddDays(-$offset)
+    $candidateDownloads = @{}
+    $unavailable = [System.Collections.Generic.List[object]]::new()
+    foreach ($mediaType in @('movie', 'tv')) {
+        $download = Download-Export -MediaType $mediaType -ExportDate $candidateDate
+        if ($download.available) {
+            $candidateDownloads[$mediaType] = $download
+        }
+        else {
+            $unavailable.Add($download)
+        }
+    }
+    $attemptedDates.Add([ordered]@{
+        date = $candidateDate.ToUniversalTime().ToString('yyyy-MM-dd')
+        unavailable = @($unavailable | ForEach-Object { "$($_.media_type):$($_.status)" })
+    })
+    if ($unavailable.Count -eq 0) {
+        $downloads = $candidateDownloads
+        $selectedDate = $candidateDate
+        break
+    }
+    if ($dateWasExplicit) {
+        throw "TMDB exports for the requested date are unavailable: $($unavailable.media_type -join ', ')."
+    }
+}
+if ($null -eq $selectedDate) {
+    throw "TMDB did not publish matching movie and TV exports within $MaxLookbackDays day(s)."
+}
+
 $results = [System.Collections.Generic.List[object]]::new()
 foreach ($mediaType in @('movie', 'tv')) {
-    $download = Download-Export -MediaType $mediaType -ExportDate $Date
+    $download = $downloads[$mediaType]
     $containerPath = Copy-ToWorkerVolume -HostPath $download.host_path -FileName $download.file_name
     $scan = Invoke-ScanCommand -MediaType $mediaType -ContainerPath $containerPath
     $results.Add([ordered]@{
@@ -126,6 +176,8 @@ foreach ($mediaType in @('movie', 'tv')) {
 $artifact = [ordered]@{
     started_at_utc = $stamp
     requested_date_utc = $Date.ToUniversalTime().ToString('yyyy-MM-dd')
+    selected_date_utc = $selectedDate.ToUniversalTime().ToString('yyyy-MM-dd')
+    attempted_dates = @($attemptedDates)
     results = @($results)
 }
 $resultFile = Join-Path $resultRoot "tmdb-scan-$stamp.json"

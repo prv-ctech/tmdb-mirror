@@ -50,6 +50,7 @@ if ($violations.Count -gt 0) {
 
 $ignoredProbes = @(
     '.env',
+    'secrets.txt',
     '.stress-runtime/example/token',
     'target/debug/example',
     'example.log'

@@ -29,6 +29,8 @@ header. Do not expose the admin listener publicly.
 
 Local images are served from port `8090`. Set `TMDB_MEDIA_BASE_URL` to a URL
 reachable by your app, for example `http://<server-host>:8090/media`.
+The single media container runs four bounded download workers by default;
+adjust `TMDB_IMAGE_WORKER_CONCURRENCY` between 1 and 32 if needed.
 
 ## Deploy
 
@@ -59,17 +61,21 @@ The application only uses `/media` and `/config` inside containers. Set
 
 ## Stress test
 
-The disposable harness keeps tokens and generated data under the ignored
-`.stress-runtime/` directory:
+The disposable harness keeps generated data under `.stress-runtime/`. Copy the
+ignored local template once; it holds the TMDB v4 read token, v3 API key, and
+optional Trawl URL.
 
 ```powershell
-$env:TMDB_STRESS_READ_TOKEN = '<paste-tmdb-read-token>'
-$env:TMDB_STRESS_TRAWL_BASE_URL = 'http://<trawl-host>:8191'
+Copy-Item secrets.txt.example secrets.txt
+./scripts/stress-tmdb-auth.ps1
 ./scripts/stress-bootstrap.ps1
 ./scripts/stress-http.ps1 -Concurrency 100 -RequestsPerWorker 50
+./scripts/stress-artwork.ps1
+./scripts/stress-media-assets.ps1
+./scripts/stress-trawl.ps1
 ./scripts/stress-resilience.ps1
 ./scripts/stress-collect.ps1
 ```
 
 Run `./scripts/verify-repository-hygiene.ps1` before committing. Keep your
-`.env` and generated runtime artifacts out of Git.
+`.env`, `secrets.txt`, and generated runtime artifacts out of Git.
