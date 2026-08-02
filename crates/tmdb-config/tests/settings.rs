@@ -344,6 +344,16 @@ fn trawl_base_url_rejects_embedded_query_credentials() {
 }
 
 #[test]
+fn trawl_base_url_can_be_omitted_with_an_empty_value() -> Result<(), Box<dyn std::error::Error>> {
+    let mut entries = valid_entries("test");
+    assert!(replace_entry(&mut entries, "TMDB_TRAWL_BASE_URL", "   "));
+
+    let config = AppConfig::load(&source_from_entries(entries))?;
+    assert!(config.trawl_base_url.is_none());
+    Ok(())
+}
+
+#[test]
 fn production_accepts_postgres_password() -> Result<(), Box<dyn std::error::Error>> {
     let source = source_from_entries(valid_entries("production"));
     let config = AppConfig::load(&source)?;

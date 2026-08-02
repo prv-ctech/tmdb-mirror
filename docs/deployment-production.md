@@ -1,7 +1,12 @@
 # Four-container deployment
 
-`deploy/compose.production.yaml` is the complete canonical Compose file. The
-stack is deliberately only four services:
+`deploy/compose.production.yaml` is the complete canonical Compose file. It
+pulls two GitHub-built Linux AMD64 images:
+
+- `ghcr.io/prv-ctech/tmdb-mirror:main` for API, main worker, and media worker.
+- `ghcr.io/prv-ctech/tmdb-mirror-postgres:main` for PostgreSQL and its bootstrap.
+
+The stack is deliberately only four services:
 
 1. PostgreSQL 18, including `pg_trgm`, `unaccent`, and `pg_stat_statements`.
 2. API, with catalog/anime/search/admin routes and bounded read connections.
@@ -48,7 +53,8 @@ application.
 Copy the root environment template, replace its angle-bracket values, and keep
 that `.env` file outside source control. It contains the single PostgreSQL
 password, TMDB read token, and admin API key used by the stack. The same file is
-passed to all four containers through `env_file`.
+passed to all four containers through `env_file`. No repository checkout or
+local Docker build is needed after GitHub Actions has published the images.
 
 Each key has an inline description in `.env.example`. The public, admin, and
 media routes are listed in [api.md](api.md).
@@ -60,10 +66,14 @@ all use those same values. Its database connection is fixed to the internal
 Compose service `postgres:5432`; do not add `DATABASE_*`, `TMDB_DB_*`, or
 per-process database aliases.
 
+Keep `TMDB_RATE_LIMIT` at `40` or lower. The worker rejects a higher value
+before it starts upstream requests.
+
 ```powershell
 Copy-Item .env.example .env
 ./scripts/validate-production-compose.ps1 -EnvFile .env -ComposeFile deploy/compose.production.yaml
-docker compose -f deploy/compose.production.yaml up -d --build
+docker compose -f deploy/compose.production.yaml pull
+docker compose -f deploy/compose.production.yaml up -d
 ```
 
 The main worker applies migrations under the existing PostgreSQL advisory lock;

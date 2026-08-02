@@ -256,21 +256,27 @@ fn load_downloader(source: EnvSource) -> anyhow::Result<ImageDownloader<ReqwestT
     let transport = ReqwestTransport::new()
         .map_err(|_| anyhow::anyhow!("image HTTP client could not start"))?;
     let downloader = ImageDownloader::new(transport, policy);
-    match source.get("TMDB_TRAWL_BASE_URL") {
-        Some(value) => {
-            let value = value.into_string().map_err(|_| {
+    let trawl_base_url = source
+        .get("TMDB_TRAWL_BASE_URL")
+        .map(|value| {
+            value.into_string().map_err(|_| {
                 anyhow::anyhow!("configuration field TMDB_TRAWL_BASE_URL is not valid Unicode")
-            })?;
-            let base = Url::parse(&value).map_err(|_| {
-                anyhow::anyhow!("configuration field TMDB_TRAWL_BASE_URL is invalid")
-            })?;
-            let fallback = HttpTrawlFallback::new(base).map_err(|_| {
-                anyhow::anyhow!("configuration field TMDB_TRAWL_BASE_URL is invalid")
-            })?;
-            Ok(downloader.with_fallback(Arc::new(fallback)))
-        }
-        None => Ok(downloader),
-    }
+            })
+        })
+        .transpose()?;
+    let Some(value) = trawl_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(downloader);
+    };
+
+    let base = Url::parse(value)
+        .map_err(|_| anyhow::anyhow!("configuration field TMDB_TRAWL_BASE_URL is invalid"))?;
+    let fallback = HttpTrawlFallback::new(base)
+        .map_err(|_| anyhow::anyhow!("configuration field TMDB_TRAWL_BASE_URL is invalid"))?;
+    Ok(downloader.with_fallback(Arc::new(fallback)))
 }
 
 fn load_environment(source: EnvSource) -> anyhow::Result<Environment> {

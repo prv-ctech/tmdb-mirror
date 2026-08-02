@@ -1,10 +1,10 @@
-# Complete four-container production deployment.
-# Keep the repository checkout beside this file so build context, migrations,
-# and PostgreSQL initialization are available to Docker.
+# Complete four-container production deployment using GitHub-built images.
+# No source checkout, Dockerfile, or PostgreSQL initialization bind mount is
+# required at deployment time.
 
 services:
   postgres:
-    image: postgres:18-bookworm@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296
+    image: ghcr.io/prv-ctech/tmdb-mirror-postgres:main
     restart: unless-stopped
     env_file:
       - ../.env
@@ -39,10 +39,6 @@ services:
         target: /var/lib/postgresql
         bind:
           create_host_path: false
-      - type: bind
-        source: ../infra/postgres/initdb
-        target: /docker-entrypoint-initdb.d
-        read_only: true
     healthcheck:
       test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -h 127.0.0.1 -t 1']
       interval: 5s
@@ -52,10 +48,7 @@ services:
     networks: [tmdb-private]
 
   api:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    image: tmdb-api:production
+    image: ghcr.io/prv-ctech/tmdb-mirror:main
     restart: unless-stopped
     env_file:
       - ../.env
@@ -78,10 +71,7 @@ services:
     networks: [tmdb-private]
 
   worker:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    image: tmdb-worker:production
+    image: ghcr.io/prv-ctech/tmdb-mirror:main
     restart: unless-stopped
     env_file:
       - ../.env
@@ -103,10 +93,7 @@ services:
     networks: [tmdb-private]
 
   media:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    image: tmdb-media:production
+    image: ghcr.io/prv-ctech/tmdb-mirror:main
     restart: unless-stopped
     env_file:
       - ../.env

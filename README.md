@@ -38,14 +38,16 @@ adjust `TMDB_IMAGE_WORKER_CONCURRENCY` between 1 and 32 if needed.
 ## Deploy
 
 The stack has four containers: PostgreSQL, API, main worker, and media worker.
-For a complete, readable Compose example, use the root file below. The same
-`.env` is passed to every container once through `env_file`; there is no second
-copy of each setting in the Compose YAML.
+GitHub Actions publishes the two Linux AMD64 images to GHCR, so a deployment
+only needs the Compose file and `.env`—not a repository checkout or Dockerfile.
+The same `.env` is passed to every container once through `env_file`; there is
+no second copy of each setting in the Compose YAML.
 
 ```powershell
 Copy-Item .env.example .env
 docker compose -f docker-compose-example.yaml config --services
-docker compose -f docker-compose-example.yaml up -d --build
+docker compose -f docker-compose-example.yaml pull
+docker compose -f docker-compose-example.yaml up -d
 ```
 
 Replace the angle-bracket values in `.env`, especially the TMDB read token and
@@ -59,7 +61,8 @@ them directly from `.env`; do not add duplicate `DATABASE_*` settings.
 The production template is also a full four-service file (not an include):
 
 ```powershell
-docker compose -f deploy/compose.production.yaml up -d --build
+docker compose -f deploy/compose.production.yaml pull
+docker compose -f deploy/compose.production.yaml up -d
 ```
 
 The application only uses `/media` and `/config` inside containers. Set

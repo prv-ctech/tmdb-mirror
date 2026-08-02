@@ -236,7 +236,11 @@ fn optional_uri(source: &impl ConfigSource, name: &str) -> Result<Option<Uri>, C
     let value = value
         .into_string()
         .map_err(|_| ConfigError::InvalidUnicode(name.to_owned()))?;
-    if value.is_empty() || value.contains('\0') {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.contains('\0') {
         return Err(ConfigError::InvalidValue(name.to_owned()));
     }
     let uri: Uri = value

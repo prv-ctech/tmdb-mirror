@@ -1,4 +1,4 @@
-# Compatibility entry point. Use compose.production.yaml for the complete,
-# directly editable four-container deployment.
+# Compatibility entry point. The included production file pulls GitHub-built
+# images and is the complete, directly editable four-container deployment.
 include:
   - path: ./compose.production.yaml

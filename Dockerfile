@@ -15,6 +15,8 @@ RUN cargo build --locked --release --bins
 
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
 
+LABEL org.opencontainers.image.source="https://github.com/prv-ctech/tmdb-mirror"
+
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \

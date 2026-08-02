@@ -1,6 +1,7 @@
-# Complete four-container Compose example.
+# Complete four-container Compose example using GitHub-built images.
 # Copy .env.example to .env, edit .env, then run:
-#   docker compose -f docker-compose-example.yaml up -d --build
+#   docker compose -f docker-compose-example.yaml pull
+#   docker compose -f docker-compose-example.yaml up -d
 # The application settings are loaded once through env_file. Only host-side
 # mount paths and published ports belong in this file.
 
@@ -8,7 +9,7 @@ name: tmdb
 
 services:
   postgres:
-    image: postgres:18-bookworm@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296
+    image: ghcr.io/prv-ctech/tmdb-mirror-postgres:main
     restart: unless-stopped
     env_file:
       - .env
@@ -39,7 +40,6 @@ services:
       - effective_io_concurrency=256
     volumes:
       - ./data/postgres18:/var/lib/postgresql
-      - ./infra/postgres/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -h 127.0.0.1 -t 1']
       interval: 5s
@@ -49,10 +49,7 @@ services:
     networks: [tmdb-private]
 
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: tmdb-api:local
+    image: ghcr.io/prv-ctech/tmdb-mirror:main
     restart: unless-stopped
     env_file:
       - .env
@@ -75,10 +72,7 @@ services:
     networks: [tmdb-private]
 
   worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: tmdb-worker:local
+    image: ghcr.io/prv-ctech/tmdb-mirror:main
     restart: unless-stopped
     env_file:
       - .env
@@ -96,10 +90,7 @@ services:
     networks: [tmdb-private]
 
   media:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: tmdb-media:local
+    image: ghcr.io/prv-ctech/tmdb-mirror:main
     restart: unless-stopped
     env_file:
       - .env
