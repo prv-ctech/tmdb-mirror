@@ -1195,12 +1195,15 @@ async fn closing_and_recreating_the_pool_preserves_accepted_jobs(
     let database: String = sqlx::query_scalar("SELECT current_database()")
         .fetch_one(&pool)
         .await?;
+    let owner: String = sqlx::query_scalar("SELECT current_user")
+        .fetch_one(&pool)
+        .await?;
     let repo = JobRepository::new(pool.clone());
     let submitted = repo.submit(NewJob::noop("pool-recreate")?).await?;
     drop(repo);
     pool.close().await;
 
-    let reopened = role_pool(&database, "tmdb_owner", PoolPolicy::ReadWrite).await?;
+    let reopened = role_pool(&database, &owner, PoolPolicy::ReadWrite).await?;
     let reopened_repo = JobRepository::new(reopened);
     let persisted = reopened_repo.get(submitted.job_id()).await?;
     assert_eq!(persisted.status(), JobStatus::Queued);

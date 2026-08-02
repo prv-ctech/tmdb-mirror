@@ -21,6 +21,8 @@ $runtimeRoot = Join-Path (Join-Path $repoRoot '.stress-runtime') $ProjectName
 $envFile = Join-Path $runtimeRoot 'compose.env'
 $metadataFile = Join-Path $runtimeRoot 'metadata.json'
 $appImage = 'tmdb-stress-app:local'
+$stressDatabaseName = 'tmdb_stress_catalog'
+$stressDatabaseUser = 'tmdb_stress_owner'
 
 if ([string]::IsNullOrWhiteSpace($SecretsFile)) {
     $SecretsFile = Join-Path $repoRoot 'secrets.txt'
@@ -118,13 +120,13 @@ function Wait-Migrations {
             $password = (Invoke-Compose -Arguments @('exec', '-T', 'postgres', 'printenv', 'POSTGRES_PASSWORD')).Trim()
             $migrationsExist = (Invoke-Compose -Arguments @(
                 'exec', '-T', '-e', "PGPASSWORD=$password", 'postgres', 'psql', '-X', '-At',
-                '--username', 'tmdb_owner', '--dbname', 'tmdb', '-c',
+                '--username', $stressDatabaseUser, '--dbname', $stressDatabaseName, '-c',
                 "SELECT to_regclass('ops._sqlx_migrations') IS NOT NULL"
             )).Trim()
             if ($migrationsExist -eq 't') {
                 $version = (Invoke-Compose -Arguments @(
                     'exec', '-T', '-e', "PGPASSWORD=$password", 'postgres', 'psql', '-X', '-At',
-                    '--username', 'tmdb_owner', '--dbname', 'tmdb', '-c',
+                    '--username', $stressDatabaseUser, '--dbname', $stressDatabaseName, '-c',
                     "SELECT COALESCE(max(version), 0) FROM ops._sqlx_migrations WHERE success"
                 )).Trim()
                 if ([int]$version -ge 19) { return }
@@ -178,8 +180,8 @@ try {
         "TMDB_STRESS_IMAGE_PORT=$ImagePort",
         "TMDB_STRESS_PG_PORT=$PostgresPort",
         'TMDB_ENVIRONMENT=test',
-        'POSTGRES_DB=tmdb',
-        'POSTGRES_USER=tmdb_owner',
+        "POSTGRES_DB=$stressDatabaseName",
+        "POSTGRES_USER=$stressDatabaseUser",
         'POSTGRES_PASSWORD=tmdb-stress',
         'PGDATA=/var/lib/postgresql/18/docker',
         'POSTGRES_INITDB_ARGS=--data-checksums --encoding=UTF8 --auth-local=scram-sha-256 --auth-host=scram-sha-256',

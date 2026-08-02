@@ -45,14 +45,30 @@ function Invoke-DockerChecked {
     return [string]::Join("`n", @($output)).Trim()
 }
 
+function Get-RequiredEnvironmentValue {
+    param([Parameter(Mandatory)][string]$Name)
+
+    foreach ($line in Get-Content -LiteralPath $envPath) {
+        $match = [regex]::Match($line, "^\s*$([regex]::Escape($Name))\s*=\s*(.*?)\s*$")
+        if ($match.Success) {
+            $value = $match.Groups[1].Value
+            if ([string]::IsNullOrWhiteSpace($value)) {
+                break
+            }
+            return $value
+        }
+    }
+    throw "Required development environment setting is missing: $Name"
+}
+
 function Invoke-PostgresScalar {
     param([Parameter(Mandatory)][string]$Sql)
 
     $arguments = @(
         'compose', '--env-file', $envPath, '-p', $projectName,
-        '-f', $composePath, 'exec', '-T', 'postgres',
-        'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-U', 'tmdb_owner',
-        '-d', 'tmdb', '-Atc', $Sql
+        '-f', $composePath, 'exec', '-T', '-e', "PGPASSWORD=$databasePassword", 'postgres',
+        'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-U', $databaseUser,
+        '-d', $databaseName, '-Atc', $Sql
     )
     return Invoke-DockerChecked -Arguments $arguments
 }
@@ -106,9 +122,9 @@ function Assert-DockerRuntime {
         '-f', $composePath, 'config', '--format', 'json'
     )
     $renderedHealthcheck = ($renderedComposeJson | ConvertFrom-Json).services.postgres.healthcheck
-    $expectedHealthcheckCommand = 'CMD|pg_isready|-U|tmdb_owner|-d|tmdb|-t|1'
+    $expectedRenderedHealthcheckCommand = 'CMD-SHELL|pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -h 127.0.0.1 -t 1'
     Assert-Exact 'rendered_healthcheck_command' `
-        (@($renderedHealthcheck.test) -join '|') $expectedHealthcheckCommand
+        (@($renderedHealthcheck.test) -join '|') $expectedRenderedHealthcheckCommand
     Assert-Exact 'rendered_healthcheck_timing' `
         "$($renderedHealthcheck.interval)|$($renderedHealthcheck.timeout)|$($renderedHealthcheck.retries)" `
         '2s|3s|30'
@@ -117,8 +133,9 @@ function Assert-DockerRuntime {
         'container', 'inspect', '--format', '{{json .Config.Healthcheck}}', $containerName
     )
     $liveHealthcheck = $liveHealthcheckJson | ConvertFrom-Json
+    $expectedLiveHealthcheckCommand = 'CMD-SHELL|pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" -h 127.0.0.1 -t 1'
     Assert-Exact 'live_healthcheck_command' `
-        (@($liveHealthcheck.Test) -join '|') $expectedHealthcheckCommand
+        (@($liveHealthcheck.Test) -join '|') $expectedLiveHealthcheckCommand
     Assert-Exact 'live_healthcheck_timing' `
         "$($liveHealthcheck.Interval)|$($liveHealthcheck.Timeout)|$($liveHealthcheck.Retries)" `
         '2000000000|3000000000|30'
@@ -205,6 +222,16 @@ if (-not (Test-Path -LiteralPath $envPath -PathType Leaf)) {
     throw "Tracked development environment example is missing: $envPath"
 }
 
+$databaseName = Get-RequiredEnvironmentValue -Name 'POSTGRES_DB'
+$databaseUser = Get-RequiredEnvironmentValue -Name 'POSTGRES_USER'
+$databasePassword = Invoke-DockerChecked -Arguments @(
+    'compose', '--env-file', $envPath, '-p', $projectName,
+    '-f', $composePath, 'exec', '-T', 'postgres', 'printenv', 'POSTGRES_PASSWORD'
+)
+if ([string]::IsNullOrWhiteSpace($databasePassword)) {
+    throw 'PostgreSQL development password is unavailable.'
+}
+
 Assert-DockerRuntime
 
 $version = Invoke-PostgresScalar 'SHOW server_version'
@@ -247,13 +274,13 @@ $expectedRoles = @(
     'monitor|true|false|false|false|false|false|false|true'
 ) -join "`n"
 Assert-Exact 'role_attributes_and_scram' (Invoke-PostgresScalar $rolesSql) $expectedRoles
-Assert-Exact 'owner_scram' (Invoke-PostgresScalar "SELECT (rolpassword LIKE 'SCRAM-SHA-256`$%')::text FROM pg_authid WHERE rolname = 'tmdb_owner'") 'true'
+Assert-Exact 'owner_scram' (Invoke-PostgresScalar "SELECT (rolpassword LIKE 'SCRAM-SHA-256`$%')::text FROM pg_authid WHERE rolname = current_user") 'true'
 Assert-Exact 'host_auth_methods' (Invoke-PostgresScalar "SELECT string_agg(DISTINCT auth_method, ',' ORDER BY auth_method) FROM pg_hba_file_rules WHERE type IN ('host', 'hostssl', 'hostnossl') AND error IS NULL") 'scram-sha-256'
 
 $grantsSql = @"
 SELECT string_agg(
-    rolname || '|connect=' || has_database_privilege(rolname, 'tmdb', 'CONNECT')::text ||
-    '|create=' || has_database_privilege(rolname, 'tmdb', 'CREATE')::text ||
+    rolname || '|connect=' || has_database_privilege(rolname, current_database(), 'CONNECT')::text ||
+    '|create=' || has_database_privilege(rolname, current_database(), 'CREATE')::text ||
     '|public_create=' || has_schema_privilege(rolname, 'public', 'CREATE')::text,
     E'\n' ORDER BY rolname)
 FROM pg_roles
@@ -273,7 +300,7 @@ $publicConnectSql = @"
 SELECT coalesce(bool_or(grantee = 0 AND privilege_type = 'CONNECT'), false)::text
 FROM pg_database
 CROSS JOIN LATERAL aclexplode(COALESCE(datacl, acldefault('d', datdba)))
-WHERE datname = 'tmdb'
+WHERE datname = current_database()
 "@
 Assert-Exact 'public_connect_grant' (Invoke-PostgresScalar $publicConnectSql) 'false'
 
@@ -281,7 +308,7 @@ $databaseAclRegressionSql = @"
 WITH database_acl AS (
     SELECT datacl, datdba
     FROM pg_database
-    WHERE datname = 'tmdb'
+    WHERE datname = current_database()
 ), acl_cases(case_name, case_acl, owner_oid) AS (
     SELECT 'null_default', NULL::aclitem[], datdba FROM database_acl
     UNION ALL

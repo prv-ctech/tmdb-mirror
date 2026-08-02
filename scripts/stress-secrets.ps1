@@ -76,3 +76,42 @@ function Resolve-StressSecret {
     }
     return $null
 }
+
+function Read-StressDatabaseIdentity {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Stress runtime environment is missing: $Path"
+    }
+
+    $entries = @{}
+    $lineNumber = 0
+    foreach ($line in [IO.File]::ReadLines($Path, [Text.UTF8Encoding]::new($false))) {
+        $lineNumber++
+        $match = [regex]::Match($line, '^\s*(POSTGRES_DB|POSTGRES_USER)\s*=\s*(.*?)\s*$')
+        if (-not $match.Success) {
+            continue
+        }
+        $name = $match.Groups[1].Value
+        $value = $match.Groups[2].Value
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            throw "Stress runtime database setting is empty at line $lineNumber."
+        }
+        if ($entries.ContainsKey($name)) {
+            throw "Duplicate stress runtime database setting at line $lineNumber."
+        }
+        $entries[$name] = $value
+    }
+
+    foreach ($name in @('POSTGRES_DB', 'POSTGRES_USER')) {
+        if (-not $entries.ContainsKey($name)) {
+            throw "Stress runtime environment is missing $name."
+        }
+    }
+
+    return [pscustomobject]@{
+        Database = [string]$entries['POSTGRES_DB']
+        Username = [string]$entries['POSTGRES_USER']
+    }
+}

@@ -1745,14 +1745,11 @@ async fn anime_images(
     RawQuery(query): RawQuery,
     request_id: Option<Extension<RequestId>>,
 ) -> Response {
-    let media_type = match MediaType::from_str(&raw_media_type) {
-        Ok(media_type) => media_type,
-        Err(_) => {
-            return error_response(
-                CatalogApiError::InvalidQuery,
-                &request_id_string(request_id),
-            );
-        }
+    let Ok(media_type) = MediaType::from_str(&raw_media_type) else {
+        return error_response(
+            CatalogApiError::InvalidQuery,
+            &request_id_string(request_id),
+        );
     };
     scoped_resource(
         state,

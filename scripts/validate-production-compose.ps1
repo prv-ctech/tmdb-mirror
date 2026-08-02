@@ -14,7 +14,7 @@ if ([string]::IsNullOrWhiteSpace($EnvFile)) {
     $EnvFile = Join-Path $PSScriptRoot '..\.env'
 }
 if ([string]::IsNullOrWhiteSpace($ComposeFile)) {
-    $ComposeFile = Join-Path $PSScriptRoot '..\deploy\compose.compact.yaml'
+    $ComposeFile = Join-Path $PSScriptRoot '..\deploy\compose.production.yaml'
 }
 
 function Resolve-RequiredFile {
@@ -85,6 +85,12 @@ foreach ($legacy in @('pgbouncer:', 'image-server:', 'admin-migrate:', 'storage-
     if ($composeText -match "(?m)^\s{2}$([regex]::Escape($legacy))") {
         throw "Legacy extra service remains in the canonical Compose template: $legacy"
     }
+}
+if ($composeText -match 'pg_isready\s+-U\s+tmdb_owner|pg_isready\s+.*-d\s+tmdb') {
+    throw 'PostgreSQL health checks must use POSTGRES_USER and POSTGRES_DB from the shared environment file.'
+}
+if ($composeText -notmatch '\$\$POSTGRES_USER' -or $composeText -notmatch '\$\$POSTGRES_DB') {
+    throw 'PostgreSQL health checks must interpolate POSTGRES_USER and POSTGRES_DB inside the container.'
 }
 
 $temporaryOutput = [System.IO.Path]::GetTempFileName()

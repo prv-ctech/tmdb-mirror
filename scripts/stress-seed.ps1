@@ -8,6 +8,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $repoRoot 'scripts/stress-secrets.ps1')
 $composeFile = Join-Path $repoRoot 'deploy/compose.stress.yaml'
 $runtimeRoot = Join-Path (Join-Path $repoRoot '.stress-runtime') $ProjectName
 $envFile = Join-Path $runtimeRoot 'compose.env'
@@ -20,6 +21,7 @@ if (-not (Test-Path -LiteralPath $envFile -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $seedFile -PathType Leaf)) {
     throw "Seed SQL is missing: $seedFile"
 }
+$databaseIdentity = Read-StressDatabaseIdentity -Path $envFile
 
 $composeArgs = @('compose', '--env-file', $envFile, '--project-name', $ProjectName, '--file', $composeFile)
 $sql = [IO.File]::ReadAllText($seedFile, [Text.UTF8Encoding]::new($false))
@@ -31,7 +33,7 @@ $postgresPassword = ([string]::Join("`n", @($passwordOutput))).Trim()
 if ([string]::IsNullOrWhiteSpace($postgresPassword)) {
     throw 'Disposable database password is empty.'
 }
-$psqlArgs = $composeArgs + @('exec', '-T', '-e', "PGPASSWORD=$postgresPassword", 'postgres', 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '--username', 'tmdb_owner', '--dbname', 'tmdb', '--set', "seed_count=$Count", '--set', "seed_base=$baseId")
+$psqlArgs = $composeArgs + @('exec', '-T', '-e', "PGPASSWORD=$postgresPassword", 'postgres', 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '--username', $databaseIdentity.Username, '--dbname', $databaseIdentity.Database, '--set', "seed_count=$Count", '--set', "seed_base=$baseId")
 $containerId = ([string]::Join("`n", @(& docker @($composeArgs + @('ps', '-q', 'postgres'))))).Trim()
 if ([string]::IsNullOrWhiteSpace($containerId)) {
     throw 'Unable to resolve the disposable postgres container.'
@@ -53,7 +55,7 @@ if ($exitCode -ne 0) {
 }
 
 $verificationSql = 'SELECT json_build_object(''titles'', (SELECT count(*) FROM catalog.titles WHERE tmdb_id >= {0} + 1 AND tmdb_id < {0} + {1} + 1), ''anime'', (SELECT count(*) FROM catalog.titles WHERE is_anime AND tmdb_id >= {0} + 1 AND tmdb_id < {0} + {1} + 1), ''search_documents'', (SELECT count(*) FROM search.search_documents WHERE title_id IN (SELECT id FROM catalog.titles WHERE tmdb_id >= {0} + 1 AND tmdb_id < {0} + {1} + 1)))' -f $baseId, $Count
-$countOutput = & docker @($composeArgs + @('exec', '-T', '-e', "PGPASSWORD=$postgresPassword", 'postgres', 'psql', '-X', '-At', '--username', 'tmdb_owner', '--dbname', 'tmdb', '-c', $verificationSql)) 2>&1
+$countOutput = & docker @($composeArgs + @('exec', '-T', '-e', "PGPASSWORD=$postgresPassword", 'postgres', 'psql', '-X', '-At', '--username', $databaseIdentity.Username, '--dbname', $databaseIdentity.Database, '-c', $verificationSql)) 2>&1
 if ($LASTEXITCODE -ne 0) {
     throw "Seed verification failed.`n$([string]::Join("`n", @($countOutput)))"
 }

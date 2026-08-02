@@ -26,14 +26,14 @@ pub struct MigrationReport {
     pub applied: u64,
 }
 
-/// Verifies the configured migration role, then validates and applies all embedded migrations.
+/// Verifies the migration identity, then validates and applies all embedded migrations.
 ///
 /// # Errors
 ///
 /// Returns a sanitized role, query, or migration error. `SQLx` retains its advisory
 /// lock and checksum validation behavior.
-pub async fn migrate(pool: &PgPool) -> Result<MigrationReport, DbError> {
-    require_role(pool, "migrator").await?;
+pub async fn migrate(pool: &PgPool, database_owner: &str) -> Result<MigrationReport, DbError> {
+    require_role(pool, "migrator", database_owner).await?;
 
     let mut connection = pool.acquire().await.map_err(|_| DbError::Connection)?;
     connection.close_on_drop();
@@ -179,20 +179,24 @@ async fn reconcile_round_two_checksum(connection: &mut PgConnection) -> Result<(
     Ok(())
 }
 
-pub(crate) async fn require_role(pool: &PgPool, expected: &str) -> Result<(), DbError> {
+pub(crate) async fn require_role(
+    pool: &PgPool,
+    expected: &str,
+    database_owner: &str,
+) -> Result<(), DbError> {
     let current: String = sqlx::query_scalar("SELECT current_user")
         .fetch_one(pool)
         .await
         .map_err(|_| DbError::Query)?;
-    // The four-container deployment intentionally uses one shared database
-    // account from its single `.env` file. Keep the historical role-specific
-    // identities valid for existing databases and ACL tests, while allowing
-    // that shared account through the same guarded code paths.
-    if current == expected || current == "tmdb_owner" {
+    if role_is_allowed(&current, expected, database_owner) {
         Ok(())
     } else {
         Err(DbError::WrongRole)
     }
+}
+
+fn role_is_allowed(current_role: &str, expected_role: &str, database_owner: &str) -> bool {
+    current_role == expected_role || current_role == database_owner
 }
 
 async fn applied_count(connection: &mut PgConnection) -> Result<u64, DbError> {
@@ -208,4 +212,19 @@ async fn applied_count(connection: &mut PgConnection) -> Result<u64, DbError> {
         .await
         .map_err(|_| DbError::Query)?;
     u64::try_from(count).map_err(|_| DbError::Query)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::role_is_allowed;
+
+    #[test]
+    fn configured_database_owner_is_allowed_to_migrate() {
+        assert!(role_is_allowed("custom_owner", "migrator", "custom_owner"));
+    }
+
+    #[test]
+    fn unrelated_role_is_not_allowed_to_migrate() {
+        assert!(!role_is_allowed("api_reader", "migrator", "custom_owner"));
+    }
 }

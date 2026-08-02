@@ -19,6 +19,7 @@ $resultFile = Join-Path $resultRoot "trawl-$stamp.json"
 if (-not (Test-Path -LiteralPath $envFile -PathType Leaf)) {
     throw "Runtime environment is missing: $envFile. Run stress-bootstrap.ps1 first."
 }
+$databaseIdentity = Read-StressDatabaseIdentity -Path $envFile
 if ([string]::IsNullOrWhiteSpace($SecretsFile)) {
     $SecretsFile = Join-Path $repoRoot 'secrets.txt'
 }
@@ -73,7 +74,7 @@ try {
     }
     $sourceKey = Invoke-DockerChecked -Arguments ($composeArgs + @(
         'exec', '-T', '-e', "PGPASSWORD=$databasePassword", 'postgres', 'psql', '-X', '-At',
-        '--username', 'tmdb_owner', '--dbname', 'tmdb', '-c',
+        '--username', $databaseIdentity.Username, '--dbname', $databaseIdentity.Database, '-c',
         "SELECT source_key FROM assets.image_assets WHERE status = 'ready' AND source = 'tmdb' ORDER BY id LIMIT 1;"
     ))
     if ($sourceKey -notmatch '^/[A-Za-z0-9._-]+$') {

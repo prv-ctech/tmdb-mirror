@@ -77,19 +77,23 @@ pub trait ReadinessProbe: Send + Sync + 'static {
 #[derive(Clone, Debug)]
 pub struct DatabaseReadinessProbe {
     pool: sqlx::PgPool,
+    database_owner: String,
 }
 
 impl DatabaseReadinessProbe {
     #[must_use]
-    pub fn new(pool: sqlx::PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: sqlx::PgPool, database_owner: impl Into<String>) -> Self {
+        Self {
+            pool,
+            database_owner: database_owner.into(),
+        }
     }
 }
 
 #[async_trait]
 impl ReadinessProbe for DatabaseReadinessProbe {
     async fn check(&self) -> Result<ReadinessReport, ProbeError> {
-        tmdb_db::readiness(&self.pool)
+        tmdb_db::readiness(&self.pool, &self.database_owner)
             .await
             .map_err(ProbeError::from)
     }

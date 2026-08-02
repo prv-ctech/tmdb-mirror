@@ -80,12 +80,12 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Migrate => {
             let pool = connect_direct(&config, PoolPolicy::Migrator).await?;
-            let report = migrate(&pool).await?;
+            let report = migrate(&pool, &config.username).await?;
             println!("{}", serde_json::to_string(&report)?);
         }
         Command::Doctor { json: true } => {
             let pool = connect_direct(&config, PoolPolicy::ReadOnly).await?;
-            let report = doctor(&pool).await?;
+            let report = doctor(&pool, &config.username).await?;
             println!("{}", serde_json::to_string(&report)?);
         }
         Command::Doctor { json: false } => {
@@ -240,8 +240,8 @@ struct DoctorIdentity {
     readiness_select: bool,
 }
 
-async fn doctor(pool: &sqlx::PgPool) -> anyhow::Result<DoctorReport> {
-    let readiness_report = readiness(pool).await?;
+async fn doctor(pool: &sqlx::PgPool, database_owner: &str) -> anyhow::Result<DoctorReport> {
+    let readiness_report = readiness(pool, database_owner).await?;
     let current_user: String = sqlx::query_scalar("SELECT current_user")
         .fetch_one(pool)
         .await

@@ -10,6 +10,7 @@ Set-StrictMode -Version Latest
 Add-Type -AssemblyName System.Net.Http
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $repoRoot 'scripts/stress-secrets.ps1')
 $composeFile = Join-Path $repoRoot 'deploy/compose.stress.yaml'
 $runtimeRoot = Join-Path (Join-Path $repoRoot '.stress-runtime') $ProjectName
 $envFile = Join-Path $runtimeRoot 'compose.env'
@@ -20,6 +21,7 @@ $resultFile = Join-Path $resultRoot "media-assets-$stamp.json"
 if (-not (Test-Path -LiteralPath $envFile -PathType Leaf)) {
     throw "Runtime environment is missing: $envFile. Run stress-bootstrap.ps1 first."
 }
+$databaseIdentity = Read-StressDatabaseIdentity -Path $envFile
 New-Item -ItemType Directory -Force -Path $resultRoot | Out-Null
 
 $composeArgs = @('compose', '--env-file', $envFile, '--project-name', $ProjectName, '--file', $composeFile)
@@ -51,7 +53,7 @@ function Invoke-PostgresJson {
 
     $output = Invoke-DockerChecked -Arguments ($composeArgs + @(
         'exec', '-T', '-e', "PGPASSWORD=$Password", 'postgres', 'psql', '-X', '-At',
-        '--username', 'tmdb_owner', '--dbname', 'tmdb', '-c', $Sql
+        '--username', $databaseIdentity.Username, '--dbname', $databaseIdentity.Database, '-c', $Sql
     ))
     if ([string]::IsNullOrWhiteSpace($output)) {
         throw 'PostgreSQL returned no JSON during the media-asset verification.'

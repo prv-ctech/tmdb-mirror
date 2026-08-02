@@ -27,7 +27,10 @@ async fn main() -> anyhow::Result<()> {
 
     let metrics = Metrics::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"), "unknown");
     let state = ApiState::new(
-        Arc::new(DatabaseReadinessProbe::new(pool.clone())),
+        Arc::new(DatabaseReadinessProbe::new(
+            pool.clone(),
+            config.database.username.clone(),
+        )),
         metrics.clone(),
     );
     let catalog_router = tmdb_api::build_catalog_router_with_media(

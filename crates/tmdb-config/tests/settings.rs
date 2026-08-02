@@ -23,8 +23,8 @@ fn valid_entries(environment: &str) -> Vec<(OsString, OsString)> {
         ("TMDB_ENVIRONMENT", environment),
         ("TMDB_API_BIND", "127.0.0.1:8080"),
         ("TMDB_ADMIN_BIND", "127.0.0.1:8081"),
-        ("POSTGRES_DB", "tmdb"),
-        ("POSTGRES_USER", "tmdb_owner"),
+        ("POSTGRES_DB", "example_catalog"),
+        ("POSTGRES_USER", "example_owner"),
         ("POSTGRES_PASSWORD", DATABASE_PASSWORD),
         ("TMDB_TRAWL_BASE_URL", "http://trawl.internal:8080"),
         ("TMDB_API_KEY", ADMIN_API_KEY),
@@ -41,8 +41,8 @@ fn source_from_entries(entries: Vec<(OsString, OsString)>) -> MapSource {
 fn shared_database_entries(environment: &str) -> MapSource {
     MapSource::from([
         ("TMDB_ENVIRONMENT", environment),
-        ("POSTGRES_DB", "tmdb"),
-        ("POSTGRES_USER", "tmdb_owner"),
+        ("POSTGRES_DB", "example_catalog"),
+        ("POSTGRES_USER", "example_owner"),
         ("POSTGRES_PASSWORD", "shared-database-password"),
     ])
 }
@@ -50,8 +50,8 @@ fn shared_database_entries(environment: &str) -> MapSource {
 fn postgres_database_entries(environment: &str) -> Vec<(OsString, OsString)> {
     [
         ("TMDB_ENVIRONMENT", environment),
-        ("POSTGRES_DB", "tmdb"),
-        ("POSTGRES_USER", "tmdb_owner"),
+        ("POSTGRES_DB", "example_catalog"),
+        ("POSTGRES_USER", "example_owner"),
         ("POSTGRES_PASSWORD", "shared-database-password"),
     ]
     .into_iter()
@@ -240,14 +240,14 @@ fn app_config_parses_typed_settings_and_redacts_secrets() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn postgres_database_settings_use_one_password() -> Result<(), Box<dyn std::error::Error>> {
+fn postgres_settings_accept_custom_identity() -> Result<(), Box<dyn std::error::Error>> {
     let source = shared_database_entries("production");
     let config = load_shared_database(&source, Environment::Production)?;
 
     assert_eq!(config.host, "postgres");
     assert_eq!(config.port, 5432);
-    assert_eq!(config.database, "tmdb");
-    assert_eq!(config.username, "tmdb_owner");
+    assert_eq!(config.database, "example_catalog");
+    assert_eq!(config.username, "example_owner");
     assert_eq!(config.password.expose_secret(), "shared-database-password");
     Ok(())
 }

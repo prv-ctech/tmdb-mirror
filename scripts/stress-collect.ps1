@@ -7,6 +7,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $repoRoot 'scripts/stress-secrets.ps1')
 $composeFile = Join-Path $repoRoot 'deploy/compose.stress.yaml'
 $runtimeRoot = Join-Path (Join-Path $repoRoot '.stress-runtime') $ProjectName
 $envFile = Join-Path $runtimeRoot 'compose.env'
@@ -18,6 +19,7 @@ $composeArgs = @('compose', '--env-file', $envFile, '--project-name', $ProjectNa
 if (-not (Test-Path -LiteralPath $envFile -PathType Leaf)) {
     throw "Runtime environment is missing: $envFile"
 }
+$databaseIdentity = Read-StressDatabaseIdentity -Path $envFile
 
 function Invoke-External {
     param([Parameter(Mandatory)][string[]]$Arguments)
@@ -59,7 +61,7 @@ $postgresPassword = ([string]::Join("`n", @($passwordOutput))).Trim()
 if ([string]::IsNullOrWhiteSpace($postgresPassword)) {
     throw 'Disposable database password is empty.'
 }
-$dbStats = $statsSql | & docker @($composeArgs + @('exec', '-T', '-e', "PGPASSWORD=$postgresPassword", 'postgres', 'psql', '-X', '-At', '--username', 'tmdb_owner', '--dbname', 'tmdb')) 2>&1
+$dbStats = $statsSql | & docker @($composeArgs + @('exec', '-T', '-e', "PGPASSWORD=$postgresPassword", 'postgres', 'psql', '-X', '-At', '--username', $databaseIdentity.Username, '--dbname', $databaseIdentity.Database)) 2>&1
 if ($LASTEXITCODE -ne 0) {
     throw "Database statistics query failed.`n$([string]::Join("`n", @($dbStats)))"
 }

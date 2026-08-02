@@ -53,7 +53,10 @@ the admin API key. Edit the host side of the PostgreSQL, `/config`, and `/media`
 bind mounts in `docker-compose-example.yaml`; the paths on the right are fixed
 inside the containers.
 
-The production template uses the same four services and fixed paths:
+`POSTGRES_DB` and `POSTGRES_USER` are your names to choose. The stack reads
+them directly from `.env`; do not add duplicate `DATABASE_*` settings.
+
+The production template is also a full four-service file (not an include):
 
 ```powershell
 docker compose -f deploy/compose.production.yaml up -d --build

@@ -7,6 +7,7 @@ use tmdb_db::{DbError, MIGRATOR, PoolPolicy, connect_direct, migrate, readiness}
 use tokio::sync::Barrier;
 
 const SCHEMAS: [&str; 6] = ["assets", "auth", "catalog", "ops", "search", "source"];
+const TEST_SHARED_DATABASE_OWNER: &str = "test_shared_database_owner";
 
 #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
 async fn foundation_migration_installs_owned_schemas_and_bookkeeping(
@@ -522,7 +523,9 @@ async fn readiness_is_sanitized_read_only_and_requires_api_reader(
         .fetch_one(&owner_pool)
         .await?;
     let reader = role_pool(&database, "api_reader", PoolPolicy::ReadOnly).await?;
-    let report = readiness(&reader).await.map_err(db_error)?;
+    let report = readiness(&reader, TEST_SHARED_DATABASE_OWNER)
+        .await
+        .map_err(db_error)?;
     assert_eq!(report.postgres_major, 18);
     assert_eq!(report.schema_revision, "0015");
     assert_eq!(
@@ -537,7 +540,7 @@ async fn readiness_is_sanitized_read_only_and_requires_api_reader(
         assert!(!rendered.contains(forbidden));
     }
 
-    let Err(wrong_role) = readiness(&owner_pool).await else {
+    let Err(wrong_role) = readiness(&owner_pool, TEST_SHARED_DATABASE_OWNER).await else {
         return Err(test_error("readiness accepted a non-api_reader session"));
     };
     assert!(!format!("{wrong_role:?}").contains("postgres://"));
@@ -917,7 +920,10 @@ async fn representative_version_one_database_upgrades_through_two_three_and_four
     install_required_extensions(&owner_pool).await?;
     let reader = role_pool(&database, "api_reader", PoolPolicy::ReadOnly).await?;
     assert_eq!(
-        readiness(&reader).await.map_err(db_error)?.schema_revision,
+        readiness(&reader, TEST_SHARED_DATABASE_OWNER)
+            .await
+            .map_err(db_error)?
+            .schema_revision,
         "0015"
     );
     Ok(())
@@ -1072,7 +1078,9 @@ async fn round_one_three_database_is_repaired_by_four(owner_pool: PgPool) -> sql
         .fetch_one(&owner_pool)
         .await?;
     let migrator_pool = role_pool(&database, "migrator", PoolPolicy::Migrator).await?;
-    let report = migrate(&migrator_pool).await.map_err(db_error)?;
+    let report = migrate(&migrator_pool, TEST_SHARED_DATABASE_OWNER)
+        .await
+        .map_err(db_error)?;
     assert_eq!(report.applied, 16);
 
     let versions: Vec<i64> = sqlx::query_scalar(
@@ -1299,9 +1307,21 @@ async fn actual_migrator_applies_once_then_preserves_snapshot(
         .await?;
     let migrator_pool = role_pool(&database, "migrator", PoolPolicy::Migrator).await?;
 
-    assert_eq!(migrate(&migrator_pool).await.map_err(db_error)?.applied, 19);
+    assert_eq!(
+        migrate(&migrator_pool, TEST_SHARED_DATABASE_OWNER)
+            .await
+            .map_err(db_error)?
+            .applied,
+        19
+    );
     let first = foundation_snapshot(&migrator_pool).await?;
-    assert_eq!(migrate(&migrator_pool).await.map_err(db_error)?.applied, 0);
+    assert_eq!(
+        migrate(&migrator_pool, TEST_SHARED_DATABASE_OWNER)
+            .await
+            .map_err(db_error)?
+            .applied,
+        0
+    );
     let second = foundation_snapshot(&migrator_pool).await?;
     if second != first {
         let only_second: Vec<&String> =
@@ -1322,7 +1342,13 @@ async fn actual_migrator_applies_once_then_preserves_snapshot(
     )
     .execute(&owner_pool)
     .await?;
-    assert_eq!(migrate(&migrator_pool).await.map_err(db_error)?.applied, 0);
+    assert_eq!(
+        migrate(&migrator_pool, TEST_SHARED_DATABASE_OWNER)
+            .await
+            .map_err(db_error)?
+            .applied,
+        0
+    );
     let repaired = foundation_snapshot(&migrator_pool).await?;
     assert_eq!(repaired, first);
     assert!(first.iter().any(|line| line.starts_with("migration|1|")));
@@ -1386,11 +1412,11 @@ async fn concurrent_actual_migrators_report_exactly_one_application(
 
     let first = async {
         first_barrier.wait().await;
-        migrate(&first_pool).await
+        migrate(&first_pool, TEST_SHARED_DATABASE_OWNER).await
     };
     let second = async {
         second_barrier.wait().await;
-        migrate(&second_pool).await
+        migrate(&second_pool, TEST_SHARED_DATABASE_OWNER).await
     };
     let release = async { barrier.wait().await };
     let (first, second, _) = tokio::join!(first, second, release);
@@ -1421,7 +1447,7 @@ async fn migration_runner_rejects_every_role_other_than_migrator(
         "monitor",
     ] {
         let pool = role_pool(&database, role, PoolPolicy::ReadWrite).await?;
-        let Err(error) = migrate(&pool).await else {
+        let Err(error) = migrate(&pool, TEST_SHARED_DATABASE_OWNER).await else {
             return Err(test_error("migration accepted a non-migrator role"));
         };
         let debug = format!("{error:?}");
@@ -1580,7 +1606,7 @@ async fn assert_readiness_drift(owner_pool: &PgPool) -> sqlx::Result<()> {
         .fetch_one(owner_pool)
         .await?;
     let reader = role_pool(&database, "api_reader", PoolPolicy::ReadOnly).await?;
-    let result = readiness(&reader).await;
+    let result = readiness(&reader, TEST_SHARED_DATABASE_OWNER).await;
     reader.close().await;
     assert_eq!(result, Err(DbError::Unready));
     Ok(())

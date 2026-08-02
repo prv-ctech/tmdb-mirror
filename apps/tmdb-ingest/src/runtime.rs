@@ -83,7 +83,7 @@ pub async fn run_worker() -> anyhow::Result<()> {
         .await
         .map_err(|error| anyhow::anyhow!(error))
         .context("connect migration database")?;
-    migrate(&migration_pool)
+    migrate(&migration_pool, &migrator.username)
         .await
         .map_err(|error| anyhow::anyhow!(error))
         .context("apply database migrations")?;

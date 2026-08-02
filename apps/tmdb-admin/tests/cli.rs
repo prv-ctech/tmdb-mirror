@@ -18,8 +18,8 @@ fn doctor_requires_json_output_flag() -> Result<(), Box<dyn std::error::Error>> 
     let output = Command::new(env!("CARGO_BIN_EXE_tmdb-admin"))
         .arg("doctor")
         .env("TMDB_ENVIRONMENT", "development")
-        .env("POSTGRES_DB", "tmdb")
-        .env("POSTGRES_USER", "tmdb_owner")
+        .env("POSTGRES_DB", "example_catalog")
+        .env("POSTGRES_USER", "example_owner")
         .env("POSTGRES_PASSWORD", "test-only-not-read")
         .output()?;
     assert!(!output.status.success());
@@ -33,8 +33,8 @@ fn legacy_database_cli_options_are_rejected() -> Result<(), Box<dyn std::error::
     let output = Command::new(env!("CARGO_BIN_EXE_tmdb-admin"))
         .args(["--host", "127.0.0.1", "doctor"])
         .env("TMDB_ENVIRONMENT", "development")
-        .env("POSTGRES_DB", "tmdb")
-        .env("POSTGRES_USER", "tmdb_owner")
+        .env("POSTGRES_DB", "example_catalog")
+        .env("POSTGRES_USER", "example_owner")
         .env("POSTGRES_PASSWORD", "test-only-not-read")
         .output()?;
     assert!(!output.status.success());

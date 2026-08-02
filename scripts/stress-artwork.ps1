@@ -25,6 +25,7 @@ $imageBaseUrl = "http://127.0.0.1:$ImagePort"
 if (-not (Test-Path -LiteralPath $envFile -PathType Leaf)) {
     throw "Runtime environment is missing: $envFile. Run stress-bootstrap.ps1 first."
 }
+$databaseIdentity = Read-StressDatabaseIdentity -Path $envFile
 if ([string]::IsNullOrWhiteSpace($SecretsFile)) {
     $SecretsFile = Join-Path $repoRoot 'secrets.txt'
 }
@@ -68,7 +69,7 @@ function Invoke-PostgresJson {
 
     $output = Invoke-DockerChecked -Arguments ($composeArgs + @(
         'exec', '-T', '-e', "PGPASSWORD=$Password", 'postgres', 'psql', '-X', '-At',
-        '--username', 'tmdb_owner', '--dbname', 'tmdb', '-c', $Sql
+        '--username', $databaseIdentity.Username, '--dbname', $databaseIdentity.Database, '-c', $Sql
     ))
     if ([string]::IsNullOrWhiteSpace($output)) {
         throw 'PostgreSQL returned no JSON during the real-artwork stress check.'

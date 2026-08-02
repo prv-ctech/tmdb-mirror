@@ -11,7 +11,7 @@ services:
       - tmdb_pg18_data:/var/lib/postgresql
       - ../infra/postgres/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: [CMD, pg_isready, -U, tmdb_owner, -d, tmdb, -t, '1']
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -h 127.0.0.1 -t 1']
       interval: 2s
       timeout: 3s
       retries: 30

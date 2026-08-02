@@ -15,6 +15,10 @@ Unraid/Compose.
 Host ports default to `55433` (PostgreSQL), `18080` (API), `18081` (admin), and
 `18090` (media), all bound to loopback.
 
+The disposable harness deliberately uses `tmdb_stress_catalog` and
+`tmdb_stress_owner`, proving that the stack does not require fixed database or
+owner names.
+
 ## Start
 
 Run from the repository root in PowerShell. Copy `secrets.txt.example` to the

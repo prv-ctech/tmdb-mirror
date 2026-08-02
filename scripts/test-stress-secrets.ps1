@@ -39,6 +39,18 @@ try {
         -Actual (Resolve-StressSecret -Secrets $secrets -Name 'TMDB_STRESS_READ_TOKEN' -ExplicitValue 'direct-token') `
         -Expected 'direct-token'
 
+    [IO.File]::WriteAllLines(
+        $temporary,
+        @(
+            'POSTGRES_DB=custom_catalog',
+            'POSTGRES_USER=custom_owner'
+        ),
+        [Text.UTF8Encoding]::new($false)
+    )
+    $identity = Read-StressDatabaseIdentity -Path $temporary
+    Assert-Equal -Name 'custom stress database name' -Actual $identity.Database -Expected 'custom_catalog'
+    Assert-Equal -Name 'custom stress database user' -Actual $identity.Username -Expected 'custom_owner'
+
     [IO.File]::WriteAllText(
         $temporary,
         'TMDB_STRESS_READ_TOKEN="quoted-value"',

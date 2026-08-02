@@ -27,8 +27,8 @@ pub struct ReadinessReport {
 /// # Errors
 ///
 /// Returns a sanitized error when any readiness invariant is not met.
-pub async fn readiness(pool: &PgPool) -> Result<ReadinessReport, DbError> {
-    require_role(pool, "api_reader").await?;
+pub async fn readiness(pool: &PgPool, database_owner: &str) -> Result<ReadinessReport, DbError> {
+    require_role(pool, "api_reader", database_owner).await?;
 
     let mut transaction = pool.begin().await.map_err(|_| DbError::Query)?;
     let read_only: String = sqlx::query_scalar("SHOW transaction_read_only")

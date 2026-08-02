@@ -1,7 +1,7 @@
 # Four-container deployment
 
-`deploy/compose.production.yaml` includes the canonical
-`deploy/compose.compact.yaml`. The stack is deliberately only four services:
+`deploy/compose.production.yaml` is the complete canonical Compose file. The
+stack is deliberately only four services:
 
 1. PostgreSQL 18, including `pg_trgm`, `unaccent`, and `pg_stat_statements`.
 2. API, with catalog/anime/search/admin routes and bounded read connections.
@@ -54,13 +54,15 @@ Each key has an inline description in `.env.example`. The public, admin, and
 media routes are listed in [api.md](api.md).
 
 The app reads only `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` for
-its database identity. Its database connection is fixed to the internal
+its database identity. You may choose any valid database and owner names; the
+bootstrap script, workers, API readiness check, and PostgreSQL health check
+all use those same values. Its database connection is fixed to the internal
 Compose service `postgres:5432`; do not add `DATABASE_*`, `TMDB_DB_*`, or
 per-process database aliases.
 
 ```powershell
 Copy-Item .env.example .env
-./scripts/validate-production-compose.ps1 -EnvFile .env -ComposeFile deploy/compose.compact.yaml
+./scripts/validate-production-compose.ps1 -EnvFile .env -ComposeFile deploy/compose.production.yaml
 docker compose -f deploy/compose.production.yaml up -d --build
 ```
 
