@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -7,7 +8,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tmdb_domain::MediaType;
-use tmdb_jobs::{ClaimedJob, JobExecutionError, JobExecutor, JobRepository, NewJob};
+use tmdb_jobs::{ClaimedJob, JobError, JobExecutionError, JobExecutor, JobRepository, NewJob};
 use tmdb_upstream::{
     DailyExportParser, MAX_DAILY_EXPORT_BYTES, TmdbClient, TmdbClientError, TmdbKeyword,
 };
@@ -34,6 +35,7 @@ const INGEST_JOB_TYPES: &[&str] = &[
     CHANGES_SYNC_JOB,
     DAILY_EXPORT_JOB,
 ];
+const DAILY_EXPORT_REFRESH_PRIORITY: i16 = -100;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -323,8 +325,15 @@ impl JobExecutor for IngestExecutor {
                     .fetch_changes(media_type, page)
                     .await
                     .map_err(|error| map_upstream_error(&error))?;
-                if let Some(database) = &self.database {
+                let changed_ids: Vec<u64> = change_page
+                    .results
+                    .iter()
+                    .map(|changed| changed.id)
+                    .collect();
+                let detail_refresh_candidates = if let Some(database) = &self.database {
                     catalog_write::persist_changes(database, media_type, &change_page).await?;
+                    let detail_refresh_candidates =
+                        enqueue_refresh_jobs(database, media_type, &changed_ids).await?;
                     if change_page.total_pages > page {
                         let next_page = page.saturating_add(1);
                         let next_job = NewJob::new(
@@ -347,12 +356,16 @@ impl JobExecutor for IngestExecutor {
                                 )
                             })?;
                     }
-                }
+                    detail_refresh_candidates
+                } else {
+                    0
+                };
                 Ok(serde_json::json!({
                     "media_type": media_type,
                     "page": change_page.page,
                     "total_pages": change_page.total_pages,
                     "changed_ids": change_page.results.len(),
+                    "detail_refresh_candidates": detail_refresh_candidates,
                     "next_page_queued": change_page.total_pages > page,
                     "dedup_key": dedup_key
                 }))
@@ -398,16 +411,32 @@ impl JobExecutor for IngestExecutor {
                     .fetch_daily_export_to_file(&url, &destination, self.export_max_bytes)
                     .await
                     .map_err(|error| map_upstream_error(&error))?;
-                let parser = self.export_parser;
-                let records = tokio::task::spawn_blocking(move || parser.count_file(&destination))
-                    .await
-                    .map_err(|_| {
-                        JobExecutionError::retry("export_storage", Duration::from_secs(30))
-                    })?
-                    .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+                let queue_summary = if let Some(database) = &self.database {
+                    enqueue_daily_export_refresh_jobs(
+                        database,
+                        media_type,
+                        self.export_parser,
+                        destination,
+                    )
+                    .await?
+                } else {
+                    let parser = self.export_parser;
+                    let records =
+                        tokio::task::spawn_blocking(move || parser.count_file(&destination))
+                            .await
+                            .map_err(|_| {
+                                JobExecutionError::retry("export_storage", Duration::from_secs(30))
+                            })?
+                            .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+                    ExportQueueSummary {
+                        records,
+                        detail_refresh_candidates: 0,
+                    }
+                };
                 Ok(serde_json::json!({
                     "media_type": media_type,
-                    "records": records,
+                    "records": queue_summary.records,
+                    "detail_refresh_candidates": queue_summary.detail_refresh_candidates,
                     "dedup_key": dedup_key,
                     "bytes": download.bytes,
                     "sha256": hex_digest(&download.sha256)
@@ -495,6 +524,9 @@ fn map_upstream_error(error: &TmdbClientError) -> JobExecutionError {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+    use sqlx::PgPool;
+
     use super::*;
 
     #[test]
@@ -609,5 +641,318 @@ mod tests {
             id: 42,
             name: Some("animation".to_owned()),
         }]));
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn changed_ids_enqueue_idempotent_detail_refresh_jobs(pool: PgPool) -> sqlx::Result<()> {
+        enqueue_refresh_jobs(&pool, MediaType::Movie, &[42, 42, 43])
+            .await
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+
+        let rows: Vec<(String, Value, String, i16)> = sqlx::query_as(
+            "SELECT job_type, payload, dedup_key, priority
+               FROM ops.jobs
+              WHERE job_type = 'ingest.refresh_movie'
+              ORDER BY dedup_key",
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, REFRESH_MOVIE_JOB);
+        assert_eq!(rows[0].1["tmdb_id"], 42);
+        assert_eq!(rows[0].2, "ingest.refresh_movie:42");
+        assert_eq!(rows[1].1["tmdb_id"], 43);
+        assert_eq!(rows[1].2, "ingest.refresh_movie:43");
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn daily_export_enqueues_detail_refresh_jobs(pool: PgPool) -> sqlx::Result<()> {
+        let export = tempfile::NamedTempFile::new()?;
+        std::fs::write(
+            export.path(),
+            concat!(
+                "{\"id\":51,\"adult\":false,\"video\":false}\n",
+                "{\"id\":52,\"adult\":false,\"video\":false}\n",
+                "{\"id\":51,\"adult\":false,\"video\":false}\n"
+            ),
+        )?;
+
+        let summary = enqueue_daily_export_refresh_jobs(
+            &pool,
+            MediaType::Movie,
+            DailyExportParser::default(),
+            export.path().to_path_buf(),
+        )
+        .await
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+
+        assert_eq!(summary.records, 3);
+        assert_eq!(summary.detail_refresh_candidates, 2);
+        let rows: Vec<(String, Value, String, i16)> = sqlx::query_as(
+            "SELECT job_type, payload, dedup_key, priority
+               FROM ops.jobs
+              WHERE job_type = 'ingest.refresh_movie'
+              ORDER BY dedup_key",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1["tmdb_id"], 51);
+        assert_eq!(rows[1].1["tmdb_id"], 52);
+        assert_eq!(rows[0].3, DAILY_EXPORT_REFRESH_PRIORITY);
+        assert_eq!(rows[1].3, DAILY_EXPORT_REFRESH_PRIORITY);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn daily_export_does_not_requeue_loaded_catalog_titles(pool: PgPool) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO catalog.titles (media_type, tmdb_id, display_title)
+             VALUES ('movie', 51, 'Already loaded')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO catalog.movie_details (title_id)
+             SELECT id
+               FROM catalog.titles
+              WHERE media_type = 'movie' AND tmdb_id = 51",
+        )
+        .execute(&pool)
+        .await?;
+        let export = tempfile::NamedTempFile::new()?;
+        std::fs::write(
+            export.path(),
+            concat!(
+                "{\"id\":51,\"adult\":false,\"video\":false}\n",
+                "{\"id\":52,\"adult\":false,\"video\":false}\n"
+            ),
+        )?;
+
+        let summary = enqueue_daily_export_refresh_jobs(
+            &pool,
+            MediaType::Movie,
+            DailyExportParser::default(),
+            export.path().to_path_buf(),
+        )
+        .await
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+
+        assert_eq!(summary.records, 2);
+        assert_eq!(summary.detail_refresh_candidates, 1);
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT (payload ->> 'tmdb_id')::bigint
+               FROM ops.jobs
+              WHERE job_type = 'ingest.refresh_movie'
+              ORDER BY 1",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(ids, [52]);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExportQueueSummary {
+    records: usize,
+    detail_refresh_candidates: usize,
+}
+
+async fn enqueue_refresh_jobs(
+    pool: &PgPool,
+    media_type: MediaType,
+    tmdb_ids: &[u64],
+) -> Result<usize, JobExecutionError> {
+    enqueue_refresh_jobs_with_priority(pool, media_type, tmdb_ids, 0).await
+}
+
+async fn enqueue_refresh_jobs_with_priority(
+    pool: &PgPool,
+    media_type: MediaType,
+    tmdb_ids: &[u64],
+    priority: i16,
+) -> Result<usize, JobExecutionError> {
+    const SUBMISSION_BATCH_SIZE: usize = 500;
+
+    let repository = JobRepository::new(pool.clone());
+    let mut submitted = 0_usize;
+    for ids in tmdb_ids.chunks(SUBMISSION_BATCH_SIZE) {
+        let jobs = ids
+            .iter()
+            .copied()
+            .map(|tmdb_id| refresh_job(media_type, tmdb_id, priority))
+            .collect::<Result<Vec<_>, _>>()?;
+        let outcomes = repository
+            .submit_many(&jobs)
+            .await
+            .map_err(map_submission_error)?;
+        submitted = submitted.saturating_add(
+            outcomes
+                .iter()
+                .filter(|outcome| !outcome.was_duplicate())
+                .count(),
+        );
+    }
+    Ok(submitted)
+}
+
+async fn enqueue_missing_refresh_jobs(
+    pool: &PgPool,
+    media_type: MediaType,
+    tmdb_ids: &[u64],
+) -> Result<usize, JobExecutionError> {
+    let validated_ids = tmdb_ids
+        .iter()
+        .copied()
+        .map(validate_refresh_tmdb_id)
+        .collect::<Result<Vec<_>, _>>()?;
+    let catalogued_ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT title.tmdb_id
+           FROM catalog.titles AS title
+          WHERE title.media_type = $1
+            AND title.tmdb_id = ANY($2)
+            AND (
+                ($1 = 'movie' AND EXISTS (
+                    SELECT 1
+                      FROM catalog.movie_details AS detail
+                     WHERE detail.title_id = title.id
+                ))
+                OR ($1 = 'tv' AND EXISTS (
+                    SELECT 1
+                      FROM catalog.tv_details AS detail
+                     WHERE detail.title_id = title.id
+                ))
+            )",
+    )
+    .bind(media_type.to_string())
+    .bind(
+        validated_ids
+            .iter()
+            .map(|tmdb_id| i64::from(*tmdb_id))
+            .collect::<Vec<_>>(),
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    let catalogued_ids = catalogued_ids.into_iter().collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let missing = validated_ids
+        .into_iter()
+        .filter(|tmdb_id| seen.insert(*tmdb_id) && !catalogued_ids.contains(&i64::from(*tmdb_id)))
+        .map(u64::from)
+        .collect::<Vec<_>>();
+    enqueue_refresh_jobs_with_priority(pool, media_type, &missing, DAILY_EXPORT_REFRESH_PRIORITY)
+        .await
+}
+
+async fn enqueue_daily_export_refresh_jobs(
+    pool: &PgPool,
+    media_type: MediaType,
+    parser: DailyExportParser,
+    path: PathBuf,
+) -> Result<ExportQueueSummary, JobExecutionError> {
+    const SUBMISSION_BATCH_SIZE: usize = 500;
+    const CHANNEL_CAPACITY: usize = 2;
+
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u64>>(CHANNEL_CAPACITY);
+    let parser_task = tokio::task::spawn_blocking(move || {
+        let mut sender = Some(sender);
+        let mut batch = Vec::with_capacity(SUBMISSION_BATCH_SIZE);
+        let result = parser.scan_file(path, |record| {
+            if sender.is_none() {
+                return;
+            }
+            batch.push(record.id);
+            if batch.len() == SUBMISSION_BATCH_SIZE {
+                let next = std::mem::replace(&mut batch, Vec::with_capacity(SUBMISSION_BATCH_SIZE));
+                if sender
+                    .as_ref()
+                    .is_some_and(|sender| sender.blocking_send(next).is_err())
+                {
+                    sender = None;
+                }
+            }
+        });
+        if !batch.is_empty()
+            && let Some(sender) = sender
+        {
+            let _ = sender.blocking_send(batch);
+        }
+        result
+    });
+
+    let mut received_records = 0_usize;
+    let mut detail_refresh_candidates = 0_usize;
+    let mut submission_error = None;
+    while let Some(ids) = receiver.recv().await {
+        received_records = received_records.saturating_add(ids.len());
+        match enqueue_missing_refresh_jobs(pool, media_type, &ids).await {
+            Ok(submitted) => {
+                detail_refresh_candidates = detail_refresh_candidates.saturating_add(submitted);
+            }
+            Err(error) => {
+                submission_error = Some(error);
+                receiver.close();
+                break;
+            }
+        }
+    }
+    drop(receiver);
+
+    let parsed_records = parser_task
+        .await
+        .map_err(|_| JobExecutionError::retry("export_storage", Duration::from_secs(30)))?
+        .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+    if let Some(error) = submission_error {
+        return Err(error);
+    }
+    if parsed_records != received_records {
+        return Err(JobExecutionError::retry(
+            "export_queue_incomplete",
+            Duration::from_secs(5),
+        ));
+    }
+    Ok(ExportQueueSummary {
+        records: received_records,
+        detail_refresh_candidates,
+    })
+}
+
+fn refresh_job(
+    media_type: MediaType,
+    tmdb_id: u64,
+    priority: i16,
+) -> Result<NewJob, JobExecutionError> {
+    let tmdb_id = validate_refresh_tmdb_id(tmdb_id)?;
+    let job_type = match media_type {
+        MediaType::Movie => REFRESH_MOVIE_JOB,
+        MediaType::Tv => REFRESH_TV_JOB,
+    };
+    NewJob::new(
+        job_type,
+        INGEST_PAYLOAD_VERSION,
+        serde_json::json!({"tmdb_id": tmdb_id}),
+        &format!("{job_type}:{tmdb_id}"),
+    )
+    .and_then(|job| job.with_priority(priority))
+    .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))
+}
+
+fn validate_refresh_tmdb_id(tmdb_id: u64) -> Result<u32, JobExecutionError> {
+    u32::try_from(tmdb_id)
+        .ok()
+        .filter(|tmdb_id| *tmdb_id > 0)
+        .ok_or_else(|| JobExecutionError::dead_letter("invalid_payload"))
+}
+
+fn map_submission_error(error: JobError) -> JobExecutionError {
+    match error {
+        JobError::Validation(_) => JobExecutionError::dead_letter("invalid_payload"),
+        JobError::NotFound | JobError::LeaseLost | JobError::Rejected | JobError::Database => {
+            JobExecutionError::retry("database_unavailable", Duration::from_secs(5))
+        }
     }
 }

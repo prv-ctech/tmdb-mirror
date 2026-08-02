@@ -283,6 +283,63 @@ async fn duplicate_active_dedup_key_returns_original_and_terminal_state_releases
 }
 
 #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+async fn batch_submission_preserves_order_and_active_deduplication(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repository = JobRepository::new(pool);
+    let submitted = repository
+        .submit_many(&[
+            NewJob::noop("batch-first")?,
+            NewJob::noop("batch-second")?,
+            NewJob::noop("batch-third")?,
+        ])
+        .await?;
+
+    assert_eq!(submitted.len(), 3);
+    assert!(submitted.iter().all(|outcome| !outcome.was_duplicate()));
+    assert_ne!(submitted[0].job_id(), submitted[1].job_id());
+    assert_ne!(submitted[1].job_id(), submitted[2].job_id());
+
+    let repeated = repository
+        .submit_many(&[
+            NewJob::noop("batch-first")?,
+            NewJob::noop("batch-second")?,
+            NewJob::noop("batch-third")?,
+        ])
+        .await?;
+
+    assert_eq!(repeated.len(), 3);
+    assert!(repeated.iter().all(|outcome| outcome.was_duplicate()));
+    assert_eq!(submitted[0].job_id(), repeated[0].job_id());
+    assert_eq!(submitted[1].job_id(), repeated[1].job_id());
+    assert_eq!(submitted[2].job_id(), repeated[2].job_id());
+    Ok(())
+}
+
+#[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+async fn batch_submission_accepts_the_full_bounded_export_chunk(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repository = JobRepository::new(pool);
+    let jobs = (0..500)
+        .map(|index| NewJob::noop(&format!("bounded-export-{index}")))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let outcomes = repository.submit_many(&jobs).await?;
+    assert_eq!(outcomes.len(), 500);
+    assert!(outcomes.iter().all(|outcome| !outcome.was_duplicate()));
+
+    let oversized = (0..501)
+        .map(|index| NewJob::noop(&format!("oversized-export-{index}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(matches!(
+        repository.submit_many(&oversized).await,
+        Err(JobError::Validation(tmdb_jobs::ValidationError::BatchSize))
+    ));
+    Ok(())
+}
+
+#[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
 async fn simultaneous_same_key_submitters_return_one_id_and_one_new_submission(
     pool: PgPool,
 ) -> Result<(), Box<dyn std::error::Error>> {

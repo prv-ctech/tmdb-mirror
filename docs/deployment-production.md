@@ -77,8 +77,13 @@ docker compose -f deploy/compose.production.yaml up -d
 ```
 
 The main worker applies migrations under the existing PostgreSQL advisory lock;
-restarts are safe. It then expands one idempotent changes-sync slot per media
-namespace into the durable job table. The media worker claims only image jobs.
+restarts are safe. If no completed detail-capable inventory exists, it queues
+one movie and one TV export immediately. That first pass expands into durable
+detail jobs; later daily exports only queue IDs that are missing full catalog
+detail. The worker runs up to eight ingestion loops, bounded by
+`TMDB_MAX_CONNECTIONS` and `TMDB_RATE_LIMIT`. The media worker waits for the
+durable queue schema before claiming image jobs, so first-boot migrations do
+not cause an image-worker crash.
 
 ## Media policy
 

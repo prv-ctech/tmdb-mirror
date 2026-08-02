@@ -19,6 +19,9 @@ pub enum ValidationError {
     /// A priority was outside the supported range.
     #[error("invalid job priority")]
     Priority,
+    /// A bulk submission contained too many jobs for one bounded database statement.
+    #[error("invalid job batch size")]
+    BatchSize,
     /// An attempt limit was outside the supported range.
     #[error("invalid maximum attempts")]
     MaxAttempts,

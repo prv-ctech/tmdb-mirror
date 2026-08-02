@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const IMAGE_JOB_TYPES: &[&str] = &[crate::image::IMAGE_JOB_TYPE, "system.noop"];
+const IMAGE_QUEUE_READY_RETRY: Duration = Duration::from_secs(1);
 
 /// Starts the direct-database image worker shell.
 pub async fn run() -> anyhow::Result<()> {
@@ -74,6 +75,14 @@ pub async fn run() -> anyhow::Result<()> {
         )
         .await
     });
+    if !wait_for_image_job_queue(&pool, &cancellation).await {
+        cancellation.cancel();
+        if let Ok(Err(error)) = media_server.await {
+            tracing::error!(event = "media_server_stopped", error = %error);
+        }
+        pool.close().await;
+        return Ok(());
+    }
     let result = run_workers(workers, cancellation.clone()).await;
     cancellation.cancel();
     if let Ok(Err(error)) = media_server.await {
@@ -81,6 +90,37 @@ pub async fn run() -> anyhow::Result<()> {
     }
     pool.close().await;
     result
+}
+
+async fn wait_for_image_job_queue(pool: &PgPool, cancellation: &CancellationToken) -> bool {
+    loop {
+        match image_job_queue_ready(pool).await {
+            Ok(true) => {
+                tracing::info!(event = "image_job_queue_ready");
+                return true;
+            }
+            Ok(false) => tracing::info!(
+                event = "image_job_queue_not_ready",
+                retry_seconds = IMAGE_QUEUE_READY_RETRY.as_secs()
+            ),
+            Err(_) => tracing::warn!(
+                event = "image_job_queue_check_failed",
+                retry_seconds = IMAGE_QUEUE_READY_RETRY.as_secs()
+            ),
+        }
+        tokio::select! {
+            () = cancellation.cancelled() => return false,
+            () = tokio::time::sleep(IMAGE_QUEUE_READY_RETRY) => {}
+        }
+    }
+}
+
+async fn image_job_queue_ready(pool: &PgPool) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT pg_catalog.to_regprocedure('ops.claim_job_for_types(text,bigint,text[])') IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await
 }
 
 async fn run_workers<E>(
@@ -442,6 +482,20 @@ mod tests {
         let configs = image_worker_configs(base, 1)?;
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].worker_id.as_str(), "tmdb-media");
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn image_worker_reports_queue_unready_before_migrations(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        assert!(!image_job_queue_ready(&pool).await?);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn image_worker_reports_queue_ready_after_migrations(pool: PgPool) -> sqlx::Result<()> {
+        assert!(image_job_queue_ready(&pool).await?);
         Ok(())
     }
 }

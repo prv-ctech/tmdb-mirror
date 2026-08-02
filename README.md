@@ -34,6 +34,8 @@ Local images are served from port `8090`. Set `TMDB_MEDIA_BASE_URL` to a URL
 reachable by your app, for example `http://<server-host>:8090/media`.
 The single media container runs four bounded download workers by default;
 adjust `TMDB_IMAGE_WORKER_CONCURRENCY` between 1 and 32 if needed.
+The main worker runs up to eight ingestion loops, automatically bounded by
+`TMDB_MAX_CONNECTIONS` and the TMDB rate limit.
 
 ## Deploy
 

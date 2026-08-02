@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::model::{
@@ -14,6 +14,8 @@ use crate::{
     ClaimedJob, FailureDisposition, Job, JobError, JobId, JobStatus, NewJob, SubmitOutcome,
     ValidationError, WorkerId,
 };
+
+const MAX_SUBMIT_BATCH_SIZE: usize = 500;
 
 /// PostgreSQL-backed durable leased-job repository.
 #[derive(Clone, Debug)]
@@ -58,6 +60,80 @@ impl JobRepository {
                         duplicate: row.was_duplicate,
                     });
                 }
+                Err(error) if sqlstate(&error).as_deref() == Some("40001") && attempt < 2 => {}
+                Err(error) => return Err(map_database_error(&error)),
+            }
+        }
+        Err(JobError::Database)
+    }
+
+    /// Submits a bounded group of jobs through the same idempotent database boundary.
+    ///
+    /// The returned outcomes preserve input order. One statement invokes the existing
+    /// security-definer submission function for every request, avoiding a network round trip
+    /// per exported TMDB ID while retaining per-job validation, deduplication, and audit events.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for an oversized batch or a sanitized database error when the
+    /// durable submission boundary cannot accept the requested jobs.
+    pub async fn submit_many(&self, jobs: &[NewJob]) -> Result<Vec<SubmitOutcome>, JobError> {
+        if jobs.is_empty() {
+            return Ok(Vec::new());
+        }
+        if jobs.len() > MAX_SUBMIT_BATCH_SIZE {
+            return Err(JobError::Validation(ValidationError::BatchSize));
+        }
+
+        let payloads: Vec<String> = jobs
+            .iter()
+            .map(|job| serde_json::to_string(&job.payload).map_err(|_| JobError::Database))
+            .collect::<Result<_, _>>()?;
+        let positions: Vec<i32> = (0..jobs.len())
+            .map(|position| {
+                i32::try_from(position)
+                    .map_err(|_| JobError::Validation(ValidationError::BatchSize))
+            })
+            .collect::<Result<_, _>>()?;
+
+        for attempt in 0..3 {
+            let mut builder = QueryBuilder::<Postgres>::new(
+                "SELECT submitted.job_id, submitted.was_duplicate\n                   FROM (",
+            );
+            builder.push_values(
+                jobs.iter().zip(payloads.iter()).zip(positions.iter()),
+                |mut values, ((job, payload), position)| {
+                    values
+                        .push_bind(*position)
+                        .push_bind(JobId::new().as_uuid())
+                        .push_bind(&job.job_type)
+                        .push_bind(job.payload_version)
+                        .push_bind(payload)
+                        .push_bind(job.priority)
+                        .push_bind(job.max_attempts)
+                        .push_bind(job.available_at)
+                        .push_bind(&job.dedup_key);
+                },
+            );
+            builder.push(
+                ") AS requested(\n                     position, id, job_type, payload_version, payload, priority, max_attempts,\n                     available_at, dedup_key\n                 )\n                 CROSS JOIN LATERAL ops.submit_job(\n                     requested.id, requested.job_type, requested.payload_version, requested.payload,\n                     requested.priority, requested.max_attempts, requested.available_at,\n                     requested.dedup_key\n                 ) AS submitted\n                 ORDER BY requested.position",
+            );
+
+            let result = builder
+                .build_query_as::<SubmitRow>()
+                .fetch_all(&self.pool)
+                .await;
+            match result {
+                Ok(rows) if rows.len() == jobs.len() => {
+                    return Ok(rows
+                        .into_iter()
+                        .map(|row| SubmitOutcome {
+                            job_id: row.job_id.into(),
+                            duplicate: row.was_duplicate,
+                        })
+                        .collect());
+                }
+                Ok(_) => return Err(JobError::Database),
                 Err(error) if sqlstate(&error).as_deref() == Some("40001") && attempt < 2 => {}
                 Err(error) => return Err(map_database_error(&error)),
             }

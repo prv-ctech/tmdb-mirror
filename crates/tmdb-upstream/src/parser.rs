@@ -103,20 +103,24 @@ impl DailyExportParser {
     ///
     /// Returns a sanitized file, gzip, JSON, or bound error.
     pub fn count_file(&self, path: impl AsRef<Path>) -> Result<usize, ExportParseError> {
-        let path = path.as_ref();
-        let mut probe = File::open(path)?;
-        let mut header = [0_u8; 2];
-        let gzip = match probe.read_exact(&mut header) {
-            Ok(()) => header == [0x1f, 0x8b],
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => false,
-            Err(_) => return Err(ExportParseError::Io),
-        };
-        drop(probe);
-        if gzip {
-            self.count_reader(BufReader::new(GzDecoder::new(File::open(path)?)))
-        } else {
-            self.count_reader(BufReader::new(File::open(path)?))
-        }
+        self.scan_file(path, |_| {})
+    }
+
+    /// Validates and visits every record in a plain or gzip daily export file without retaining
+    /// the complete export in memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized file, gzip, JSON, or bound error.
+    pub fn scan_file<F>(
+        &self,
+        path: impl AsRef<Path>,
+        mut on_record: F,
+    ) -> Result<usize, ExportParseError>
+    where
+        F: FnMut(DailyExportRecord),
+    {
+        self.scan_file_until(path, None, &mut on_record)
     }
 
     /// Validates and visits at most `limit` records from a plain or gzip daily
@@ -139,6 +143,18 @@ impl DailyExportParser {
         if limit == 0 {
             return Err(ExportParseError::InvalidBounds);
         }
+        self.scan_file_until(path, Some(limit), &mut on_record)
+    }
+
+    fn scan_file_until<F>(
+        &self,
+        path: impl AsRef<Path>,
+        limit: Option<usize>,
+        on_record: &mut F,
+    ) -> Result<usize, ExportParseError>
+    where
+        F: FnMut(DailyExportRecord),
+    {
         let path = path.as_ref();
         let mut probe = File::open(path)?;
         let mut header = [0_u8; 2];
@@ -151,15 +167,11 @@ impl DailyExportParser {
         if gzip {
             self.scan_reader_until(
                 &mut BufReader::new(GzDecoder::new(File::open(path)?)),
-                Some(limit),
-                &mut on_record,
+                limit,
+                on_record,
             )
         } else {
-            self.scan_reader_until(
-                &mut BufReader::new(File::open(path)?),
-                Some(limit),
-                &mut on_record,
-            )
+            self.scan_reader_until(&mut BufReader::new(File::open(path)?), limit, on_record)
         }
     }
 
