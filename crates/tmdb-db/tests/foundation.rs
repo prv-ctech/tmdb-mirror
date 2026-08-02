@@ -1435,7 +1435,7 @@ async fn concurrent_actual_migrators_report_exactly_one_application(
         second.map_err(db_error)?.applied,
     ];
     applied.sort_unstable();
-    assert_eq!(applied, [0, 20]);
+    assert_eq!(applied, [0, 21]);
 
     first_pool.close().await;
     second_pool.close().await;

@@ -7,7 +7,7 @@ services:
     image: ghcr.io/prv-ctech/tmdb-mirror-postgres:main
     restart: unless-stopped
     env_file:
-      - ../.env
+      - ${TMDB_ENV_FILE:-../.env}
     shm_size: 2gb
     command:
       - postgres
@@ -38,7 +38,7 @@ services:
         source: ./data/postgres18
         target: /var/lib/postgresql
         bind:
-          create_host_path: false
+          create_host_path: true
     healthcheck:
       test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -h 127.0.0.1 -t 1']
       interval: 5s
@@ -51,7 +51,7 @@ services:
     image: ghcr.io/prv-ctech/tmdb-mirror:main
     restart: unless-stopped
     env_file:
-      - ../.env
+      - ${TMDB_ENV_FILE:-../.env}
     depends_on:
       postgres:
         condition: service_healthy
@@ -74,8 +74,9 @@ services:
     image: ghcr.io/prv-ctech/tmdb-mirror:main
     restart: unless-stopped
     env_file:
-      - ../.env
-    entrypoint: [/usr/local/bin/tmdb-worker]
+      - ${TMDB_ENV_FILE:-../.env}
+    entrypoint: [/usr/local/bin/tmdb-runtime, worker]
+    user: "0:0"
     depends_on:
       postgres:
         condition: service_healthy
@@ -84,11 +85,12 @@ services:
         source: ./data/config
         target: /config
         bind:
-          create_host_path: false
+          create_host_path: true
     read_only: true
     tmpfs: [/tmp]
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SETPCAP]
     init: true
     networks: [tmdb-private]
 
@@ -96,8 +98,9 @@ services:
     image: ghcr.io/prv-ctech/tmdb-mirror:main
     restart: unless-stopped
     env_file:
-      - ../.env
-    entrypoint: [/usr/local/bin/tmdb-images]
+      - ${TMDB_ENV_FILE:-../.env}
+    entrypoint: [/usr/local/bin/tmdb-runtime, media]
+    user: "0:0"
     depends_on:
       postgres:
         condition: service_healthy
@@ -106,18 +109,19 @@ services:
         source: ./data/media
         target: /media
         bind:
-          create_host_path: false
+          create_host_path: true
       - type: bind
         source: ./data/config
         target: /config
         bind:
-          create_host_path: false
+          create_host_path: true
     ports:
       - "8090:8090"
     read_only: true
     tmpfs: [/tmp]
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SETPCAP]
     init: true
     healthcheck:
       test: [CMD, curl, --fail, --silent, http://127.0.0.1:8090/health/live]

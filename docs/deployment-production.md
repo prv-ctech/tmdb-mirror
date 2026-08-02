@@ -39,10 +39,27 @@ template. A normal Unraid mapping is:
 /config -> <host-config-directory>
 ```
 
-The API is read-only; the worker and media process run as UID/GID `10001`.
-Ensure the selected `/config` and `/media` host directories are writable by
-that identity before startup. The stack intentionally has no storage-init
-container that changes host ownership.
+The API runs as UID/GID `10001`. The worker and media services begin with a
+tiny built-in startup preparer: it creates their fixed child folders, gives
+those folders to UID/GID `10001`, verifies an actual write as that user, and
+then drops root before starting Rust. No separate storage-init container or
+manual `chown` step is needed.
+
+It never recursively changes `/config` or `/media`, so a restart does not walk
+millions of images or alter unrelated files in a broad host mount. It changes
+only these app-owned paths:
+
+```text
+/config/work  /config/raw  /config/backups  /config/logs  /config/media
+/media/.masters  /media/movies  /media/tv  /media/anime/{movie,tv}
+/media/casting  /media/networks  /media/companies  /media/collections
+```
+
+Docker/Unraid must still supply the two mount roots themselves. The canonical
+Compose file creates its relative sample directories automatically. For an
+Unraid bind mount, select a dedicated host folder for `/config`; if a network
+share or ACL refuses the mount change, startup stops with the fixed path and
+operation that failed instead of silently retrying image jobs.
 
 No `TMDB_MEDIA_HOST_ROOT`, `TMDB_WORK_HOST_ROOT`, `TMDB_MEDIA_ROOT`,
 `TMDB_WORK_ROOT`, or similar host-path environment variable is read by the
@@ -68,6 +85,24 @@ per-process database aliases.
 
 Keep `TMDB_RATE_LIMIT` at `40` or lower. The worker rejects a higher value
 before it starts upstream requests.
+
+## Terminal logs
+
+`TMDB_LOG_FORMAT=pretty` is the default and produces compact, readable colored
+service logs in Docker/Unraid. `TMDB_LOG_LEVEL=info` shows startup, storage
+checks, worker lifecycle, retries, dead letters, and media failures without
+flooding the terminal with successful health checks. Temporarily set
+`TMDB_LOG_LEVEL=debug` to show individual HTTP requests, job claims,
+successful jobs, and successful image publication while diagnosing a small
+test run. Set
+`TMDB_LOG_FORMAT=json` only when a log collector requires JSON; `RUST_LOG`
+remains an advanced full filter override. For temporary raw SQLx query timing,
+include `sqlx=warn` in that override; it is deliberately off by default.
+
+Operational events contain only bounded fields: fixed container paths, job
+IDs/types, retry codes, image entity IDs, safe HTTP status, and safe I/O
+classes such as `permission_denied`. They never print database passwords,
+tokens, image source URLs, payloads, host bind paths, or raw upstream errors.
 
 ```powershell
 Copy-Item .env.example .env

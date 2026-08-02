@@ -129,7 +129,7 @@ function Wait-Migrations {
                     '--username', $stressDatabaseUser, '--dbname', $stressDatabaseName, '-c',
                     "SELECT COALESCE(max(version), 0) FROM ops._sqlx_migrations WHERE success"
                 )).Trim()
-                if ([int]$version -ge 20) { return }
+                if ([int]$version -ge 21) { return }
             }
         }
         catch {
@@ -139,6 +139,48 @@ function Wait-Migrations {
     } while ([DateTime]::UtcNow -lt $deadline)
     $logs = Invoke-Compose -Arguments @('logs', '--no-color', '--timestamps', 'worker')
     throw "Timed out waiting for consolidated worker migrations.`n$logs"
+}
+
+function Assert-RuntimeStorage {
+    param(
+        [Parameter(Mandatory)][string]$Service,
+        [Parameter(Mandatory)][string]$Check
+    )
+
+    try {
+        Invoke-Compose -Arguments @('exec', '-T', '--user', '10001:10001', $Service, 'sh', '-ec', $Check) | Out-Null
+    }
+    catch {
+        throw "The $Service service cannot use its fixed runtime folders as UID 10001. $($_.Exception.Message)"
+    }
+}
+
+function Assert-ServiceProcessIdentity {
+    param(
+        [Parameter(Mandatory)][string]$Service,
+        [Parameter(Mandatory)][string]$ProcessName
+    )
+
+    # `init: true` deliberately keeps a tiny root reaper as container PID 1.
+    # Inspect the actual Rust process instead, so this proves tmdb-runtime
+    # dropped privileges before it started the service.
+    $check = @'
+for p in /proc/[0-9]*; do
+    read -r comm < $p/comm || continue
+    if [ x$comm = x__PROCESS_NAME__ ]; then
+        stat -c %u $p | grep -qx 10001
+        exit $?
+    fi
+done
+exit 1
+'@.Replace('__PROCESS_NAME__', $ProcessName)
+
+    try {
+        Invoke-Compose -Arguments @('exec', '-T', '--user', '0:0', $Service, 'sh', '-ec', $check) | Out-Null
+    }
+    catch {
+        throw "The $Service service did not run its Rust process as UID 10001. $($_.Exception.Message)"
+    }
 }
 
 if (-not (Test-Path -LiteralPath $composeFile -PathType Leaf)) {
@@ -188,6 +230,8 @@ try {
         'TMDB_API_BIND=0.0.0.0:8080',
         'TMDB_ADMIN_BIND=0.0.0.0:8081',
         'TMDB_MEDIA_BIND=0.0.0.0:8090',
+        'TMDB_LOG_FORMAT=pretty',
+        'TMDB_LOG_LEVEL=info',
         'TMDB_ADMIN_API_KEY=test-admin-key-placeholder-0123456789',
         "TMDB_READ_ACCESS_TOKEN=$($TmdbReadToken.Trim())",
         'TMDB_API_BASE_URL=https://api.themoviedb.org/3',
@@ -242,26 +286,14 @@ try {
     Write-Output 'Starting the consolidated worker so it applies migrations...'
     Invoke-Compose -Arguments @('up', '-d', '--remove-orphans', 'worker') | Write-Output
     Wait-Migrations
-    # The runtime image is intentionally non-root. Prepare the disposable
-    # disk-backed media volume once so the worker can write permanent assets
-    # without adding a storage-init service to the four-container topology.
-    $mediaVolume = "$ProjectName`_media"
-    Invoke-DockerChecked -Arguments @(
-        'volume', 'create', '--label', "com.docker.compose.project=$ProjectName",
-        '--label', 'com.docker.compose.volume=tmdb_stress_media', $mediaVolume
-    ) | Out-Null
-    Invoke-DockerChecked -Arguments @(
-        'run', '--rm', '--user', '0:0', '--mount', "type=volume,source=$mediaVolume,target=/media,volume-nocopy=true",
-        '--entrypoint', '/usr/bin/chown', $appImage, '-R', '10001:10001', '/media'
-    ) | Out-Null
-    Invoke-DockerChecked -Arguments @(
-        'run', '--rm', '--user', '10001:10001', '--mount', "type=volume,source=$mediaVolume,target=/media,volume-nocopy=true",
-        '--entrypoint', '/bin/sh', $appImage, '-c', 'touch /media/.write-test && rm /media/.write-test'
-    ) | Out-Null
     Write-Output 'Starting API and media worker...'
     Invoke-Compose -Arguments @('up', '-d', '--remove-orphans', 'api', 'media') | Write-Output
     Wait-ServiceHealthy -Service 'api'
     Wait-ServiceHealthy -Service 'media'
+    Assert-ServiceProcessIdentity -Service 'worker' -ProcessName 'tmdb-worker'
+    Assert-ServiceProcessIdentity -Service 'media' -ProcessName 'tmdb-images'
+    Assert-RuntimeStorage -Service 'worker' -Check 'test -w /config/work && test -w /config/raw && test -w /config/backups && test -w /config/logs'
+    Assert-RuntimeStorage -Service 'media' -Check 'test -w /config/media && test -w /media/movies && test -w /media/tv && test -w /media/anime/movie && test -w /media/anime/tv && test -w /media/casting && test -w /media/networks && test -w /media/companies && test -w /media/collections'
     Write-Output "Stress stack is ready: http://127.0.0.1:$ApiPort"
     Write-Output "Runtime metadata: $metadataFile"
 }

@@ -29,6 +29,8 @@ COPY --from=builder /workspace/target/release/tmdb-api /usr/local/bin/tmdb-api
 COPY --from=builder /workspace/target/release/tmdb-images /usr/local/bin/tmdb-images
 COPY --from=builder /workspace/target/release/tmdb-ingest /usr/local/bin/tmdb-ingest
 COPY --from=builder /workspace/target/release/tmdb-worker /usr/local/bin/tmdb-worker
+COPY infra/runtime/tmdb-runtime /usr/local/bin/tmdb-runtime
+RUN chmod 0755 /usr/local/bin/tmdb-runtime
 
 USER 10001:10001
 WORKDIR /nonexistent

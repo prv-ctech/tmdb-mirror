@@ -68,11 +68,8 @@ fn method_and_status_labels_are_bounded() {
 
 #[test]
 fn tracing_rejects_invalid_filter_without_panicking() {
-    let result = tmdb_observability::init_tracing_with_filter(
-        "test",
-        LogFormat::Compact,
-        Some("[not valid"),
-    );
+    let result =
+        tmdb_observability::init_tracing_with_filter("test", LogFormat::Pretty, Some("[not valid"));
     assert!(result.is_err());
 }
 

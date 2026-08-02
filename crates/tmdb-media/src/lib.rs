@@ -3,7 +3,13 @@
 //! Host paths deliberately do not appear in this crate.  Deployments mount
 //! their chosen host directories at [`MEDIA_ROOT`] and [`CONFIG_ROOT`].
 
-use std::path::PathBuf;
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use thiserror::Error;
 
@@ -17,6 +23,306 @@ pub const MEDIA_WORK_ROOT: &str = "/config/media";
 pub const RAW_ROOT: &str = "/config/raw";
 /// Durable worker logs below [`CONFIG_ROOT`].
 pub const LOG_ROOT: &str = "/config/logs";
+/// General worker scratch directory below [`CONFIG_ROOT`].
+pub const WORK_ROOT: &str = "/config/work";
+/// Worker backup/checkpoint directory below [`CONFIG_ROOT`].
+pub const BACKUP_ROOT: &str = "/config/backups";
+
+/// Fixed service role whose writable directories must be ready before startup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeStorageRole {
+    /// The main worker, which owns migrations, ingest, exports, and schedules.
+    Worker,
+    /// The media worker, which owns image scratch data and final media publication.
+    Media,
+}
+
+impl RuntimeStorageRole {
+    /// Returns the stable role name used in safe operational events.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Worker => "worker",
+            Self::Media => "media",
+        }
+    }
+}
+
+/// A fixed, application-owned writable path. These labels deliberately never
+/// contain a deployment's host-side mount path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeStoragePath {
+    /// `/config/work`
+    ConfigWork,
+    /// `/config/raw`
+    ConfigRaw,
+    /// `/config/backups`
+    ConfigBackups,
+    /// `/config/logs`
+    ConfigLogs,
+    /// `/config/media`
+    ConfigMedia,
+    /// `/media/.masters`
+    MediaMasters,
+    /// `/media/movies`
+    MediaMovies,
+    /// `/media/tv`
+    MediaTv,
+    /// `/media/anime`
+    MediaAnime,
+    /// `/media/anime/movie`
+    MediaAnimeMovie,
+    /// `/media/anime/tv`
+    MediaAnimeTv,
+    /// `/media/casting`
+    MediaCasting,
+    /// `/media/networks`
+    MediaNetworks,
+    /// `/media/companies`
+    MediaCompanies,
+    /// `/media/collections`
+    MediaCollections,
+}
+
+impl RuntimeStoragePath {
+    /// Returns the fixed in-container path shown in logs and diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfigWork => WORK_ROOT,
+            Self::ConfigRaw => RAW_ROOT,
+            Self::ConfigBackups => BACKUP_ROOT,
+            Self::ConfigLogs => LOG_ROOT,
+            Self::ConfigMedia => MEDIA_WORK_ROOT,
+            Self::MediaMasters => "/media/.masters",
+            Self::MediaMovies => "/media/movies",
+            Self::MediaTv => "/media/tv",
+            Self::MediaAnime => "/media/anime",
+            Self::MediaAnimeMovie => "/media/anime/movie",
+            Self::MediaAnimeTv => "/media/anime/tv",
+            Self::MediaCasting => "/media/casting",
+            Self::MediaNetworks => "/media/networks",
+            Self::MediaCompanies => "/media/companies",
+            Self::MediaCollections => "/media/collections",
+        }
+    }
+
+    fn resolve(self, config_root: &Path, media_root: &Path) -> PathBuf {
+        match self {
+            Self::ConfigWork => config_root.join("work"),
+            Self::ConfigRaw => config_root.join("raw"),
+            Self::ConfigBackups => config_root.join("backups"),
+            Self::ConfigLogs => config_root.join("logs"),
+            Self::ConfigMedia => config_root.join("media"),
+            Self::MediaMasters => media_root.join(".masters"),
+            Self::MediaMovies => media_root.join("movies"),
+            Self::MediaTv => media_root.join("tv"),
+            Self::MediaAnime => media_root.join("anime"),
+            Self::MediaAnimeMovie => media_root.join("anime").join("movie"),
+            Self::MediaAnimeTv => media_root.join("anime").join("tv"),
+            Self::MediaCasting => media_root.join("casting"),
+            Self::MediaNetworks => media_root.join("networks"),
+            Self::MediaCompanies => media_root.join("companies"),
+            Self::MediaCollections => media_root.join("collections"),
+        }
+    }
+}
+
+/// Failure while creating or verifying an application-owned runtime directory.
+#[derive(Debug, Error)]
+pub enum RuntimeStorageError {
+    /// A path required to be a directory is a regular file or another entry.
+    #[error("required storage path is not a directory")]
+    NotDirectory { path: RuntimeStoragePath },
+    /// A required path is a symlink, which would let startup modify a target
+    /// outside the fixed storage layout.
+    #[error("required storage path must not be a symlink")]
+    Symlink { path: RuntimeStoragePath },
+    /// The directory could not be created.
+    #[error("could not create required storage path")]
+    Create {
+        path: RuntimeStoragePath,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The service user cannot create and remove a small probe file in the path.
+    #[error("required storage path is not writable")]
+    Write {
+        path: RuntimeStoragePath,
+        #[source]
+        source: std::io::Error,
+    },
+    /// A successful probe could not be removed, so retaining it would leave
+    /// unwanted state behind.
+    #[error("could not remove storage write probe")]
+    Cleanup {
+        path: RuntimeStoragePath,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl RuntimeStorageError {
+    /// Returns the fixed in-container path that failed, never a host mount path.
+    #[must_use]
+    pub const fn path(&self) -> RuntimeStoragePath {
+        match self {
+            Self::NotDirectory { path }
+            | Self::Symlink { path }
+            | Self::Create { path, .. }
+            | Self::Write { path, .. }
+            | Self::Cleanup { path, .. } => *path,
+        }
+    }
+
+    /// Returns the bounded operation name suitable for a log field.
+    #[must_use]
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::NotDirectory { .. } => "not_directory",
+            Self::Symlink { .. } => "symlink",
+            Self::Create { .. } => "create",
+            Self::Write { .. } => "write_probe",
+            Self::Cleanup { .. } => "cleanup_probe",
+        }
+    }
+
+    /// Returns a bounded I/O classification when the failure came from the
+    /// filesystem. It intentionally omits operating-system error text.
+    #[must_use]
+    pub fn io_kind(&self) -> Option<&'static str> {
+        let source = match self {
+            Self::Create { source, .. }
+            | Self::Write { source, .. }
+            | Self::Cleanup { source, .. } => source,
+            Self::NotDirectory { .. } | Self::Symlink { .. } => return None,
+        };
+        Some(match source.kind() {
+            std::io::ErrorKind::PermissionDenied => "permission_denied",
+            std::io::ErrorKind::ReadOnlyFilesystem => "read_only_filesystem",
+            std::io::ErrorKind::StorageFull => "storage_full",
+            std::io::ErrorKind::QuotaExceeded => "quota_exceeded",
+            std::io::ErrorKind::NotFound => "not_found",
+            std::io::ErrorKind::AlreadyExists => "already_exists",
+            _ => "io_error",
+        })
+    }
+}
+
+const WORKER_RUNTIME_PATHS: &[RuntimeStoragePath] = &[
+    RuntimeStoragePath::ConfigWork,
+    RuntimeStoragePath::ConfigRaw,
+    RuntimeStoragePath::ConfigBackups,
+    RuntimeStoragePath::ConfigLogs,
+];
+const MEDIA_RUNTIME_PATHS: &[RuntimeStoragePath] = &[
+    RuntimeStoragePath::ConfigMedia,
+    RuntimeStoragePath::ConfigLogs,
+    RuntimeStoragePath::MediaMasters,
+    RuntimeStoragePath::MediaMovies,
+    RuntimeStoragePath::MediaTv,
+    RuntimeStoragePath::MediaAnime,
+    RuntimeStoragePath::MediaAnimeMovie,
+    RuntimeStoragePath::MediaAnimeTv,
+    RuntimeStoragePath::MediaCasting,
+    RuntimeStoragePath::MediaNetworks,
+    RuntimeStoragePath::MediaCompanies,
+    RuntimeStoragePath::MediaCollections,
+];
+static WRITE_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Creates and verifies the fixed writable paths for a worker role.
+///
+/// This uses only the fixed container roots and is run after the entrypoint has
+/// dropped to the unprivileged service identity. It therefore proves that the
+/// actual service process—not only the root startup helper—can use every path.
+///
+/// # Errors
+///
+/// Returns a bounded error naming the failing in-container path and operation.
+pub fn prepare_runtime_storage(role: RuntimeStorageRole) -> Result<(), RuntimeStorageError> {
+    prepare_runtime_storage_at(role, Path::new(CONFIG_ROOT), Path::new(MEDIA_ROOT))
+}
+
+/// Creates and verifies runtime storage at supplied roots for isolated tests.
+/// Production callers should use [`prepare_runtime_storage`].
+///
+/// # Errors
+///
+/// Returns a bounded error naming the corresponding fixed in-container path.
+pub fn prepare_runtime_storage_at(
+    role: RuntimeStorageRole,
+    config_root: &Path,
+    media_root: &Path,
+) -> Result<(), RuntimeStorageError> {
+    let paths = match role {
+        RuntimeStorageRole::Worker => WORKER_RUNTIME_PATHS,
+        RuntimeStorageRole::Media => MEDIA_RUNTIME_PATHS,
+    };
+    for storage_path in paths {
+        let path = storage_path.resolve(config_root, media_root);
+        prepare_directory(*storage_path, &path, role)?;
+    }
+    Ok(())
+}
+
+fn prepare_directory(
+    storage_path: RuntimeStoragePath,
+    path: &Path,
+    role: RuntimeStorageRole,
+) -> Result<(), RuntimeStorageError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(RuntimeStorageError::Symlink { path: storage_path });
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(RuntimeStorageError::NotDirectory { path: storage_path });
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir_all(path)
+            .map_err(|source| RuntimeStorageError::Create {
+                path: storage_path,
+                source,
+            })?,
+        Err(source) => {
+            return Err(RuntimeStorageError::Create {
+                path: storage_path,
+                source,
+            });
+        }
+    }
+
+    // The timestamp prevents a stale probe from a hard-killed previous
+    // container (whose PID may be reused) from blocking a healthy restart.
+    let timestamp_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let probe_number = WRITE_PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let probe = path.join(format!(
+        ".tmdb-{}-write-probe-{}-{timestamp_nanos}-{probe_number}",
+        role.as_str(),
+        std::process::id()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|source| RuntimeStorageError::Write {
+            path: storage_path,
+            source,
+        })?;
+    file.write_all(b"tmdb-runtime-probe")
+        .and_then(|()| file.sync_all())
+        .map_err(|source| RuntimeStorageError::Write {
+            path: storage_path,
+            source,
+        })?;
+    drop(file);
+    fs::remove_file(probe).map_err(|source| RuntimeStorageError::Cleanup {
+        path: storage_path,
+        source,
+    })
+}
 
 /// A title's catalog scope determines its public directory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -266,6 +572,10 @@ fn logo_or_cover_filename(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
     use super::*;
 
     #[test]
@@ -274,6 +584,75 @@ mod tests {
         assert_eq!(CONFIG_ROOT, "/config");
         assert_eq!(MEDIA_WORK_ROOT, "/config/media");
         assert_eq!(RAW_ROOT, "/config/raw");
+    }
+
+    #[test]
+    fn worker_storage_preflight_creates_only_worker_config_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sandbox = tempdir()?;
+        let config = sandbox.path().join("config");
+        let media = sandbox.path().join("media");
+        fs::create_dir(&config)?;
+
+        prepare_runtime_storage_at(RuntimeStorageRole::Worker, &config, &media)?;
+
+        for child in ["work", "raw", "backups", "logs"] {
+            assert!(config.join(child).is_dir(), "missing {child}");
+        }
+        assert!(!media.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn media_storage_preflight_creates_fixed_scratch_and_public_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sandbox = tempdir()?;
+        let config = sandbox.path().join("config");
+        let media = sandbox.path().join("media");
+        fs::create_dir(&config)?;
+        fs::create_dir(&media)?;
+
+        prepare_runtime_storage_at(RuntimeStorageRole::Media, &config, &media)?;
+
+        for child in ["media", "logs"] {
+            assert!(config.join(child).is_dir(), "missing /config/{child}");
+        }
+        for child in [
+            ".masters",
+            "movies",
+            "tv",
+            "anime/movie",
+            "anime/tv",
+            "casting",
+            "networks",
+            "companies",
+            "collections",
+        ] {
+            assert!(media.join(child).is_dir(), "missing /media/{child}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn storage_preflight_reports_a_file_that_blocks_a_required_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sandbox = tempdir()?;
+        let config = sandbox.path().join("config");
+        let media = sandbox.path().join("media");
+        fs::create_dir(&config)?;
+        fs::write(config.join("media"), b"not a directory")?;
+        fs::create_dir(&media)?;
+
+        let Err(error) = prepare_runtime_storage_at(RuntimeStorageRole::Media, &config, &media)
+        else {
+            return Err(std::io::Error::other(
+                "a regular file must not satisfy the media scratch directory",
+            )
+            .into());
+        };
+        assert_eq!(error.path(), RuntimeStoragePath::ConfigMedia,);
+        assert_eq!(error.operation(), "not_directory");
+        Ok(())
     }
 
     #[test]

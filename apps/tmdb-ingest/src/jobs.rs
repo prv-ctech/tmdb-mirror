@@ -282,11 +282,28 @@ impl JobExecutor for IngestExecutor {
         let dedup_key = parsed.dedup_key();
         match parsed {
             IngestJob::RefreshMovie { tmdb_id } => {
-                let movie = self
-                    .client
-                    .fetch_movie(tmdb_id)
-                    .await
-                    .map_err(|error| map_upstream_error(&error))?;
+                let movie = match self.client.fetch_movie(tmdb_id).await {
+                    Ok(movie) => movie,
+                    Err(TmdbClientError::NotFound) => {
+                        tracing::debug!(
+                            event = "upstream_item_skipped",
+                            operation = "movie_detail",
+                            media_type = "movie",
+                            tmdb_id,
+                            reason = "not_found",
+                        );
+                        return Ok(serde_json::json!({
+                            "media_type":"movie",
+                            "tmdb_id":tmdb_id,
+                            "skipped":"upstream_not_found",
+                            "dedup_key":dedup_key
+                        }));
+                    }
+                    Err(error) => {
+                        log_upstream_failure("movie_detail", "movie", tmdb_id, None, &error);
+                        return Err(map_upstream_error(&error));
+                    }
+                };
                 if let Some(database) = &self.database {
                     catalog_write::persist_movie_with_options(
                         database,
@@ -302,11 +319,28 @@ impl JobExecutor for IngestExecutor {
                 }))
             }
             IngestJob::RefreshTv { tmdb_id } => {
-                let series = self
-                    .client
-                    .fetch_tv(tmdb_id)
-                    .await
-                    .map_err(|error| map_upstream_error(&error))?;
+                let series = match self.client.fetch_tv(tmdb_id).await {
+                    Ok(series) => series,
+                    Err(TmdbClientError::NotFound) => {
+                        tracing::debug!(
+                            event = "upstream_item_skipped",
+                            operation = "tv_detail",
+                            media_type = "tv",
+                            tmdb_id,
+                            reason = "not_found",
+                        );
+                        return Ok(serde_json::json!({
+                            "media_type":"tv",
+                            "tmdb_id":tmdb_id,
+                            "skipped":"upstream_not_found",
+                            "dedup_key":dedup_key
+                        }));
+                    }
+                    Err(error) => {
+                        log_upstream_failure("tv_detail", "tv", tmdb_id, None, &error);
+                        return Err(map_upstream_error(&error));
+                    }
+                };
                 if let Some(database) = &self.database {
                     catalog_write::persist_tv_with_options(
                         database,
@@ -322,11 +356,21 @@ impl JobExecutor for IngestExecutor {
                 }))
             }
             IngestJob::ChangesSync { media_type, page } => {
-                let change_page = self
-                    .client
-                    .fetch_changes(media_type, page)
-                    .await
-                    .map_err(|error| map_upstream_error(&error))?;
+                let change_page =
+                    self.client
+                        .fetch_changes(media_type, page)
+                        .await
+                        .map_err(|error| {
+                            tracing::warn!(
+                                event = "upstream_request_failed",
+                                operation = "changes_page",
+                                media_type = media_type_name(media_type),
+                                page,
+                                failure_reason = upstream_error_reason(&error),
+                                http_status = upstream_http_status(&error),
+                            );
+                            map_upstream_error(&error)
+                        })?;
                 let changed_ids: Vec<u64> = change_page
                     .results
                     .iter()
@@ -376,11 +420,36 @@ impl JobExecutor for IngestExecutor {
                 tv_id,
                 season_number,
             } => {
-                let season = self
-                    .client
-                    .fetch_season(tv_id, season_number)
-                    .await
-                    .map_err(|error| map_upstream_error(&error))?;
+                let season = match self.client.fetch_season(tv_id, season_number).await {
+                    Ok(season) => season,
+                    Err(TmdbClientError::NotFound) => {
+                        tracing::debug!(
+                            event = "upstream_item_skipped",
+                            operation = "season_detail",
+                            media_type = "tv",
+                            tmdb_id = tv_id,
+                            season_number,
+                            reason = "not_found",
+                        );
+                        return Ok(serde_json::json!({
+                            "media_type":"tv",
+                            "tv_id":tv_id,
+                            "season_number":season_number,
+                            "skipped":"upstream_not_found",
+                            "dedup_key":dedup_key
+                        }));
+                    }
+                    Err(error) => {
+                        log_upstream_failure(
+                            "season_detail",
+                            "tv",
+                            tv_id,
+                            Some(season_number),
+                            &error,
+                        );
+                        return Err(map_upstream_error(&error));
+                    }
+                };
                 if let Some(database) = &self.database {
                     catalog_write::persist_season_with_options(
                         database,
@@ -412,7 +481,16 @@ impl JobExecutor for IngestExecutor {
                     .client
                     .fetch_daily_export_to_file(&url, &destination, self.export_max_bytes)
                     .await
-                    .map_err(|error| map_upstream_error(&error))?;
+                    .map_err(|error| {
+                        tracing::warn!(
+                            event = "upstream_request_failed",
+                            operation = "daily_export",
+                            media_type = media_type_name(media_type),
+                            failure_reason = upstream_error_reason(&error),
+                            http_status = upstream_http_status(&error),
+                        );
+                        map_upstream_error(&error)
+                    })?;
                 let queue_summary = if let Some(database) = &self.database {
                     enqueue_daily_export_refresh_jobs(
                         database,
@@ -493,6 +571,67 @@ fn contains_anime_keyword(keywords: &[TmdbKeyword]) -> bool {
         .any(|keyword| keyword.id == u64::from(tmdb_domain::ANIME_KEYWORD_ID))
 }
 
+fn log_upstream_failure(
+    operation: &'static str,
+    media_type: &'static str,
+    tmdb_id: u32,
+    season_number: Option<u16>,
+    error: &TmdbClientError,
+) {
+    tracing::warn!(
+        event = "upstream_request_failed",
+        operation,
+        media_type,
+        tmdb_id,
+        season_number = season_number.unwrap_or(0),
+        failure_reason = upstream_error_reason(error),
+        http_status = upstream_http_status(error),
+    );
+}
+
+fn media_type_name(media_type: MediaType) -> &'static str {
+    match media_type {
+        MediaType::Movie => "movie",
+        MediaType::Tv => "tv",
+    }
+}
+
+fn upstream_error_reason(error: &TmdbClientError) -> &'static str {
+    match error {
+        TmdbClientError::InvalidBaseUrl => "invalid_base_url",
+        TmdbClientError::InvalidPath => "invalid_path",
+        TmdbClientError::HttpClientBuild => "http_client_build_failed",
+        TmdbClientError::Policy(_) => "request_policy_failed",
+        TmdbClientError::Transport => "transport_failed",
+        TmdbClientError::ResponseTooLarge => "response_too_large",
+        TmdbClientError::ExportSizeLimit => "export_size_limit",
+        TmdbClientError::InvalidExportDestination => "invalid_export_destination",
+        TmdbClientError::ExportStorage => "export_storage_failed",
+        TmdbClientError::RateLimited { .. } => "rate_limited",
+        TmdbClientError::Unauthorized => "unauthorized",
+        TmdbClientError::Forbidden { .. } => "forbidden",
+        TmdbClientError::NotFound => "not_found",
+        TmdbClientError::NotModified => "not_modified",
+        TmdbClientError::UpstreamServer { .. } => "upstream_server_error",
+        TmdbClientError::PermanentHttp { .. } => "permanent_http_error",
+        TmdbClientError::MalformedJson { .. } => "malformed_json",
+    }
+}
+
+fn upstream_http_status(error: &TmdbClientError) -> u16 {
+    match error {
+        TmdbClientError::Unauthorized => 401,
+        TmdbClientError::Forbidden { .. } => 403,
+        TmdbClientError::NotFound => 404,
+        TmdbClientError::NotModified => 304,
+        TmdbClientError::RateLimited { .. } => 429,
+        TmdbClientError::UpstreamServer { status } | TmdbClientError::PermanentHttp { status } => {
+            *status
+        }
+        _ => 0,
+    }
+}
+
 fn map_upstream_error(error: &TmdbClientError) -> JobExecutionError {
     match error {
         TmdbClientError::RateLimited { retry_after } => JobExecutionError::retry(
@@ -537,6 +676,17 @@ mod tests {
         assert!(error.is_terminal());
         assert_eq!(error.failure_code(), "upstream_unauthorized");
         assert_eq!(error.retry_delay(), Duration::ZERO);
+    }
+
+    #[test]
+    fn upstream_not_found_is_classified_for_a_nonfatal_detail_skip() {
+        assert_eq!(
+            upstream_error_reason(&TmdbClientError::NotFound),
+            "not_found"
+        );
+        assert_eq!(upstream_http_status(&TmdbClientError::NotFound), 404);
+        assert_eq!(media_type_name(MediaType::Movie), "movie");
+        assert_eq!(media_type_name(MediaType::Tv), "tv");
     }
 
     #[test]

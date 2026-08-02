@@ -1,0 +1,103 @@
+#!/bin/sh
+# Prepare only TMDB-owned child paths, then immediately drop to the unprivileged
+# service identity. Host mounts themselves remain deployment-owned.
+set -eu
+
+readonly APP_UID=10001
+readonly APP_GID=10001
+
+fail() {
+    # All inputs are fixed literals. Do not print environment values or host paths.
+    printf '%s\n' "tmdb-runtime event=storage_prepare_failed role=$1 path=$2 operation=$3 hint=$4" >&2
+    exit 78
+}
+
+prepare_mount_root() {
+    role=$1
+    path=$2
+    if [ -L "$path" ]; then
+        fail "$role" "$path" "symlink" "mount_a_real_directory"
+    fi
+    if [ ! -d "$path" ]; then
+        fail "$role" "$path" "missing_mount" "map_this_container_path"
+    fi
+    # Preserve the mount's existing mode and add only the traverse bit needed
+    # for UID 10001 to reach its named child directories. This avoids changing
+    # read/list access for other containers when a user mounted shared appdata.
+    if ! chmod o+x "$path"; then
+        fail "$role" "$path" "set_traverse_permission" "check_mount_permissions"
+    fi
+}
+
+prepare_directory() {
+    role=$1
+    path=$2
+    if [ -L "$path" ]; then
+        fail "$role" "$path" "symlink" "replace_with_directory"
+    fi
+    if [ -e "$path" ] && [ ! -d "$path" ]; then
+        fail "$role" "$path" "not_directory" "replace_with_directory"
+    fi
+    if [ ! -d "$path" ] && ! mkdir -p -- "$path"; then
+        fail "$role" "$path" "create" "check_mount_permissions"
+    fi
+    # Do not use recursive ownership changes: the title trees can contain
+    # millions of files, and this wrapper must never mutate unrelated content.
+    if ! chown --no-dereference "$APP_UID:$APP_GID" "$path"; then
+        fail "$role" "$path" "set_owner" "check_mount_permissions"
+    fi
+    if ! chmod 0755 "$path"; then
+        fail "$role" "$path" "set_directory_permissions" "check_mount_permissions"
+    fi
+}
+
+drop_privileges_and_exec() {
+    if ! command -v setpriv >/dev/null 2>&1; then
+        fail "$1" "runtime" "drop_privileges" "runtime_image_is_incomplete"
+    fi
+    role=$1
+    shift
+    printf '%s\n' "tmdb-runtime event=storage_prepared role=$role uid=$APP_UID gid=$APP_GID"
+    exec setpriv \
+        --reuid="$APP_UID" \
+        --regid="$APP_GID" \
+        --clear-groups \
+        --bounding-set=-all \
+        --inh-caps=-all \
+        --ambient-caps=-all \
+        -- "$@"
+}
+
+case "${1:-}" in
+    worker)
+        prepare_mount_root worker /config
+        prepare_directory worker /config/work
+        prepare_directory worker /config/raw
+        prepare_directory worker /config/backups
+        prepare_directory worker /config/logs
+        shift
+        drop_privileges_and_exec worker /usr/local/bin/tmdb-worker "$@"
+        ;;
+    media)
+        prepare_mount_root media /config
+        prepare_mount_root media /media
+        prepare_directory media /config/media
+        prepare_directory media /config/logs
+        prepare_directory media /media/.masters
+        prepare_directory media /media/movies
+        prepare_directory media /media/tv
+        prepare_directory media /media/anime
+        prepare_directory media /media/anime/movie
+        prepare_directory media /media/anime/tv
+        prepare_directory media /media/casting
+        prepare_directory media /media/networks
+        prepare_directory media /media/companies
+        prepare_directory media /media/collections
+        shift
+        drop_privileges_and_exec media /usr/local/bin/tmdb-images "$@"
+        ;;
+    *)
+        printf '%s\n' "tmdb-runtime event=startup_failed operation=invalid_role hint=use_worker_or_media" >&2
+        exit 64
+        ;;
+esac

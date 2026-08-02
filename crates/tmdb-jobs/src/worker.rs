@@ -203,13 +203,28 @@ where
     /// a lost or expired lease.
     pub async fn run(self, cancellation: CancellationToken) -> Result<(), WorkerError> {
         let supported_job_types = self.executor.supported_job_types();
+        tracing::info!(
+            event = "job_worker_started",
+            worker_id = self.config.worker_id.as_str(),
+            claim_scope = if supported_job_types.is_some() {
+                "filtered"
+            } else {
+                "all"
+            },
+        );
         loop {
             let permit = tokio::select! {
-                () = cancellation.cancelled() => return Ok(()),
+                () = cancellation.cancelled() => {
+                    tracing::info!(event = "job_worker_stopped", worker_id = self.config.worker_id.as_str());
+                    return Ok(());
+                },
                 permit = self.claim_gate.clone().acquire_owned() => permit.map_err(|_| WorkerError::Repository(JobError::Database))?,
             };
             let claim = tokio::select! {
-                () = cancellation.cancelled() => return Ok(()),
+                () = cancellation.cancelled() => {
+                    tracing::info!(event = "job_worker_stopped", worker_id = self.config.worker_id.as_str());
+                    return Ok(());
+                },
                 result = self.repository.claim_for_types(
                     &self.config.worker_id,
                     self.config.lease_duration,
@@ -220,12 +235,23 @@ where
 
             let Some(job) = claim else {
                 tokio::select! {
-                    () = cancellation.cancelled() => return Ok(()),
+                    () = cancellation.cancelled() => {
+                        tracing::info!(event = "job_worker_stopped", worker_id = self.config.worker_id.as_str());
+                        return Ok(());
+                    },
                     () = time::sleep(self.config.idle_poll_interval) => {}
                 }
                 continue;
             };
 
+            tracing::debug!(
+                event = "job_claimed",
+                worker_id = self.config.worker_id.as_str(),
+                job_id = %job.job_id().as_uuid(),
+                job_type = job.job_type(),
+                attempt = job.attempts(),
+                max_attempts = job.max_attempts(),
+            );
             self.execute_claimed(job, &cancellation).await?;
         }
     }
@@ -236,11 +262,21 @@ where
         cancellation: &CancellationToken,
     ) -> Result<(), WorkerError> {
         if job.cancellation_requested() {
-            self.repository
+            let outcome = self
+                .repository
                 .complete(job.job_id(), &self.config.worker_id, json!({}))
                 .await
                 .map(|_| ())
-                .or_else(ignore_lost_lease)
+                .or_else(ignore_lost_lease);
+            if outcome.is_ok() {
+                tracing::info!(
+                    event = "job_cancelled",
+                    worker_id = self.config.worker_id.as_str(),
+                    job_id = %job.job_id().as_uuid(),
+                    job_type = job.job_type(),
+                );
+            }
+            outcome
         } else {
             let heartbeat_stop = CancellationToken::new();
             let lease_lost = CancellationToken::new();
@@ -254,19 +290,35 @@ where
                 () = cancellation.cancelled() => {
                     execution.abort();
                     let _ = execution.await;
+                    tracing::info!(
+                        event = "job_execution_cancelled",
+                        worker_id = self.config.worker_id.as_str(),
+                        job_id = %job.job_id().as_uuid(),
+                        job_type = job.job_type(),
+                    );
                     Ok(())
                 },
                 () = lease_lost.cancelled() => {
                     execution.abort();
                     let _ = execution.await;
+                    tracing::warn!(
+                        event = "job_lease_lost",
+                        worker_id = self.config.worker_id.as_str(),
+                        job_id = %job.job_id().as_uuid(),
+                        job_type = job.job_type(),
+                    );
                     Ok(())
                 },
                 result = &mut execution => {
                     let result = result.unwrap_or_else(|_| {
-                        Err(JobExecutionError::retry(
-                            "execution_failed",
-                            Duration::from_secs(1),
-                        ))
+                        tracing::error!(
+                            event = "job_execution_panicked",
+                            worker_id = self.config.worker_id.as_str(),
+                            job_id = %job.job_id().as_uuid(),
+                            job_type = job.job_type(),
+                            failure_code = "execution_failed",
+                        );
+                        Err(JobExecutionError::retry("execution_failed", Duration::from_secs(1)))
                     });
                     self.record_outcome(&job, result).await
                 },
@@ -297,6 +349,12 @@ where
                     () = stop.cancelled() => break,
                     _ = ticker.tick() => {
                         if repository.heartbeat(job_id, &worker_id, lease_duration).await.is_err() {
+                            tracing::warn!(
+                                event = "job_lease_heartbeat_failed",
+                                worker_id = worker_id.as_str(),
+                                job_id = %job_id.as_uuid(),
+                                error_code = "database_or_lease",
+                            );
                             lease_lost.cancel();
                             break;
                         }
@@ -312,30 +370,201 @@ where
         result: Result<Value, JobExecutionError>,
     ) -> Result<(), WorkerError> {
         match result {
-            Ok(value) => self
-                .repository
-                .complete(job.job_id(), &self.config.worker_id, value)
-                .await
-                .map(|_| ())
-                .or_else(ignore_lost_lease),
-            Err(error) if error.is_terminal() => self
-                .repository
-                .dead_letter(job.job_id(), &self.config.worker_id, error.failure_code())
-                .await
-                .map(|_| ())
-                .or_else(ignore_lost_lease),
-            Err(error) => self
-                .repository
-                .fail(
-                    job.job_id(),
-                    &self.config.worker_id,
-                    error.failure_code(),
-                    error.retry_delay(),
-                )
-                .await
-                .map(|_| ())
-                .or_else(ignore_lost_lease),
+            Ok(value) => self.record_success(job, value).await,
+            Err(error) if error.is_terminal() => self.record_terminal_failure(job, error).await,
+            Err(error) => self.record_retryable_failure(job, error).await,
         }
+    }
+
+    async fn record_success(&self, job: &ClaimedJob, value: Value) -> Result<(), WorkerError> {
+        match self
+            .repository
+            .complete(job.job_id(), &self.config.worker_id, value)
+            .await
+        {
+            Ok(_) => {
+                tracing::debug!(
+                    event = "job_succeeded",
+                    worker_id = self.config.worker_id.as_str(),
+                    job_id = %job.job_id().as_uuid(),
+                    job_type = job.job_type(),
+                    attempt = job.attempts(),
+                );
+                Ok(())
+            }
+            Err(error) => record_repository_error(job, &self.config.worker_id, error),
+        }
+    }
+
+    async fn record_terminal_failure(
+        &self,
+        job: &ClaimedJob,
+        error: JobExecutionError,
+    ) -> Result<(), WorkerError> {
+        let failure_code = log_failure_code(error.failure_code());
+        log_job_execution_failure(job, &self.config.worker_id, failure_code, true);
+        match self
+            .repository
+            .dead_letter(job.job_id(), &self.config.worker_id, error.failure_code())
+            .await
+        {
+            Ok(crate::FailureDisposition::DeadLettered) => {
+                log_dead_letter(job, &self.config.worker_id, failure_code);
+                Ok(())
+            }
+            Ok(crate::FailureDisposition::Cancelled) => {
+                log_cancelled(job, &self.config.worker_id);
+                Ok(())
+            }
+            Ok(crate::FailureDisposition::RetryScheduled { .. }) => {
+                Err(WorkerError::Repository(JobError::Database))
+            }
+            Err(repository_error) => {
+                record_repository_error(job, &self.config.worker_id, repository_error)
+            }
+        }
+    }
+
+    async fn record_retryable_failure(
+        &self,
+        job: &ClaimedJob,
+        error: JobExecutionError,
+    ) -> Result<(), WorkerError> {
+        let failure_code = log_failure_code(error.failure_code());
+        log_job_execution_failure(job, &self.config.worker_id, failure_code, false);
+        match self
+            .repository
+            .fail(
+                job.job_id(),
+                &self.config.worker_id,
+                error.failure_code(),
+                error.retry_delay(),
+            )
+            .await
+        {
+            Ok(crate::FailureDisposition::RetryScheduled { .. }) => {
+                tracing::warn!(
+                    event = "job_retry_scheduled",
+                    worker_id = self.config.worker_id.as_str(),
+                    job_id = %job.job_id().as_uuid(),
+                    job_type = job.job_type(),
+                    attempt = job.attempts(),
+                    max_attempts = job.max_attempts(),
+                    failure_code,
+                    retry_seconds = error.retry_delay().as_secs_f64(),
+                );
+                Ok(())
+            }
+            Ok(crate::FailureDisposition::DeadLettered) => {
+                log_dead_letter(job, &self.config.worker_id, failure_code);
+                Ok(())
+            }
+            Ok(crate::FailureDisposition::Cancelled) => {
+                log_cancelled(job, &self.config.worker_id);
+                Ok(())
+            }
+            Err(repository_error) => {
+                record_repository_error(job, &self.config.worker_id, repository_error)
+            }
+        }
+    }
+}
+
+fn log_job_execution_failure(
+    job: &ClaimedJob,
+    worker_id: &WorkerId,
+    failure_code: &str,
+    terminal: bool,
+) {
+    if terminal {
+        tracing::error!(
+            event = "job_execution_failed",
+            worker_id = worker_id.as_str(),
+            job_id = %job.job_id().as_uuid(),
+            job_type = job.job_type(),
+            attempt = job.attempts(),
+            max_attempts = job.max_attempts(),
+            failure_code,
+            terminal,
+        );
+    } else {
+        tracing::warn!(
+            event = "job_execution_failed",
+            worker_id = worker_id.as_str(),
+            job_id = %job.job_id().as_uuid(),
+            job_type = job.job_type(),
+            attempt = job.attempts(),
+            max_attempts = job.max_attempts(),
+            failure_code,
+            terminal,
+        );
+    }
+}
+
+fn log_dead_letter(job: &ClaimedJob, worker_id: &WorkerId, failure_code: &str) {
+    tracing::error!(
+        event = "job_dead_lettered",
+        worker_id = worker_id.as_str(),
+        job_id = %job.job_id().as_uuid(),
+        job_type = job.job_type(),
+        attempt = job.attempts(),
+        max_attempts = job.max_attempts(),
+        failure_code,
+    );
+}
+
+fn log_cancelled(job: &ClaimedJob, worker_id: &WorkerId) {
+    tracing::info!(
+        event = "job_cancelled",
+        worker_id = worker_id.as_str(),
+        job_id = %job.job_id().as_uuid(),
+        job_type = job.job_type(),
+    );
+}
+
+fn record_repository_error(
+    job: &ClaimedJob,
+    worker_id: &WorkerId,
+    error: JobError,
+) -> Result<(), WorkerError> {
+    match error {
+        JobError::LeaseLost | JobError::NotFound => {
+            tracing::warn!(
+                event = "job_outcome_not_recorded",
+                worker_id = worker_id.as_str(),
+                job_id = %job.job_id().as_uuid(),
+                job_type = job.job_type(),
+                error_code = "lease_lost",
+            );
+            Ok(())
+        }
+        other => {
+            tracing::error!(
+                event = "job_outcome_record_failed",
+                worker_id = worker_id.as_str(),
+                job_id = %job.job_id().as_uuid(),
+                job_type = job.job_type(),
+                error_code = "database_unavailable",
+            );
+            Err(WorkerError::Repository(other))
+        }
+    }
+}
+
+fn log_failure_code(code: &str) -> &str {
+    match code {
+        "execution_failed"
+        | "upstream_unavailable"
+        | "upstream_unauthorized"
+        | "rate_limited"
+        | "invalid_payload"
+        | "lease_expired"
+        | "attempts_exhausted"
+        | "entity_not_ready"
+        | "export_storage"
+        | "database_unavailable"
+        | "export_queue_incomplete" => code,
+        _ => "custom_failure",
     }
 }
 
@@ -343,5 +572,22 @@ fn ignore_lost_lease(error: JobError) -> Result<(), WorkerError> {
     match error {
         JobError::LeaseLost | JobError::NotFound => Ok(()),
         other => Err(WorkerError::Repository(other)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_logs_do_not_echo_arbitrary_failure_text() {
+        assert_eq!(
+            log_failure_code("upstream_unavailable"),
+            "upstream_unavailable"
+        );
+        assert_eq!(
+            log_failure_code("https://example.invalid/?token=secret"),
+            "custom_failure"
+        );
     }
 }

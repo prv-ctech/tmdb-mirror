@@ -2333,6 +2333,7 @@ dependencies = [
  "tmdb-db",
  "tokio",
  "tokio-util",
+ "tracing",
  "uuid",
 ]
 
@@ -2340,6 +2341,7 @@ dependencies = [
 name = "tmdb-media"
 version = "0.1.0"
 dependencies = [
+ "tempfile",
  "thiserror",
 ]
 

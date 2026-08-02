@@ -7,8 +7,8 @@ use tmdb_config::{
 };
 use tmdb_db::{PoolPolicy, connect_direct, migrate};
 use tmdb_jobs::{JobRepository, NewJob, Worker, WorkerConfig, WorkerId};
-use tmdb_media::RAW_ROOT;
-use tmdb_observability::{LogFormat, init_tracing};
+use tmdb_media::{RAW_ROOT, RuntimeStorageRole, prepare_runtime_storage};
+use tmdb_observability::init_tracing_from_env;
 use tmdb_upstream::{MAX_DAILY_EXPORT_BYTES, RateLimitPolicy, RetryPolicy, TmdbClient};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -26,8 +26,9 @@ const MAX_INGEST_WORKER_CONCURRENCY: usize = 8;
 /// Returns an error when configuration, database connectivity, or the worker
 /// loop cannot be started.
 pub async fn run() -> anyhow::Result<()> {
-    init_tracing(env!("CARGO_PKG_NAME"), LogFormat::Json)
-        .map_err(|error| anyhow::anyhow!(error))?;
+    init_tracing_from_env(env!("CARGO_PKG_NAME")).map_err(|error| anyhow::anyhow!(error))?;
+    tracing::info!(event = "ingest_worker_starting");
+    prepare_worker_storage()?;
     let source = EnvSource;
     let environment = load_environment(source)?;
     let database = load_shared_database(&source, environment)?;
@@ -78,8 +79,9 @@ pub async fn run() -> anyhow::Result<()> {
 /// Returns an error when configuration, migration, database connectivity, or
 /// the worker loop cannot be started.
 pub async fn run_worker() -> anyhow::Result<()> {
-    init_tracing(env!("CARGO_PKG_NAME"), LogFormat::Json)
-        .map_err(|error| anyhow::anyhow!(error))?;
+    init_tracing_from_env(env!("CARGO_PKG_NAME")).map_err(|error| anyhow::anyhow!(error))?;
+    tracing::info!(event = "main_worker_starting");
+    prepare_worker_storage()?;
     let source = EnvSource;
     let environment = load_environment(source)?;
     let migrator = load_shared_database(&source, environment)?;
@@ -87,10 +89,12 @@ pub async fn run_worker() -> anyhow::Result<()> {
         .await
         .map_err(|error| anyhow::anyhow!(error))
         .context("connect migration database")?;
+    tracing::info!(event = "database_migration_starting");
     migrate(&migration_pool, &migrator.username)
         .await
         .map_err(|error| anyhow::anyhow!(error))
         .context("apply database migrations")?;
+    tracing::info!(event = "database_migration_complete");
     migration_pool.close().await;
 
     let database = load_shared_database(&source, environment)?;
@@ -111,7 +115,8 @@ pub async fn run_worker() -> anyhow::Result<()> {
         .await
         .map_err(|error| anyhow::anyhow!(error))
         .context("connect worker database")?;
-    if parse_or(source, "TMDB_ENABLE_DAILY_EXPORT", true)? {
+    let daily_export_enabled = parse_or(source, "TMDB_ENABLE_DAILY_EXPORT", true)?;
+    if daily_export_enabled {
         ensure_catalog_seed(&pool, previous_export_date()?).await?;
     }
     let executor = ingest_executor.with_database(pool.clone());
@@ -119,6 +124,11 @@ pub async fn run_worker() -> anyhow::Result<()> {
         .into_iter()
         .map(|config| Worker::new(JobRepository::new(pool.clone()), executor.clone(), config))
         .collect();
+    tracing::info!(
+        event = "main_worker_ready",
+        ingest_workers = worker_concurrency,
+        daily_export_enabled,
+    );
     let cancellation = CancellationToken::new();
     let signal_cancellation = cancellation.clone();
     tokio::spawn(async move {
@@ -141,6 +151,28 @@ pub async fn run_worker() -> anyhow::Result<()> {
     let _ = scheduler.await;
     pool.close().await;
     result.map_err(|error| anyhow::anyhow!(error))
+}
+
+fn prepare_worker_storage() -> anyhow::Result<()> {
+    prepare_runtime_storage(RuntimeStorageRole::Worker).map_err(|error| {
+        tracing::error!(
+            event = "storage_preflight_failed",
+            role = RuntimeStorageRole::Worker.as_str(),
+            path = error.path().as_str(),
+            operation = error.operation(),
+            io_kind = error.io_kind().unwrap_or("not_applicable"),
+        );
+        anyhow::anyhow!(
+            "worker storage preflight failed at {} ({})",
+            error.path().as_str(),
+            error.operation(),
+        )
+    })?;
+    tracing::info!(
+        event = "storage_preflight_ready",
+        role = RuntimeStorageRole::Worker.as_str()
+    );
+    Ok(())
 }
 
 async fn run_ingest_workers(
@@ -181,6 +213,7 @@ async fn run_scheduler(
     source: EnvSource,
 ) -> anyhow::Result<()> {
     if !parse_or(source, "TMDB_ENABLE_SCHEDULER", true)? {
+        tracing::info!(event = "scheduler_disabled");
         cancellation.cancelled().await;
         return Ok(());
     }
@@ -189,6 +222,11 @@ async fn run_scheduler(
         bail!("TMDB_SCHEDULER_INTERVAL_SECONDS must be positive");
     }
     let daily_export_enabled = parse_or(source, "TMDB_ENABLE_DAILY_EXPORT", true)?;
+    tracing::info!(
+        event = "scheduler_started",
+        interval_seconds,
+        daily_export_enabled,
+    );
     let mut interval = tokio::time::interval(Duration::from_secs(interval_seconds));
     loop {
         tokio::select! {

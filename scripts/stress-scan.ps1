@@ -84,12 +84,9 @@ function Copy-ToWorkerVolume {
     if ($exitCode -ne 0 -or [string]::IsNullOrWhiteSpace($containerId)) {
         throw 'The consolidated worker container is not running; cannot place the export in the shared config volume.'
     }
-    # The stress /config volume is intentionally an empty tmpfs on a fresh
-    # run.  Create the fixed raw-export directory inside the container before
-    # docker cp resolves its destination; this keeps all scan input below
-    # /config without relying on a host-path convention.
-    & docker @($composeArgs + @('exec', '-T', 'worker', 'mkdir', '-p', '/config/raw')) 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'Could not create /config/raw in the consolidated worker volume.' }
+    # The root-only runtime preparer creates this fixed directory before the
+    # unprivileged worker starts. Do not create it here: the stress test must
+    # prove the normal startup path works without a manual permission fix.
     $destination = "/config/raw/$FileName"
     & docker cp $HostPath "$containerId`:$destination" 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Could not copy export into the stress work volume: $FileName" }

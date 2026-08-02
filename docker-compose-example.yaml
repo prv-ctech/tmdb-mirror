@@ -76,7 +76,8 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    entrypoint: [/usr/local/bin/tmdb-worker]
+    entrypoint: [/usr/local/bin/tmdb-runtime, worker]
+    user: "0:0"
     depends_on:
       postgres:
         condition: service_healthy
@@ -86,6 +87,7 @@ services:
     tmpfs: [/tmp]
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SETPCAP]
     init: true
     networks: [tmdb-private]
 
@@ -94,7 +96,8 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    entrypoint: [/usr/local/bin/tmdb-images]
+    entrypoint: [/usr/local/bin/tmdb-runtime, media]
+    user: "0:0"
     depends_on:
       postgres:
         condition: service_healthy
@@ -107,6 +110,7 @@ services:
     tmpfs: [/tmp]
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SETPCAP]
     init: true
     healthcheck:
       test: [CMD, curl, --fail, --silent, http://127.0.0.1:8090/health/live]

@@ -971,13 +971,72 @@ pub enum StorageError {
     DigestMismatch,
     /// Filesystem operation failed without exposing a path.
     #[error("image storage operation failed")]
-    Io(#[source] std::io::Error),
+    Io {
+        /// Fixed publication stage that failed.
+        operation: StorageOperation,
+        /// Underlying I/O error. Callers must log only its error kind.
+        #[source]
+        source: std::io::Error,
+    },
     /// A destination exists but is not a regular file.
     #[error("image storage destination conflicts with an existing entry")]
     DestinationConflict,
     /// A downloaded image could not be converted into deterministic derivatives.
     #[error("image derivative generation failed")]
     Derivative,
+}
+
+/// Fixed media-publication stages used in safe terminal diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageOperation {
+    /// Create the bounded `/config/media/images` scratch directory.
+    PrepareScratchDirectory,
+    /// Create a unique scratch image file.
+    CreateScratchFile,
+    /// Write downloaded bytes to the scratch image file.
+    WriteScratchFile,
+    /// Sync a scratch image file before publication.
+    SyncScratchFile,
+    /// Check whether the final destination already exists.
+    CheckDestination,
+    /// Read existing destination metadata.
+    ReadDestinationMetadata,
+    /// Hash an existing destination to verify deduplication.
+    VerifyExistingDigest,
+    /// Create the final destination directory.
+    PrepareDestinationDirectory,
+    /// Copy scratch content into a destination-local temporary file.
+    CopyToDestination,
+    /// Sync the destination-local temporary file.
+    SyncDestinationFile,
+    /// Atomically rename the temporary file into its final destination.
+    PublishDestination,
+}
+
+impl StorageOperation {
+    /// Returns the stable, safe diagnostic value for this stage.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PrepareScratchDirectory => "prepare_scratch_directory",
+            Self::CreateScratchFile => "create_scratch_file",
+            Self::WriteScratchFile => "write_scratch_file",
+            Self::SyncScratchFile => "sync_scratch_file",
+            Self::CheckDestination => "check_destination",
+            Self::ReadDestinationMetadata => "read_destination_metadata",
+            Self::VerifyExistingDigest => "verify_existing_digest",
+            Self::PrepareDestinationDirectory => "prepare_destination_directory",
+            Self::CopyToDestination => "copy_to_destination",
+            Self::SyncDestinationFile => "sync_destination_file",
+            Self::PublishDestination => "publish_destination",
+        }
+    }
+}
+
+impl StorageError {
+    fn io(operation: StorageOperation, source: std::io::Error) -> Self {
+        Self::Io { operation, source }
+    }
 }
 
 /// Scratch/permanent image store.  Scratch and permanent roots are checked to
@@ -1093,7 +1152,7 @@ impl ImageStore {
         let scratch_dir = self.work_root.join("images");
         tokio::fs::create_dir_all(&scratch_dir)
             .await
-            .map_err(StorageError::Io)?;
+            .map_err(|error| StorageError::io(StorageOperation::PrepareScratchDirectory, error))?;
         let (relative, public_mime, public_bytes, result) = match self.layout {
             StorageLayout::ContentAddressed => {
                 let relative = Self::relative_path(digest);
@@ -1196,21 +1255,24 @@ impl ImageStore {
             .create_new(true)
             .open(scratch)
             .await
-            .map_err(StorageError::Io)?;
+            .map_err(|error| StorageError::io(StorageOperation::CreateScratchFile, error))?;
         scratch_file
             .write_all(body)
             .await
-            .map_err(StorageError::Io)?;
-        scratch_file.sync_all().await.map_err(StorageError::Io)?;
+            .map_err(|error| StorageError::io(StorageOperation::WriteScratchFile, error))?;
+        scratch_file
+            .sync_all()
+            .await
+            .map_err(|error| StorageError::io(StorageOperation::SyncScratchFile, error))?;
         drop(scratch_file);
 
         if tokio::fs::try_exists(destination)
             .await
-            .map_err(StorageError::Io)?
+            .map_err(|error| StorageError::io(StorageOperation::CheckDestination, error))?
         {
-            let metadata = tokio::fs::metadata(destination)
-                .await
-                .map_err(StorageError::Io)?;
+            let metadata = tokio::fs::metadata(destination).await.map_err(|error| {
+                StorageError::io(StorageOperation::ReadDestinationMetadata, error)
+            })?;
             if !metadata.is_file() {
                 return Err(StorageError::DestinationConflict);
             }
@@ -1222,14 +1284,14 @@ impl ImageStore {
         }
 
         let parent = destination.parent().ok_or(StorageError::InvalidRoot)?;
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(StorageError::Io)?;
+        tokio::fs::create_dir_all(parent).await.map_err(|error| {
+            StorageError::io(StorageOperation::PrepareDestinationDirectory, error)
+        })?;
         let temporary = parent.join(format!(".{}.{}.tmp", Uuid::now_v7(), Uuid::now_v7()));
         let copy_result = tokio::fs::copy(scratch, &temporary).await;
         if let Err(error) = copy_result {
             let _ = tokio::fs::remove_file(&temporary).await;
-            return Err(StorageError::Io(error));
+            return Err(StorageError::io(StorageOperation::CopyToDestination, error));
         }
         let outcome = async {
             let temporary_file = tokio::fs::OpenOptions::new()
@@ -1237,19 +1299,22 @@ impl ImageStore {
                 .write(true)
                 .open(&temporary)
                 .await
-                .map_err(StorageError::Io)?;
-            temporary_file.sync_all().await.map_err(StorageError::Io)?;
+                .map_err(|error| StorageError::io(StorageOperation::SyncDestinationFile, error))?;
+            temporary_file
+                .sync_all()
+                .await
+                .map_err(|error| StorageError::io(StorageOperation::SyncDestinationFile, error))?;
             drop(temporary_file);
             match tokio::fs::rename(&temporary, destination).await {
                 Ok(()) => Ok(PublishOutcome::Published),
                 Err(_error)
-                    if tokio::fs::try_exists(destination)
-                        .await
-                        .map_err(StorageError::Io)? =>
+                    if tokio::fs::try_exists(destination).await.map_err(|error| {
+                        StorageError::io(StorageOperation::CheckDestination, error)
+                    })? =>
                 {
-                    let metadata = tokio::fs::metadata(destination)
-                        .await
-                        .map_err(StorageError::Io)?;
+                    let metadata = tokio::fs::metadata(destination).await.map_err(|error| {
+                        StorageError::io(StorageOperation::ReadDestinationMetadata, error)
+                    })?;
                     if metadata.is_file() {
                         if file_matches_digest(destination, digest).await? {
                             Ok(PublishOutcome::AlreadyPresent)
@@ -1260,7 +1325,10 @@ impl ImageStore {
                         Err(StorageError::DestinationConflict)
                     }
                 }
-                Err(error) => Err(StorageError::Io(error)),
+                Err(error) => Err(StorageError::io(
+                    StorageOperation::PublishDestination,
+                    error,
+                )),
             }
         }
         .await;
@@ -1368,11 +1436,14 @@ fn encode_derivatives(body: &[u8]) -> Result<(Vec<u8>, Vec<u8>), StorageError> {
 async fn file_matches_digest(path: &Path, expected: ImageDigest) -> Result<bool, StorageError> {
     let mut file = tokio::fs::File::open(path)
         .await
-        .map_err(StorageError::Io)?;
+        .map_err(|error| StorageError::io(StorageOperation::VerifyExistingDigest, error))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
-        let read = file.read(&mut buffer).await.map_err(StorageError::Io)?;
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|error| StorageError::io(StorageOperation::VerifyExistingDigest, error))?;
         if read == 0 {
             break;
         }

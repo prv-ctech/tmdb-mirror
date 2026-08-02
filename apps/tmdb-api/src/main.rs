@@ -10,16 +10,17 @@ use tmdb_api::{
 };
 use tmdb_config::{AppConfig, EnvSource};
 use tmdb_db::{CatalogRepository, PoolPolicy, connect_direct};
-use tmdb_observability::{LogFormat, Metrics, init_tracing};
+use tmdb_observability::{Metrics, init_tracing_from_env};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing(env!("CARGO_PKG_NAME"), LogFormat::Json)
-        .map_err(|error| anyhow::anyhow!(error))?;
+    init_tracing_from_env(env!("CARGO_PKG_NAME")).map_err(|error| anyhow::anyhow!(error))?;
+    tracing::info!(event = "api_starting");
     let config = AppConfig::load(&EnvSource).context("load API configuration")?;
     let allow_local_media = load_bool("ALLOW_LOCAL_MEDIA")?;
     let media_base_url = load_optional_string("TMDB_MEDIA_BASE_URL")?;
+    let local_media_url_configured = media_base_url.is_some();
     let pool = connect_direct(&config.database, PoolPolicy::ReadOnly)
         .await
         .map_err(|error| anyhow::anyhow!(error))
@@ -46,6 +47,11 @@ async fn main() -> anyhow::Result<()> {
         .context("bind admin API listener")?;
     tracing::info!(event = "listener_started", listener = "public");
     tracing::info!(event = "listener_started", listener = "admin");
+    tracing::info!(
+        event = "api_ready",
+        local_media_enabled = allow_local_media,
+        local_media_url_configured,
+    );
 
     let cancellation = CancellationToken::new();
     let signal_cancellation = cancellation.clone();

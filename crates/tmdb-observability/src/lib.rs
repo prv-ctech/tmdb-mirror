@@ -16,7 +16,7 @@ use prometheus_client::{
     registry::{Registry, Unit},
 };
 use thiserror::Error;
-use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
+use tracing_subscriber::EnvFilter;
 
 const DEFAULT_HISTOGRAM_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 10.0,
@@ -354,8 +354,8 @@ impl Metrics {
 pub enum LogFormat {
     /// Structured JSON suitable for production collection.
     Json,
-    /// Human-readable compact output for local development.
-    Compact,
+    /// Colorized human-readable output for an interactive terminal.
+    Pretty,
 }
 
 /// Failure while building or installing the process-wide tracing subscriber.
@@ -363,11 +363,64 @@ pub enum LogFormat {
 pub enum InitTracingError {
     #[error("invalid tracing filter")]
     InvalidFilter(#[source] tracing_subscriber::filter::ParseError),
+    #[error("TMDB_LOG_FORMAT must be pretty or json")]
+    InvalidLogFormat,
+    #[error("TMDB_LOG_LEVEL must be error, warn, info, debug, or trace")]
+    InvalidLogLevel,
     #[error("tracing subscriber is already initialized")]
     AlreadyInitialized,
 }
 
-/// Initializes tracing using `RUST_LOG` or a strict INFO default.
+/// Initializes tracing using the deployment's human-readable log settings.
+///
+/// `TMDB_LOG_FORMAT` defaults to `pretty`; set it to `json` only when a log
+/// collector needs structured JSON. `RUST_LOG` remains an advanced complete
+/// filter override. Without it, `TMDB_LOG_LEVEL` defaults to `info`.
+///
+/// # Errors
+///
+/// Returns an error for an invalid log format/level or an already-initialized
+/// process-wide subscriber.
+pub fn init_tracing_from_env(service_name: &str) -> Result<(), InitTracingError> {
+    let configured_format = std::env::var("TMDB_LOG_FORMAT").ok();
+    init_tracing(
+        service_name,
+        parse_log_format(configured_format.as_deref())?,
+    )
+}
+
+fn parse_log_format(value: Option<&str>) -> Result<LogFormat, InitTracingError> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("pretty") => Ok(LogFormat::Pretty),
+        Some("json") => Ok(LogFormat::Json),
+        Some(_) => Err(InitTracingError::InvalidLogFormat),
+    }
+}
+
+fn default_filter(service_name: &str) -> Result<String, InitTracingError> {
+    let configured_level = std::env::var("TMDB_LOG_LEVEL").ok();
+    let level = parse_log_level(configured_level.as_deref())?;
+    // SQLx emits full query text for routine slow-statement warnings. The
+    // services emit bounded lifecycle and database outcomes themselves, so
+    // default terminal logs keep SQLx errors but suppress raw query noise.
+    Ok(format!("{level},{service_name}={level},sqlx=error"))
+}
+
+fn parse_log_level(value: Option<&str>) -> Result<String, InitTracingError> {
+    let level = value
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "info".to_owned());
+    if !matches!(
+        level.as_str(),
+        "error" | "warn" | "info" | "debug" | "trace"
+    ) {
+        return Err(InitTracingError::InvalidLogLevel);
+    }
+    Ok(level)
+}
+
+/// Initializes tracing using `RUST_LOG` or the `TMDB_LOG_LEVEL` INFO default.
 ///
 /// # Errors
 ///
@@ -391,7 +444,7 @@ pub fn init_tracing_with_filter(
         .map(str::to_owned)
         .or_else(|| std::env::var("RUST_LOG").ok())
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| format!("info,{service_name}=info"));
+        .map_or_else(|| default_filter(service_name), Ok)?;
     let filter = EnvFilter::try_new(filter_value).map_err(InitTracingError::InvalidFilter)?;
 
     install_sanitized_panic_hook();
@@ -399,17 +452,54 @@ pub fn init_tracing_with_filter(
         LogFormat::Json => tracing_subscriber::fmt()
             .json()
             .with_env_filter(filter)
-            .with_span_events(FmtSpan::CLOSE)
+            .with_ansi(false)
             .with_target(false)
             .try_init(),
-        LogFormat::Compact => tracing_subscriber::fmt()
+        LogFormat::Pretty => tracing_subscriber::fmt()
             .compact()
+            .with_ansi(true)
             .with_env_filter(filter)
-            .with_span_events(FmtSpan::CLOSE)
             .with_target(false)
+            .with_file(false)
+            .with_line_number(false)
             .try_init(),
     };
     result.map_err(|_| InitTracingError::AlreadyInitialized)
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_logs_default_to_pretty_and_accept_json() {
+        assert!(matches!(parse_log_format(None), Ok(LogFormat::Pretty)));
+        assert!(matches!(parse_log_format(Some("")), Ok(LogFormat::Pretty)));
+        assert!(matches!(
+            parse_log_format(Some("json")),
+            Ok(LogFormat::Json)
+        ));
+    }
+
+    #[test]
+    fn invalid_terminal_log_format_is_rejected() {
+        assert!(matches!(
+            parse_log_format(Some("xml")),
+            Err(InitTracingError::InvalidLogFormat)
+        ));
+    }
+
+    #[test]
+    fn terminal_log_level_is_bounded_and_case_insensitive() {
+        assert!(matches!(
+            parse_log_level(Some(" DEBUG ")),
+            Ok(level) if level == "debug"
+        ));
+        assert!(matches!(
+            parse_log_level(Some("verbose")),
+            Err(InitTracingError::InvalidLogLevel)
+        ));
+    }
 }
 
 fn install_sanitized_panic_hook() {
@@ -447,17 +537,34 @@ pub struct HttpRequestLog<'a> {
 /// Emits a structured request completion event without untrusted values.
 pub fn log_http_request(event: &HttpRequestLog<'_>) {
     let safe_outcome = bounded_identity(event.outcome);
-    tracing::info!(
-        event = "http_request_complete",
-        service = %bounded_identity(event.service),
-        version = %bounded_identity(event.version),
-        request_id = %bounded_identity(event.request_id),
-        listener = event.listener.as_str(),
-        method = event.method.as_str(),
-        route = %normalize_route(event.route),
-        status = event.status,
-        status_class = StatusClass::from_status(event.status).as_str(),
-        duration_ms = event.duration.as_secs_f64() * 1000.0,
-        outcome = %safe_outcome,
-    );
+    let status_class = StatusClass::from_status(event.status).as_str();
+    if event.status >= 400 {
+        tracing::warn!(
+            event = "http_request_complete",
+            service = %bounded_identity(event.service),
+            version = %bounded_identity(event.version),
+            request_id = %bounded_identity(event.request_id),
+            listener = event.listener.as_str(),
+            method = event.method.as_str(),
+            route = %normalize_route(event.route),
+            status = event.status,
+            status_class,
+            duration_ms = event.duration.as_secs_f64() * 1000.0,
+            outcome = %safe_outcome,
+        );
+    } else {
+        tracing::debug!(
+            event = "http_request_complete",
+            service = %bounded_identity(event.service),
+            version = %bounded_identity(event.version),
+            request_id = %bounded_identity(event.request_id),
+            listener = event.listener.as_str(),
+            method = event.method.as_str(),
+            route = %normalize_route(event.route),
+            status = event.status,
+            status_class,
+            duration_ms = event.duration.as_secs_f64() * 1000.0,
+            outcome = %safe_outcome,
+        );
+    }
 }

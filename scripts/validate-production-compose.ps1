@@ -93,14 +93,41 @@ if ($composeText -notmatch '\$\$POSTGRES_USER' -or $composeText -notmatch '\$\$P
     throw 'PostgreSQL health checks must interpolate POSTGRES_USER and POSTGRES_DB inside the container.'
 }
 
+# The worker and media service must use the bounded root-only preparer, which
+# creates only the fixed child paths before it drops to UID/GID 10001. Do not
+# silently regress to a manual host chmod/chown requirement or a broadly
+# privileged application process.
+foreach ($role in @('worker', 'media')) {
+    if ($composeText -notmatch "entrypoint:\s*\[\s*/usr/local/bin/tmdb-runtime\s*,\s*$role\s*\]") {
+        throw "The $role service must start through the automatic tmdb-runtime storage preparer."
+    }
+}
+if ($composeText -match 'entrypoint:\s*\[\s*/usr/local/bin/tmdb-(worker|images)') {
+    throw 'Worker services must not bypass the automatic tmdb-runtime storage preparer.'
+}
+if ($composeText -notmatch 'cap_add:\s*\[\s*CHOWN\s*,\s*DAC_OVERRIDE\s*,\s*FOWNER\s*,\s*SETGID\s*,\s*SETUID\s*,\s*SETPCAP\s*\]') {
+    throw 'Worker services must retain the minimal startup capabilities needed to prepare fixed storage paths and drop privileges.'
+}
+
 $temporaryOutput = [System.IO.Path]::GetTempFileName()
+$previousTmdbEnvFile = [Environment]::GetEnvironmentVariable('TMDB_ENV_FILE', 'Process')
 try {
+    # The canonical template defaults to ../.env for normal deployment. Point
+    # it at the caller-selected file during validation so this command tests
+    # the exact settings it was given without creating a throwaway root .env.
+    $env:TMDB_ENV_FILE = $envPath
     & docker compose --env-file $envPath --file $composePath config --quiet *> $temporaryOutput
     if ($LASTEXITCODE -ne 0) {
         throw 'Docker Compose rejected the production template or its interpolation.'
     }
 }
 finally {
+    if ($null -eq $previousTmdbEnvFile) {
+        Remove-Item Env:TMDB_ENV_FILE -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:TMDB_ENV_FILE = $previousTmdbEnvFile
+    }
     Remove-Item -LiteralPath $temporaryOutput -Force -ErrorAction SilentlyContinue
 }
 

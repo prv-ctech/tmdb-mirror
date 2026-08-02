@@ -407,6 +407,10 @@ pub(crate) fn validate_failure_code(value: &str) -> Result<(), ValidationError> 
             | "invalid_payload"
             | "lease_expired"
             | "attempts_exhausted"
+            | "entity_not_ready"
+            | "export_storage"
+            | "database_unavailable"
+            | "export_queue_incomplete"
     ) {
         Ok(())
     } else {
@@ -441,4 +445,21 @@ fn validate_text(
         return Err(error);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_failure_codes_remain_canonical() {
+        for code in [
+            "entity_not_ready",
+            "export_storage",
+            "database_unavailable",
+            "export_queue_incomplete",
+        ] {
+            assert!(validate_failure_code(code).is_ok(), "{code}");
+        }
+    }
 }

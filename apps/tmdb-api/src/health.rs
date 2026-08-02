@@ -53,7 +53,7 @@ pub async fn ready(
     let request_id = request_id.map_or_else(String::new, |value| value.0.0);
     match tokio::time::timeout(READINESS_TIMEOUT, state.probe.check()).await {
         Ok(Ok(report)) => {
-            tracing::info!(event = "readiness", outcome = "ready");
+            tracing::debug!(event = "readiness", outcome = "ready");
             Json(ReadyResponse {
                 service: env!("CARGO_PKG_NAME"),
                 version: env!("CARGO_PKG_VERSION"),
@@ -67,7 +67,7 @@ pub async fn ready(
             .into_response()
         }
         Ok(Err(_)) => {
-            tracing::info!(event = "readiness", outcome = "probe_failed");
+            tracing::warn!(event = "readiness", outcome = "probe_failed");
             state
                 .metrics
                 .inc_readiness_failure(tmdb_observability::ReadinessFailureReason::ProbeFailed);
@@ -79,7 +79,7 @@ pub async fn ready(
             )
         }
         Err(_) => {
-            tracing::info!(event = "readiness", outcome = "probe_timeout");
+            tracing::warn!(event = "readiness", outcome = "probe_timeout");
             state
                 .metrics
                 .inc_readiness_failure(tmdb_observability::ReadinessFailureReason::ProbeTimeout);

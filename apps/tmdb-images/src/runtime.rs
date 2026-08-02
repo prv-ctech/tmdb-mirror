@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::image::{
     DownloadPolicy, HttpTrawlFallback, ImageDownloader, ImageError, ImageJobPayload, ImageStore,
-    ImageTransport, ReqwestTransport, TrawlFallback,
+    ImageTransport, ReqwestTransport, StorageError, TrawlFallback,
 };
 use crate::media_server;
 use crate::persistence::persist_ready;
@@ -18,7 +18,8 @@ use tmdb_db::{PoolPolicy, connect_direct};
 use tmdb_jobs::{
     ClaimedJob, JobExecutionError, JobExecutor, JobRepository, Worker, WorkerConfig, WorkerId,
 };
-use tmdb_observability::{LogFormat, init_tracing};
+use tmdb_media::{RuntimeStorageRole, prepare_runtime_storage};
+use tmdb_observability::init_tracing_from_env;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -28,8 +29,9 @@ const IMAGE_QUEUE_READY_RETRY: Duration = Duration::from_secs(1);
 
 /// Starts the direct-database image worker shell.
 pub async fn run() -> anyhow::Result<()> {
-    init_tracing(env!("CARGO_PKG_NAME"), LogFormat::Json)
-        .map_err(|error| anyhow::anyhow!(error))?;
+    init_tracing_from_env(env!("CARGO_PKG_NAME")).map_err(|error| anyhow::anyhow!(error))?;
+    tracing::info!(event = "media_worker_starting");
+    prepare_media_storage()?;
     let source = EnvSource;
     let environment = load_environment(source)?;
     let database = load_shared_database(&source, environment)?;
@@ -38,6 +40,8 @@ pub async fn run() -> anyhow::Result<()> {
     let store = load_image_store()?;
     let downloader = load_downloader(source)?;
     let allow_local_media = parse_or(source, "ALLOW_LOCAL_MEDIA", false)?;
+    let trawl_fallback_configured =
+        std::env::var("TMDB_TRAWL_BASE_URL").is_ok_and(|value| !value.trim().is_empty());
     let media_bind = parse_or(source, "TMDB_MEDIA_BIND", "0.0.0.0:8090".to_owned())?
         .parse::<SocketAddr>()
         .map_err(|_| anyhow::anyhow!("configuration field TMDB_MEDIA_BIND is invalid"))?;
@@ -55,6 +59,12 @@ pub async fn run() -> anyhow::Result<()> {
         .into_iter()
         .map(|config| Worker::new(JobRepository::new(pool.clone()), executor.clone(), config))
         .collect();
+    tracing::info!(
+        event = "media_worker_ready",
+        download_workers = worker_concurrency,
+        local_media_enabled = allow_local_media,
+        trawl_fallback_configured,
+    );
     let cancellation = CancellationToken::new();
     let signal_cancellation = cancellation.clone();
     tokio::spawn(async move {
@@ -67,6 +77,7 @@ pub async fn run() -> anyhow::Result<()> {
         signal_cancellation.cancel();
     });
     let media_cancellation = cancellation.clone();
+    tracing::info!(event = "media_server_starting");
     let media_server = tokio::spawn(async move {
         media_server::run(
             media_bind,
@@ -90,6 +101,28 @@ pub async fn run() -> anyhow::Result<()> {
     }
     pool.close().await;
     result
+}
+
+fn prepare_media_storage() -> anyhow::Result<()> {
+    prepare_runtime_storage(RuntimeStorageRole::Media).map_err(|error| {
+        tracing::error!(
+            event = "storage_preflight_failed",
+            role = RuntimeStorageRole::Media.as_str(),
+            path = error.path().as_str(),
+            operation = error.operation(),
+            io_kind = error.io_kind().unwrap_or("not_applicable"),
+        );
+        anyhow::anyhow!(
+            "media storage preflight failed at {} ({})",
+            error.path().as_str(),
+            error.operation(),
+        )
+    })?;
+    tracing::info!(
+        event = "storage_preflight_ready",
+        role = RuntimeStorageRole::Media.as_str()
+    );
+    Ok(())
 }
 
 async fn wait_for_image_job_queue(pool: &PgPool, cancellation: &CancellationToken) -> bool {
@@ -180,24 +213,92 @@ where
         else {
             return Ok(json!({"ok": true}));
         };
+        tracing::debug!(
+            event = "image_job_started",
+            job_id = %job.job_id().as_uuid(),
+            attempt = job.attempts(),
+            entity_type = image_entity_type_name(payload.entity_type),
+            entity_id = payload.entity_id,
+            image_kind = image_kind_name(payload.kind),
+            anime = payload.anime,
+        );
         if !self.allow_local_media {
+            tracing::debug!(
+                event = "image_job_skipped",
+                job_id = %job.job_id().as_uuid(),
+                reason = "local_media_disabled",
+            );
             return Ok(json!({"skipped": "local_media_disabled"}));
         }
         {
-            let image = self
-                .downloader
-                .download(&payload)
-                .await
-                .map_err(|error| map_download_error(&error))?;
-            let stored = self.store.publish(&payload, &image).await.map_err(|_| {
-                JobExecutionError::retry("execution_failed", Duration::from_secs(5))
-            })?;
-            persist_ready(&self.pool, &payload, &stored.metadata)
-                .await
-                .map_err(map_persist_error)?;
+            let image = match self.downloader.download(&payload).await {
+                Ok(image) => image,
+                Err(error) => {
+                    let job_error = map_download_error(&error);
+                    tracing::warn!(
+                        event = "image_download_failed",
+                        job_id = %job.job_id().as_uuid(),
+                        entity_type = image_entity_type_name(payload.entity_type),
+                        entity_id = payload.entity_id,
+                        image_kind = image_kind_name(payload.kind),
+                        failure_code = job_error.failure_code(),
+                        failure_reason = image_download_reason(&error),
+                        http_status = image_http_status(&error),
+                    );
+                    return Err(job_error);
+                }
+            };
+            let stored = match self.store.publish(&payload, &image).await {
+                Ok(stored) => stored,
+                Err(error) => {
+                    let job_error = map_storage_error(&error);
+                    tracing::error!(
+                        event = "image_publish_failed",
+                        job_id = %job.job_id().as_uuid(),
+                        entity_type = image_entity_type_name(payload.entity_type),
+                        entity_id = payload.entity_id,
+                        image_kind = image_kind_name(payload.kind),
+                        failure_code = job_error.failure_code(),
+                        storage_reason = storage_error_reason(&error),
+                        storage_operation = storage_error_operation(&error),
+                        io_kind = storage_io_kind(&error).unwrap_or("not_applicable"),
+                    );
+                    return Err(job_error);
+                }
+            };
+            if let Err(error) = persist_ready(&self.pool, &payload, &stored.metadata).await {
+                let job_error = map_persist_error(error);
+                tracing::warn!(
+                    event = "image_metadata_persist_failed",
+                    job_id = %job.job_id().as_uuid(),
+                    entity_type = image_entity_type_name(payload.entity_type),
+                    entity_id = payload.entity_id,
+                    image_kind = image_kind_name(payload.kind),
+                    failure_code = job_error.failure_code(),
+                    persistence_reason = persist_error_reason(error),
+                );
+                return Err(job_error);
+            }
+            tracing::debug!(
+                event = "image_published",
+                job_id = %job.job_id().as_uuid(),
+                entity_type = image_entity_type_name(payload.entity_type),
+                entity_id = payload.entity_id,
+                image_kind = image_kind_name(payload.kind),
+                source = image_source_name(image.source),
+                deduplicated = stored.deduplicated,
+                bytes = stored.metadata.byte_size,
+            );
             serde_json::to_value(stored.metadata)
                 .map(|metadata| json!({"metadata": metadata, "deduplicated": stored.deduplicated}))
-                .map_err(|_| JobExecutionError::retry("execution_failed", Duration::from_secs(5)))
+                .map_err(|_| {
+                    tracing::error!(
+                        event = "image_result_serialization_failed",
+                        job_id = %job.job_id().as_uuid(),
+                        error_code = "execution_failed",
+                    );
+                    JobExecutionError::retry("execution_failed", Duration::from_secs(5))
+                })
         }
     }
 }
@@ -260,6 +361,112 @@ fn map_download_error(error: &ImageError) -> JobExecutionError {
         | ImageError::HttpStatus(_) => "upstream_unavailable",
     };
     JobExecutionError::retry(code, Duration::from_secs(5))
+}
+
+fn map_storage_error(_: &StorageError) -> JobExecutionError {
+    JobExecutionError::retry("execution_failed", Duration::from_secs(5))
+}
+
+fn image_entity_type_name(entity_type: crate::image::ImageEntityType) -> &'static str {
+    match entity_type {
+        crate::image::ImageEntityType::Movie => "movie",
+        crate::image::ImageEntityType::Tv => "tv",
+        crate::image::ImageEntityType::Season => "season",
+        crate::image::ImageEntityType::Episode => "episode",
+        crate::image::ImageEntityType::Person => "person",
+        crate::image::ImageEntityType::Collection => "collection",
+        crate::image::ImageEntityType::Company => "company",
+        crate::image::ImageEntityType::Network => "network",
+    }
+}
+
+fn image_kind_name(kind: crate::image::ImageKind) -> &'static str {
+    match kind {
+        crate::image::ImageKind::Poster => "poster",
+        crate::image::ImageKind::Backdrop => "backdrop",
+        crate::image::ImageKind::Still => "still",
+        crate::image::ImageKind::Profile => "profile",
+        crate::image::ImageKind::Logo => "logo",
+        crate::image::ImageKind::Banner => "banner",
+        crate::image::ImageKind::Other => "other",
+    }
+}
+
+fn image_source_name(source: crate::image::ImageSource) -> &'static str {
+    match source {
+        crate::image::ImageSource::Direct => "direct",
+        crate::image::ImageSource::Trawl => "trawl",
+    }
+}
+
+fn image_download_reason(error: &ImageError) -> &'static str {
+    match error {
+        ImageError::InvalidPolicy => "invalid_policy",
+        ImageError::InvalidTrawlUrl => "invalid_trawl_url",
+        ImageError::DisallowedHost => "disallowed_host",
+        ImageError::InvalidRedirect => "invalid_redirect",
+        ImageError::RedirectLimit => "redirect_limit",
+        ImageError::ChallengeDetected => "challenge_detected",
+        ImageError::FallbackUnavailable => "trawl_unavailable",
+        ImageError::HttpStatus(_) => "http_status",
+        ImageError::UnsupportedMime => "unsupported_mime",
+        ImageError::InvalidImage => "invalid_image",
+        ImageError::ImageTooLarge => "image_too_large",
+        ImageError::TooLarge => "body_too_large",
+        ImageError::Truncated => "body_truncated",
+        ImageError::BodyRead => "body_read_failed",
+        ImageError::Transport(_) => "transport_failed",
+    }
+}
+
+fn image_http_status(error: &ImageError) -> u16 {
+    match error {
+        ImageError::HttpStatus(status) => *status,
+        _ => 0,
+    }
+}
+
+fn storage_error_reason(error: &StorageError) -> &'static str {
+    match error {
+        StorageError::InvalidRoot => "invalid_root",
+        StorageError::InvalidPayload => "invalid_payload",
+        StorageError::DigestMismatch => "digest_mismatch",
+        StorageError::Io { .. } => "io",
+        StorageError::DestinationConflict => "destination_conflict",
+        StorageError::Derivative => "derivative_failed",
+    }
+}
+
+fn storage_io_kind(error: &StorageError) -> Option<&'static str> {
+    let StorageError::Io { source, .. } = error else {
+        return None;
+    };
+    Some(match source.kind() {
+        std::io::ErrorKind::PermissionDenied => "permission_denied",
+        std::io::ErrorKind::ReadOnlyFilesystem => "read_only_filesystem",
+        std::io::ErrorKind::StorageFull => "storage_full",
+        std::io::ErrorKind::QuotaExceeded => "quota_exceeded",
+        std::io::ErrorKind::NotFound => "not_found",
+        std::io::ErrorKind::AlreadyExists => "already_exists",
+        _ => "io_error",
+    })
+}
+
+fn storage_error_operation(error: &StorageError) -> &'static str {
+    match error {
+        StorageError::Io { operation, .. } => operation.as_str(),
+        _ => "not_applicable",
+    }
+}
+
+fn persist_error_reason(error: crate::persistence::PersistError) -> &'static str {
+    match error {
+        crate::persistence::PersistError::InvalidPayload => "invalid_payload",
+        crate::persistence::PersistError::OwnerNotFound => "owner_not_found",
+        crate::persistence::PersistError::LanguageNotFound => "language_not_found",
+        crate::persistence::PersistError::OwnerConflict => "owner_conflict",
+        crate::persistence::PersistError::Database => "database",
+    }
 }
 
 fn load_image_store() -> anyhow::Result<ImageStore> {
@@ -483,6 +690,26 @@ mod tests {
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].worker_id.as_str(), "tmdb-media");
         Ok(())
+    }
+
+    #[test]
+    fn image_storage_diagnostics_keep_permission_failures_actionable_and_bounded() {
+        let error = StorageError::Io {
+            operation: crate::image::StorageOperation::PrepareDestinationDirectory,
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+        assert_eq!(storage_error_reason(&error), "io");
+        assert_eq!(
+            storage_error_operation(&error),
+            "prepare_destination_directory"
+        );
+        assert_eq!(storage_io_kind(&error), Some("permission_denied"));
+        assert_eq!(map_storage_error(&error).failure_code(), "execution_failed");
+        assert_eq!(
+            image_download_reason(&ImageError::HttpStatus(503)),
+            "http_status"
+        );
+        assert_eq!(image_http_status(&ImageError::HttpStatus(503)), 503);
     }
 
     #[sqlx::test(migrations = false)]
