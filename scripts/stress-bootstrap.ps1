@@ -129,7 +129,7 @@ function Wait-Migrations {
                     '--username', $stressDatabaseUser, '--dbname', $stressDatabaseName, '-c',
                     "SELECT COALESCE(max(version), 0) FROM ops._sqlx_migrations WHERE success"
                 )).Trim()
-                if ([int]$version -ge 19) { return }
+                if ([int]$version -ge 20) { return }
             }
         }
         catch {

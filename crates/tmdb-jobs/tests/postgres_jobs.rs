@@ -57,7 +57,7 @@ async fn jobs_migration_has_exact_readiness_indexes_and_hardened_functions(
     assert_eq!(
         versions,
         [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
         ]
     );
     let revision: String = sqlx::query_scalar("SELECT schema_revision FROM ops.readiness")

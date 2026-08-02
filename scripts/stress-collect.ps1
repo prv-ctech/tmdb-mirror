@@ -11,6 +11,7 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $composeFile = Join-Path $repoRoot 'deploy/compose.stress.yaml'
 $runtimeRoot = Join-Path (Join-Path $repoRoot '.stress-runtime') $ProjectName
 $envFile = Join-Path $runtimeRoot 'compose.env'
+$metadataFile = Join-Path $runtimeRoot 'metadata.json'
 $resultRoot = Join-Path $runtimeRoot 'results'
 New-Item -ItemType Directory -Force -Path $resultRoot | Out-Null
 $stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
@@ -19,7 +20,25 @@ $composeArgs = @('compose', '--env-file', $envFile, '--project-name', $ProjectNa
 if (-not (Test-Path -LiteralPath $envFile -PathType Leaf)) {
     throw "Runtime environment is missing: $envFile"
 }
+if (-not (Test-Path -LiteralPath $metadataFile -PathType Leaf)) {
+    throw "Stress runtime metadata is missing: $metadataFile"
+}
 $databaseIdentity = Read-StressDatabaseIdentity -Path $envFile
+$metadata = Get-Content -Raw -LiteralPath $metadataFile | ConvertFrom-Json
+if ([string]::IsNullOrWhiteSpace([string]$metadata.started_at_utc)) {
+    throw "Stress runtime metadata does not contain started_at_utc: $metadataFile"
+}
+try {
+    $startedAt = [DateTimeOffset]::Parse(
+        [string]$metadata.started_at_utc,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind
+    )
+}
+catch {
+    throw "Stress runtime metadata contains an invalid started_at_utc value: $metadataFile"
+}
+$startedAtUtc = $startedAt.UtcDateTime.ToString('O')
 
 function Invoke-External {
     param([Parameter(Mandatory)][string[]]$Arguments)
@@ -33,7 +52,37 @@ $ps = Invoke-External -Arguments ($composeArgs + @('ps', '--all'))
 [System.IO.File]::WriteAllText((Join-Path $resultRoot "compose-$stamp.txt"), $ps, [System.Text.UTF8Encoding]::new($false))
 
 $logs = Invoke-External -Arguments ($composeArgs + @('logs', '--no-color', '--timestamps'))
-[System.IO.File]::WriteAllText((Join-Path $resultRoot "logs-$stamp.txt"), $logs, [System.Text.UTF8Encoding]::new($false))
+$logsPath = Join-Path $resultRoot "logs-$stamp.txt"
+[System.IO.File]::WriteAllText($logsPath, $logs, [System.Text.UTF8Encoding]::new($false))
+
+# The regression test covers crossed TV-detail and season writes at the
+# database boundary. Scope the runtime check to PostgreSQL logs from this
+# stress run so historical or application log text cannot create a false pass
+# or false failure.
+$postgresLogs = Invoke-External -Arguments ($composeArgs + @(
+    'logs', '--no-color', '--timestamps', '--since', $startedAtUtc, 'postgres'
+))
+$postgresLogsPath = Join-Path $resultRoot "postgres-logs-$stamp.txt"
+[System.IO.File]::WriteAllText($postgresLogsPath, $postgresLogs, [System.Text.UTF8Encoding]::new($false))
+$writeContention = [regex]::Matches(
+    $postgresLogs,
+    '(?im)^.*\bERROR:\s+(?:deadlock detected|canceling statement due to lock timeout)\b.*$'
+)
+if ($writeContention.Count -gt 0) {
+    $contentionPath = Join-Path $resultRoot "catalog-write-contention-$stamp.json"
+    $contention = [ordered]@{
+        checked_at_utc = [DateTime]::UtcNow.ToString('O')
+        run_started_at_utc = $startedAtUtc
+        postgres_log_path = $postgresLogsPath
+        matches = @($writeContention | ForEach-Object { $_.Value.Trim() })
+    }
+    [System.IO.File]::WriteAllText(
+        $contentionPath,
+        (($contention | ConvertTo-Json -Depth 4) + "`n"),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    throw "Catalog write contention was detected. See $contentionPath and $logsPath"
+}
 
 $stats = Invoke-External -Arguments @('stats', '--no-stream', '--format', '{{json .}}')
 [System.IO.File]::WriteAllText((Join-Path $resultRoot "docker-stats-$stamp.jsonl"), $stats, [System.Text.UTF8Encoding]::new($false))

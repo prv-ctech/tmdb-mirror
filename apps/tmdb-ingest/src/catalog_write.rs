@@ -14,6 +14,10 @@ use uuid::Uuid;
 const IMAGE_JOB_TYPE: &str = "image.download";
 const IMAGE_JOB_PAYLOAD_VERSION: i32 = 1;
 
+use super::catalog_locks::{
+    changes_write_resources, movie_write_resources, prelock_catalog_write_resources,
+    season_write_resources, tv_write_resources,
+};
 use super::{contains_anime_keyword, normalize_language, parse_source_date, source_id};
 
 /// Persists a movie and optionally creates local-media jobs in the same
@@ -32,7 +36,9 @@ pub(crate) async fn persist_movie_with_options(
             i64::try_from(value).map_err(|_| JobExecutionError::dead_letter("invalid_payload"))
         })
         .transpose()?;
+    let resources = movie_write_resources(movie, tmdb_id)?;
     let mut transaction = pool.begin().await.map_err(database_error)?;
+    prelock_catalog_write_resources(&mut transaction, resources).await?;
     let is_anime = contains_anime_keyword(&movie.keywords);
     let title_id = upsert_title(
         &mut transaction,
@@ -132,7 +138,9 @@ pub(crate) async fn persist_tv_with_options(
         })
         .transpose()?;
     let number_of_seasons = series.number_of_seasons.map(i32::from);
+    let resources = tv_write_resources(series, tmdb_id)?;
     let mut transaction = pool.begin().await.map_err(database_error)?;
+    prelock_catalog_write_resources(&mut transaction, resources).await?;
     let is_anime = contains_anime_keyword(&series.keywords);
     let title_id = upsert_title(
         &mut transaction,
@@ -234,7 +242,9 @@ pub(crate) async fn persist_season_with_options(
     let season_id = source_id(season.id)?;
     let season_number = i32::from(season.season_number);
     let air_date = parse_source_date(season.air_date.as_deref())?;
+    let resources = season_write_resources(tv_id, season, season_id)?;
     let mut transaction = pool.begin().await.map_err(database_error)?;
+    prelock_catalog_write_resources(&mut transaction, resources).await?;
     let parent: Option<(i64, bool)> = sqlx::query_as(
         "SELECT id, is_anime FROM catalog.titles
          WHERE media_type = 'tv' AND tmdb_id = $1 AND active
@@ -316,7 +326,9 @@ pub(crate) async fn persist_changes(
     media_type: MediaType,
     page: &ChangePage,
 ) -> Result<(), JobExecutionError> {
+    let resources = changes_write_resources(media_type, page)?;
     let mut transaction = pool.begin().await.map_err(database_error)?;
+    prelock_catalog_write_resources(&mut transaction, resources).await?;
     for changed in &page.results {
         let tmdb_id = source_id(changed.id)?;
         upsert_changed_title(
@@ -1185,9 +1197,16 @@ fn digest_hex(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use serde_json::Value;
     use sqlx::PgPool;
-    use tmdb_upstream::TmdbMovie;
+    use tmdb_upstream::{
+        TmdbCredit, TmdbCredits, TmdbEpisode, TmdbGenre, TmdbMovie, TmdbSeason, TmdbSeasonSummary,
+        TmdbTv,
+    };
+    use tokio::sync::Barrier;
 
     use super::*;
 
@@ -1267,5 +1286,207 @@ mod tests {
                 .await?;
         assert_eq!(count, 0);
         Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn concurrent_tv_and_season_writes_with_shared_resources_finish_without_lock_errors(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let series = concurrent_tv_fixture();
+        persist_tv_with_options(&pool, &series, false)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+        let season = concurrent_season_fixture();
+        let start = Arc::new(Barrier::new(9));
+        let mut writers = tokio::task::JoinSet::new();
+        for writer in 0_usize..8 {
+            let writer_pool = pool.clone();
+            let writer_start = Arc::clone(&start);
+            if writer.is_multiple_of(2) {
+                let series = series.clone();
+                writers.spawn(async move {
+                    writer_start.wait().await;
+                    persist_tv_with_options(&writer_pool, &series, false).await
+                });
+            } else {
+                let season = season.clone();
+                writers.spawn(async move {
+                    writer_start.wait().await;
+                    persist_season_with_options(&writer_pool, 800_001, &season, false).await
+                });
+            }
+        }
+        start.wait().await;
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(result) = writers.join_next().await {
+                result
+                    .map_err(|error| sqlx::Error::Protocol(error.to_string()))?
+                    .map_err(|error| as_sqlx_error(&error))?;
+            }
+            Ok::<(), sqlx::Error>(())
+        })
+        .await
+        .map_err(|_| sqlx::Error::Protocol("catalog writers exceeded 30 seconds".to_owned()))??;
+
+        let persisted: (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT count(*) FROM catalog.titles
+                   WHERE media_type = 'tv' AND tmdb_id = 800001),
+                 (SELECT count(*) FROM catalog.seasons WHERE id = 800011),
+                 (SELECT count(*) FROM catalog.episodes WHERE id = 800012)",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(persisted, (1, 1, 1));
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn concurrent_movies_with_reversed_shared_resource_order_finish_without_lock_errors(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        // This mirrors the production failure: separate titles begin their
+        // catalog writes at the same time but touch the same genre and person
+        // rows in opposite TMDB payload order. The resource prelock must make
+        // that source order irrelevant without changing the persisted order.
+        let forward = concurrent_movie_fixture(810_001, false);
+        let reverse = concurrent_movie_fixture(810_002, true);
+        let start = Arc::new(Barrier::new(9));
+        let mut writers = tokio::task::JoinSet::new();
+        for writer in 0_usize..8 {
+            let writer_pool = pool.clone();
+            let writer_start = Arc::clone(&start);
+            let movie = if writer.is_multiple_of(2) {
+                forward.clone()
+            } else {
+                reverse.clone()
+            };
+            writers.spawn(async move {
+                writer_start.wait().await;
+                persist_movie_with_options(&writer_pool, &movie, false).await
+            });
+        }
+        start.wait().await;
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(result) = writers.join_next().await {
+                result
+                    .map_err(|error| sqlx::Error::Protocol(error.to_string()))?
+                    .map_err(|error| as_sqlx_error(&error))?;
+            }
+            Ok::<(), sqlx::Error>(())
+        })
+        .await
+        .map_err(|_| sqlx::Error::Protocol("catalog writers exceeded 30 seconds".to_owned()))??;
+
+        let persisted: (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT count(*) FROM catalog.titles
+                   WHERE media_type = 'movie' AND tmdb_id IN (810001, 810002)),
+                 (SELECT count(*) FROM catalog.genres WHERE id IN (810021, 810022)),
+                 (SELECT count(*) FROM catalog.people WHERE id IN (810031, 810032))",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(persisted, (2, 2, 2));
+        Ok(())
+    }
+
+    fn concurrent_tv_fixture() -> TmdbTv {
+        TmdbTv {
+            id: 800_001,
+            name: Some("Concurrent TV fixture".to_owned()),
+            genres: vec![
+                TmdbGenre {
+                    id: 28,
+                    name: Some("Action".to_owned()),
+                },
+                TmdbGenre {
+                    id: 18,
+                    name: Some("Drama".to_owned()),
+                },
+            ],
+            credits: TmdbCredits {
+                cast: vec![TmdbCredit {
+                    id: 800_021,
+                    name: Some("Shared person".to_owned()),
+                    ..TmdbCredit::default()
+                }],
+                ..TmdbCredits::default()
+            },
+            seasons: vec![TmdbSeasonSummary {
+                id: 800_011,
+                season_number: 1,
+                name: Some("Season one".to_owned()),
+                ..TmdbSeasonSummary::default()
+            }],
+            ..TmdbTv::default()
+        }
+    }
+
+    fn concurrent_movie_fixture(tmdb_id: u64, reversed: bool) -> TmdbMovie {
+        let genres = [
+            TmdbGenre {
+                id: 810_021,
+                name: Some("First shared genre".to_owned()),
+            },
+            TmdbGenre {
+                id: 810_022,
+                name: Some("Second shared genre".to_owned()),
+            },
+        ];
+        let cast = [
+            TmdbCredit {
+                id: 810_031,
+                name: Some("First shared person".to_owned()),
+                ..TmdbCredit::default()
+            },
+            TmdbCredit {
+                id: 810_032,
+                name: Some("Second shared person".to_owned()),
+                ..TmdbCredit::default()
+            },
+        ];
+        let (genres, cast) = if reversed {
+            (
+                vec![genres[1].clone(), genres[0].clone()],
+                vec![cast[1].clone(), cast[0].clone()],
+            )
+        } else {
+            (genres.to_vec(), cast.to_vec())
+        };
+        TmdbMovie {
+            id: tmdb_id,
+            title: Some(format!("Concurrent movie fixture {tmdb_id}")),
+            genres,
+            credits: TmdbCredits {
+                cast,
+                ..TmdbCredits::default()
+            },
+            ..TmdbMovie::default()
+        }
+    }
+
+    fn concurrent_season_fixture() -> TmdbSeason {
+        TmdbSeason {
+            id: 800_011,
+            season_number: 1,
+            episodes: vec![TmdbEpisode {
+                id: 800_012,
+                episode_number: 1,
+                name: Some("Concurrent episode".to_owned()),
+                credits: TmdbCredits {
+                    crew: vec![TmdbCredit {
+                        id: 800_021,
+                        name: Some("Shared person".to_owned()),
+                        ..TmdbCredit::default()
+                    }],
+                    ..TmdbCredits::default()
+                },
+                ..TmdbEpisode::default()
+            }],
+            ..TmdbSeason::default()
+        }
     }
 }

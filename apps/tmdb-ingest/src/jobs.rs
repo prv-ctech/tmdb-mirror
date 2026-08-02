@@ -13,6 +13,8 @@ use tmdb_upstream::{
     DailyExportParser, MAX_DAILY_EXPORT_BYTES, TmdbClient, TmdbClientError, TmdbKeyword,
 };
 
+#[path = "catalog_locks.rs"]
+mod catalog_locks;
 #[path = "catalog_write.rs"]
 mod catalog_write;
 

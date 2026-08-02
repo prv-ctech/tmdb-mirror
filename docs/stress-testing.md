@@ -67,6 +67,14 @@ four internal media-worker lease IDs, shared source reuse, and zero dead-letter
 image jobs. `stress-trawl.ps1` verifies the configured existing Trawl instance
 without writing its URL or any credential to an artifact.
 
+`stress-collect.ps1` also fails the run if PostgreSQL logged a deadlock or lock
+timeout after that run started; it scopes this check to the current
+PostgreSQL container logs rather than historical application logs.
+
+The ingestion suite also runs concurrent different-movie writes that touch the
+same genres and people in opposite TMDB payload order. It must finish without
+a PostgreSQL deadlock or lock timeout.
+
 ## Refresh a token without rebuilding
 
 ```powershell
