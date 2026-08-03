@@ -32,13 +32,20 @@ The application only knows these container paths:
 | `/config/backups/pgbackrest` | PostgreSQL-owned same-host pgBackRest repository |
 | PostgreSQL `/var/lib/postgresql` | PostgreSQL 18 data/WAL |
 
-Edit only the left-hand side of the bind mounts in Compose or the Unraid
-template. A normal Unraid mapping is:
+Edit only the host-side values in the ignored runtime environment. The
+production Compose maps these variables to the fixed container paths:
 
 ```text
-/media  -> <host-media-directory>
-/config -> <host-config-directory>
+TMDB_POSTGRES_HOST_PATH -> /var/lib/postgresql
+TMDB_CONFIG_HOST_PATH   -> /config
+TMDB_MEDIA_HOST_PATH    -> /media
+TMDB_API_HOST_PORT      -> host 9001 -> container 8080
+TMDB_MEDIA_HOST_PORT    -> host 9002 -> container 8090
 ```
+
+The current Unraid deployment keeps its existing database, config, and media
+host locations and publishes the API/media services on host ports `9001` and
+`9002`, respectively. Those host-specific values stay outside Git.
 
 The API runs as UID/GID `10001`. The worker and media services begin with a
 tiny built-in startup preparer: it creates their fixed child folders, gives
@@ -59,11 +66,9 @@ only these app-owned paths:
 PostgreSQL alone creates `/config/backups/pgbackrest`. The worker and media
 worker never recursively change that repository or its parent permissions.
 
-Docker/Unraid must still supply the two mount roots themselves. The canonical
-Compose file creates its relative sample directories automatically. For an
-Unraid bind mount, select a dedicated host folder for `/config`; if a network
-share or ACL refuses the mount change, startup stops with the fixed path and
-operation that failed instead of silently retrying image jobs.
+Docker/Unraid must still supply the three host-side mount roots themselves. If
+a network share or ACL refuses the mount change, startup stops with the fixed
+path and operation that failed instead of silently retrying image jobs.
 
 No `TMDB_MEDIA_HOST_ROOT`, `TMDB_WORK_HOST_ROOT`, `TMDB_MEDIA_ROOT`,
 `TMDB_WORK_ROOT`, or similar host-path environment variable is read by the

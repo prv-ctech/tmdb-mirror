@@ -107,6 +107,11 @@ mkdir -p "$REPO_ROOT/.stress-runtime"
 interpolation_file="$REPO_ROOT/.stress-runtime/compose-validator.$$.env"
 trap 'rm -f "$interpolation_file"' EXIT
 printf 'TMDB_ENV_FILE=%s\n' "$(docker_path "$env_file")" >"$interpolation_file"
+for key in \
+    TMDB_DEPLOY_HOST_IP TMDB_API_HOST_PORT TMDB_MEDIA_HOST_PORT \
+    TMDB_POSTGRES_HOST_PATH TMDB_CONFIG_HOST_PATH TMDB_MEDIA_HOST_PATH; do
+    printf '%s=%s\n' "$key" "${entries[$key]:-}" >>"$interpolation_file"
+done
 chmod 600 "$interpolation_file"
 docker_command compose \
     --env-file "$(docker_path "$interpolation_file")" \

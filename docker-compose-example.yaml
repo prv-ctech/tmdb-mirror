@@ -1,6 +1,160 @@
-# Compatibility entry point for older checkout commands.
-# The canonical four-service definition lives in deploy/compose.production.yaml.
-name: tmdb
+name: tmdb-mirror
 
-include:
-  - path: ./deploy/compose.production.yaml
+# Standalone Unraid/Docker Compose example.
+#
+# Keep this file beside a mode-600 .env containing the settings from
+# .env.example. The .env must provide the host-specific TMDB_DEPLOY_HOST_IP,
+# TMDB_POSTGRES_HOST_PATH, TMDB_CONFIG_HOST_PATH, and TMDB_MEDIA_HOST_PATH
+# values. Do not put real credentials in this file.
+
+x-app-common: &app-common
+  image: ghcr.io/prv-ctech/tmdb-mirror:main
+  restart: unless-stopped
+  env_file:
+    - ${TMDB_ENV_FILE:-.env}
+  read_only: true
+  tmpfs:
+    - /tmp
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  init: true
+
+services:
+  postgres:
+    image: ghcr.io/prv-ctech/tmdb-mirror-postgres:main
+    container_name: tmdb-mirror-postgres
+    restart: unless-stopped
+    env_file:
+      - ${TMDB_ENV_FILE:-.env}
+    shm_size: 2gb
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - track_io_timing=on
+      - -c
+      - timezone=UTC
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=pgbackrest --stanza=tmdb archive-push %p
+      - -c
+      - archive_timeout=300s
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=32GB
+      - -c
+      - effective_cache_size=96GB
+      - -c
+      - work_mem=32MB
+      - -c
+      - maintenance_work_mem=1GB
+      - -c
+      - wal_compression=on
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=256
+    volumes:
+      - type: bind
+        source: ${TMDB_POSTGRES_HOST_PATH:?TMDB_POSTGRES_HOST_PATH must be set}
+        target: /var/lib/postgresql
+        bind:
+          create_host_path: true
+      - type: bind
+        source: ${TMDB_CONFIG_HOST_PATH:?TMDB_CONFIG_HOST_PATH must be set}
+        target: /config
+        bind:
+          create_host_path: true
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -h 127.0.0.1 -t 1']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks:
+      - tmdb-private
+
+  api:
+    <<: *app-common
+    container_name: tmdb-mirror-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${TMDB_DEPLOY_HOST_IP:?TMDB_DEPLOY_HOST_IP must be set}:${TMDB_API_HOST_PORT:-9001}:8080"
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --show-error, http://127.0.0.1:8080/health/live]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      tmdb-private: {}
+      prv-network:
+        aliases:
+          - tmdb-mirror-api
+
+  worker:
+    <<: *app-common
+    container_name: tmdb-mirror-worker
+    entrypoint: [/usr/local/bin/tmdb-runtime, worker]
+    user: "0:0"
+    init: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: ${TMDB_CONFIG_HOST_PATH:?TMDB_CONFIG_HOST_PATH must be set}
+        target: /config
+        bind:
+          create_host_path: true
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SETPCAP]
+    networks:
+      - tmdb-private
+
+  media:
+    <<: *app-common
+    container_name: tmdb-mirror-media
+    entrypoint: [/usr/local/bin/tmdb-runtime, media]
+    user: "0:0"
+    init: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: ${TMDB_MEDIA_HOST_PATH:?TMDB_MEDIA_HOST_PATH must be set}
+        target: /media
+        bind:
+          create_host_path: true
+      - type: bind
+        source: ${TMDB_CONFIG_HOST_PATH:?TMDB_CONFIG_HOST_PATH must be set}
+        target: /config
+        bind:
+          create_host_path: true
+    ports:
+      - "${TMDB_DEPLOY_HOST_IP:?TMDB_DEPLOY_HOST_IP must be set}:${TMDB_MEDIA_HOST_PORT:-9002}:8090"
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SETPCAP]
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://127.0.0.1:8090/health/live]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - tmdb-private
+
+networks:
+  tmdb-private:
+    driver: bridge
+  prv-network:
+    external: true
+    name: prv.network

@@ -2,14 +2,15 @@
 
 The API has three listeners in the four-container deployment:
 
-| Listener | Default address | Contract |
+| Listener | Published address | Contract |
 | --- | --- | --- |
-| Public catalog | `http://<host>:8080` | Unauthenticated catalog, search, health, and the public OpenAPI document |
+| Public catalog | `http://<host>:9001` | Unauthenticated catalog, search, health, and the public OpenAPI document |
 | Private admin | `http://<private-host>:8081` | API-key protected operations, jobs, backups, and metrics |
-| Media | `http://<host>:8090` | Public verified image files and media health |
+| Media | `http://<host>:9002` | Public verified image files and media health |
 
-The production Compose file publishes `8080` and `8090` only. The admin
-listener is available to containers on `prv.network` as
+The production Compose file publishes host ports `9001` and `9002` to the API
+and media container listeners `8080` and `8090`. The admin listener is available
+to containers on `prv.network` as
 `http://tmdb-mirror-api:8081`; the disposable stress Compose file publishes it
 to a loopback-only test port.
 
@@ -33,8 +34,8 @@ properties use camelCase. Public list responses use `{ "data": [...],
 Example:
 
 ```bash
-curl -i http://127.0.0.1:8080/v1/health/live
-curl -sS http://127.0.0.1:8080/v1/openapi.json
+curl -i http://127.0.0.1:9001/v1/health/live
+curl -sS http://127.0.0.1:9001/v1/openapi.json
 ```
 
 ## Common catalog query parameters

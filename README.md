@@ -7,14 +7,15 @@ runtime services: PostgreSQL, API, main worker, and media worker.
 ## Run with Docker Compose
 
 `deploy/compose.production.yaml` is the canonical checkout deployment. It
-pulls the published Linux AMD64 images and uses these host paths:
+pulls the published Linux AMD64 images and reads the host-specific bindings
+from the ignored runtime environment:
 
 | Service | Host port | Purpose |
 | --- | ---: | --- |
 | `postgres` | none | PostgreSQL 18, migrations, WAL archiving, and pgBackRest |
-| `api` | `8080` | Public catalog API |
+| `api` | `9001` | Public catalog API |
 | `worker` | none | Migrations, schedules, ingest, retries, and durable jobs |
-| `media` | `8090` | Downloaded public image files |
+| `media` | `9002` | Downloaded public image files |
 
 The admin listener remains on container port `8081` and is not published by
 the production file. A container on the existing `prv.network` can reach it at
@@ -42,14 +43,17 @@ docker compose --env-file "$TMDB_ENV_FILE" \
   -f deploy/compose.production.yaml ps
 ```
 
-The external `prv.network` must already exist. The Compose file creates the
-relative `deploy/data/postgres18`, `deploy/data/config`, and `deploy/data/media`
-directories. The application paths inside containers are fixed: `/config` for
-scratch, exports, checkpoints, logs, and backups; `/media` for public files and
-private `.masters` originals. Masters are never served.
+The external `prv.network` must already exist. Set
+`TMDB_DEPLOY_HOST_IP`, `TMDB_API_HOST_PORT`, `TMDB_MEDIA_HOST_PORT`,
+`TMDB_POSTGRES_HOST_PATH`, `TMDB_CONFIG_HOST_PATH`, and
+`TMDB_MEDIA_HOST_PATH` in the ignored runtime environment. The application
+paths inside containers are fixed: `/config` for scratch, exports,
+checkpoints, logs, and backups; `/media` for public files and private
+`.masters` originals. Masters are never served.
 
-`docker-compose-example.yaml` remains a compatibility entry point. New
-deployments should use the canonical file above. See
+`docker-compose-example.yaml` is a standalone copy-pasteable Compose file for
+Unraid. It does not use Compose `include`; place it beside the `.env` file.
+New checkout deployments can use the canonical file above. See
 [production deployment](docs/deployment-production.md) for bind mounts,
 permissions, media policy, and validation.
 

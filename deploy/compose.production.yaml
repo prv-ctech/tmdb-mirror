@@ -1,10 +1,25 @@
-# Complete four-container production deployment using GitHub-built images.
-# No source checkout, Dockerfile, or PostgreSQL initialization bind mount is
-# required at deployment time.
+name: tmdb-mirror
+
+# Host-specific values are read from the ignored runtime env file. This keeps
+# private LAN addresses and bind roots out of the repository.
+x-app-common: &app-common
+  image: ghcr.io/prv-ctech/tmdb-mirror:main
+  restart: unless-stopped
+  env_file:
+    - ${TMDB_ENV_FILE:-../.env}
+  read_only: true
+  tmpfs:
+    - /tmp
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  init: true
 
 services:
   postgres:
     image: ghcr.io/prv-ctech/tmdb-mirror-postgres:main
+    container_name: tmdb-mirror-postgres
     restart: unless-stopped
     env_file:
       - ${TMDB_ENV_FILE:-../.env}
@@ -43,12 +58,12 @@ services:
       - effective_io_concurrency=256
     volumes:
       - type: bind
-        source: ./data/postgres18
+        source: ${TMDB_POSTGRES_HOST_PATH:?TMDB_POSTGRES_HOST_PATH must be set}
         target: /var/lib/postgresql
         bind:
           create_host_path: true
       - type: bind
-        source: ./data/config
+        source: ${TMDB_CONFIG_HOST_PATH:?TMDB_CONFIG_HOST_PATH must be set}
         target: /config
         bind:
           create_host_path: true
@@ -58,23 +73,17 @@ services:
       timeout: 5s
       retries: 30
       start_period: 30s
-    networks: [tmdb-private]
+    networks:
+      - tmdb-private
 
   api:
-    image: ghcr.io/prv-ctech/tmdb-mirror:main
-    restart: unless-stopped
-    env_file:
-      - ${TMDB_ENV_FILE:-../.env}
+    <<: *app-common
+    container_name: tmdb-mirror-api
     depends_on:
       postgres:
         condition: service_healthy
     ports:
-      - "8080:8080"
-    read_only: true
-    tmpfs: [/tmp]
-    security_opt: [no-new-privileges:true]
-    cap_drop: [ALL]
-    init: true
+      - "${TMDB_DEPLOY_HOST_IP:?TMDB_DEPLOY_HOST_IP must be set}:${TMDB_API_HOST_PORT:-9001}:8080"
     healthcheck:
       test: [CMD, curl, --fail, --silent, --show-error, http://127.0.0.1:8080/health/live]
       interval: 10s
@@ -88,55 +97,46 @@ services:
           - tmdb-mirror-api
 
   worker:
-    image: ghcr.io/prv-ctech/tmdb-mirror:main
-    restart: unless-stopped
-    env_file:
-      - ${TMDB_ENV_FILE:-../.env}
+    <<: *app-common
+    container_name: tmdb-mirror-worker
     entrypoint: [/usr/local/bin/tmdb-runtime, worker]
     user: "0:0"
+    init: false
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
       - type: bind
-        source: ./data/config
+        source: ${TMDB_CONFIG_HOST_PATH:?TMDB_CONFIG_HOST_PATH must be set}
         target: /config
         bind:
           create_host_path: true
-    read_only: true
-    tmpfs: [/tmp]
-    security_opt: [no-new-privileges:true]
-    cap_drop: [ALL]
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SETPCAP]
-    networks: [tmdb-private]
+    networks:
+      - tmdb-private
 
   media:
-    image: ghcr.io/prv-ctech/tmdb-mirror:main
-    restart: unless-stopped
-    env_file:
-      - ${TMDB_ENV_FILE:-../.env}
+    <<: *app-common
+    container_name: tmdb-mirror-media
     entrypoint: [/usr/local/bin/tmdb-runtime, media]
     user: "0:0"
+    init: false
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
       - type: bind
-        source: ./data/media
+        source: ${TMDB_MEDIA_HOST_PATH:?TMDB_MEDIA_HOST_PATH must be set}
         target: /media
         bind:
           create_host_path: true
       - type: bind
-        source: ./data/config
+        source: ${TMDB_CONFIG_HOST_PATH:?TMDB_CONFIG_HOST_PATH must be set}
         target: /config
         bind:
           create_host_path: true
     ports:
-      - "8090:8090"
-    read_only: true
-    tmpfs: [/tmp]
-    security_opt: [no-new-privileges:true]
-    cap_drop: [ALL]
+      - "${TMDB_DEPLOY_HOST_IP:?TMDB_DEPLOY_HOST_IP must be set}:${TMDB_MEDIA_HOST_PORT:-9002}:8090"
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SETPCAP]
     healthcheck:
       test: [CMD, curl, --fail, --silent, http://127.0.0.1:8090/health/live]
@@ -144,7 +144,8 @@ services:
       timeout: 5s
       retries: 12
       start_period: 10s
-    networks: [tmdb-private]
+    networks:
+      - tmdb-private
 
 networks:
   tmdb-private:
