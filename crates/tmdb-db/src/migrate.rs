@@ -84,7 +84,7 @@ async fn migrate_while_locked(connection: &mut PgConnection) -> Result<Migration
 /// keeps those databases least-privilege compatible while the next migration
 /// still runs under the correct role.
 async fn repair_application_role_grants(connection: &mut PgConnection) -> Result<(), DbError> {
-    const STATEMENTS: [&str; 16] = [
+    const STATEMENTS: [&str; 17] = [
         "GRANT USAGE ON SCHEMA catalog, search, assets, ops TO api_reader",
         "GRANT SELECT ON ALL TABLES IN SCHEMA catalog, search, assets TO api_reader",
         "GRANT USAGE ON SCHEMA catalog, source, search, ops TO ingest_writer",
@@ -95,6 +95,7 @@ async fn repair_application_role_grants(connection: &mut PgConnection) -> Result
         "GRANT USAGE ON SCHEMA assets, ops TO image_writer",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA assets TO image_writer",
         "GRANT EXECUTE ON FUNCTION ops.submit_job(uuid, text, integer, text, smallint, integer, timestamptz, text) TO image_writer",
+        "GRANT EXECUTE ON FUNCTION ops.job_cancellation_requested(uuid, text) TO ingest_writer, image_writer",
         "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA catalog, source, search TO ingest_writer",
         "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA assets TO image_writer",
         "ALTER DEFAULT PRIVILEGES FOR ROLE migrator IN SCHEMA catalog, search, assets GRANT SELECT ON TABLES TO api_reader",

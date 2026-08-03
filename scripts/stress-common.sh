@@ -249,7 +249,7 @@ wait_for_migrations() {
             continue
         fi
         version="$(psql_at "$password" "SELECT COALESCE(max(version), 0) FROM ops._sqlx_migrations WHERE success" 2>/dev/null || true)"
-        if [[ "$version" =~ ^[0-9]+$ ]] && (( version >= 29 )); then
+        if [[ "$version" =~ ^[0-9]+$ ]] && (( version >= 30 )); then
             return 0
         fi
         sleep 2

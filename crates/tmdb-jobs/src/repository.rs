@@ -214,7 +214,7 @@ impl JobRepository {
             .map_err(|error| map_database_error(&error))
     }
 
-    /// Reads the durable cancellation flag for an active lease.
+    /// Reads the durable cancellation flag for this worker's active lease.
     ///
     /// The worker polls this flag between heartbeats so an administrative
     /// media cancellation can stop an in-flight download without waiting for
@@ -223,13 +223,21 @@ impl JobRepository {
     /// # Errors
     ///
     /// Returns [`JobError::NotFound`] when the job no longer exists.
-    pub async fn cancellation_requested(&self, job_id: JobId) -> Result<bool, JobError> {
-        sqlx::query_scalar("SELECT cancellation_requested FROM ops.jobs WHERE id = $1")
-            .bind(job_id.as_uuid())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|error| map_database_error(&error))?
-            .ok_or(JobError::NotFound)
+    pub async fn cancellation_requested(
+        &self,
+        job_id: JobId,
+        worker_id: &WorkerId,
+    ) -> Result<bool, JobError> {
+        sqlx::query_scalar(
+            "SELECT cancellation_requested
+               FROM ops.job_cancellation_requested($1, $2)",
+        )
+        .bind(job_id.as_uuid())
+        .bind(worker_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_database_error(&error))?
+        .ok_or(JobError::NotFound)
     }
 
     /// Completes a live lease, or acknowledges a pending cancellation.

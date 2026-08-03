@@ -21,14 +21,14 @@ async fn catalog_migration_exposes_shared_titles_dimensions_and_search_projectio
         versions,
         [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29,
+            25, 26, 27, 28, 29, 30,
         ]
     );
 
     let revision: String = sqlx::query_scalar("SELECT schema_revision FROM ops.readiness")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(revision, "0029");
+    assert_eq!(revision, "0030");
 
     let objects: Vec<String> = sqlx::query_scalar(
         "SELECT format('%I.%I', n.nspname, c.relname)

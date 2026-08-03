@@ -58,13 +58,13 @@ async fn jobs_migration_has_exact_readiness_indexes_and_hardened_functions(
         versions,
         [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29
+            25, 26, 27, 28, 29, 30
         ]
     );
     let revision: String = sqlx::query_scalar("SELECT schema_revision FROM ops.readiness")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(revision, "0029");
+    assert_eq!(revision, "0030");
 
     let indexes: Vec<(String, String)> = sqlx::query_as(
         "SELECT indexname, indexdef
@@ -117,12 +117,13 @@ async fn jobs_migration_has_exact_readiness_indexes_and_hardened_functions(
         "dead_letter_job",
         "fail_job",
         "heartbeat_job",
+        "job_cancellation_requested",
         "request_job_cancel",
         "submit_job",
     ])
     .fetch_all(&pool)
     .await?;
-    assert_eq!(functions.len(), 7);
+    assert_eq!(functions.len(), 8);
     for (_, security_definer, settings) in functions {
         assert!(security_definer);
         assert_eq!(
@@ -148,6 +149,7 @@ async fn jobs_migration_has_exact_readiness_indexes_and_hardened_functions(
         "dead_letter_job",
         "fail_job",
         "heartbeat_job",
+        "job_cancellation_requested",
         "request_job_cancel",
         "submit_job",
     ])
@@ -179,6 +181,7 @@ async fn jobs_migration_has_exact_readiness_indexes_and_hardened_functions(
         "dead_letter_job",
         "fail_job",
         "heartbeat_job",
+        "job_cancellation_requested",
         "request_job_cancel",
         "submit_job",
     ])
@@ -197,12 +200,20 @@ async fn jobs_migration_has_exact_readiness_indexes_and_hardened_functions(
             ("image_writer".to_owned(), "dead_letter_job".to_owned()),
             ("image_writer".to_owned(), "fail_job".to_owned()),
             ("image_writer".to_owned(), "heartbeat_job".to_owned()),
+            (
+                "image_writer".to_owned(),
+                "job_cancellation_requested".to_owned()
+            ),
             ("image_writer".to_owned(), "submit_job".to_owned()),
             ("ingest_writer".to_owned(), "claim_job".to_owned()),
             ("ingest_writer".to_owned(), "complete_job".to_owned()),
             ("ingest_writer".to_owned(), "dead_letter_job".to_owned()),
             ("ingest_writer".to_owned(), "fail_job".to_owned()),
             ("ingest_writer".to_owned(), "heartbeat_job".to_owned()),
+            (
+                "ingest_writer".to_owned(),
+                "job_cancellation_requested".to_owned()
+            ),
             ("ingest_writer".to_owned(), "submit_job".to_owned()),
         ]
     );
@@ -1410,6 +1421,60 @@ async fn worker_roles_have_effective_lifecycle_access_and_object_level_dml_denia
         )
         .await?;
         assert_object_denied(&worker_pool, "DELETE FROM ops.job_events", "job_events").await?;
+    }
+    Ok(())
+}
+
+#[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+async fn worker_roles_can_poll_only_their_own_cancellation_flag(
+    owner_pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&owner_pool)
+        .await?;
+    let owner_repo = JobRepository::new(owner_pool);
+
+    for role in ["ingest_writer", "image_writer"] {
+        let worker_pool = role_pool(&database, role, PoolPolicy::ReadWrite).await?;
+        let worker_repo = JobRepository::new(worker_pool);
+        let worker = WorkerId::new(&format!("cancellation-poll-{role}"))?;
+        let submitted = owner_repo
+            .submit(NewJob::noop(&format!("cancellation-poll-{role}"))?)
+            .await?;
+
+        worker_repo
+            .claim(&worker, LEASE)
+            .await?
+            .ok_or("worker role could not claim cancellation fixture")?;
+        assert!(
+            !worker_repo
+                .cancellation_requested(submitted.job_id(), &worker)
+                .await?
+        );
+
+        owner_repo
+            .request_cancel(submitted.job_id(), "test cancellation")
+            .await?;
+        assert!(
+            worker_repo
+                .cancellation_requested(submitted.job_id(), &worker)
+                .await?
+        );
+
+        let other_worker = WorkerId::new(&format!("other-cancellation-poll-{role}"))?;
+        assert!(matches!(
+            worker_repo
+                .cancellation_requested(submitted.job_id(), &other_worker)
+                .await,
+            Err(JobError::NotFound)
+        ));
+        assert_eq!(
+            worker_repo
+                .complete(submitted.job_id(), &worker, json!({}))
+                .await?
+                .status(),
+            JobStatus::Cancelled
+        );
     }
     Ok(())
 }

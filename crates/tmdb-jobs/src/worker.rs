@@ -384,7 +384,7 @@ where
                             lease_lost.cancel();
                             break;
                         }
-                        match repository.cancellation_requested(job_id).await {
+                        match repository.cancellation_requested(job_id, &worker_id).await {
                             Ok(true) => {
                                 job_cancelled.cancel();
                                 break;
