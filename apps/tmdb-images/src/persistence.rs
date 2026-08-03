@@ -42,9 +42,9 @@ struct OwnerIds {
 ///
 /// The filesystem publication happens before this function is called.  This
 /// transaction resolves the owner through the catalog's canonical identity,
-/// then upserts metadata only when the source path is still attached to that
-/// same owner.  A missing owner is retryable because ingest may be committing
-/// the entity concurrently; a source-path ownership mismatch is terminal.
+/// reconciles a source path when TMDB gallery ordering changes, and upserts
+/// the current metadata. A missing owner is retryable because ingest may be
+/// committing the entity concurrently.
 pub(crate) async fn persist_ready(
     pool: &PgPool,
     payload: &ImageJobPayload,
@@ -53,10 +53,24 @@ pub(crate) async fn persist_ready(
     validate_metadata(payload, metadata)?;
     let mut transaction = pool.begin().await.map_err(|_| PersistError::Database)?;
     let owner = resolve_owner(&mut transaction, payload).await?;
+    let (owner_type, owner_id) = owner_identity(payload.entity_type, owner)?;
     let language = resolve_language(&mut transaction, payload.language.as_deref()).await?;
     let width = i32::try_from(metadata.width).map_err(|_| PersistError::InvalidPayload)?;
     let height = i32::try_from(metadata.height).map_err(|_| PersistError::InvalidPayload)?;
     let file_size = i64::try_from(metadata.byte_size).map_err(|_| PersistError::InvalidPayload)?;
+    let gallery_index =
+        i16::try_from(payload.asset_index).map_err(|_| PersistError::InvalidPayload)?;
+    let image_kind = db_image_kind(payload.kind);
+
+    remove_conflicting_gallery_slot(
+        &mut transaction,
+        owner_type,
+        owner_id,
+        image_kind,
+        gallery_index,
+        &payload.tmdb_path,
+    )
+    .await?;
 
     let asset_id: i64 = sqlx::query_scalar(
         "INSERT INTO assets.image_assets (
@@ -73,7 +87,7 @@ pub(crate) async fn persist_ready(
              $18, $19, $20, $21, $22, $23, 'ready', $24,
              clock_timestamp(), clock_timestamp()
          )
-         ON CONFLICT (owner_type, owner_id, image_kind, gallery_index) DO UPDATE SET
+         ON CONFLICT (source, source_key, owner_type, owner_id) DO UPDATE SET
              title_id = EXCLUDED.title_id,
              person_id = EXCLUDED.person_id,
              company_id = EXCLUDED.company_id,
@@ -118,7 +132,7 @@ pub(crate) async fn persist_ready(
     .bind(height)
     .bind(file_size)
     .bind(&metadata.sha256)
-    .bind(i16::try_from(payload.asset_index).map_err(|_| PersistError::InvalidPayload)?)
+    .bind(gallery_index)
     .bind(&metadata.source_mime_type)
     .bind(i32::try_from(metadata.source_width).map_err(|_| PersistError::InvalidPayload)?)
     .bind(i32::try_from(metadata.source_height).map_err(|_| PersistError::InvalidPayload)?)
@@ -134,6 +148,33 @@ pub(crate) async fn persist_ready(
         .commit()
         .await
         .map_err(|_| PersistError::Database)
+}
+
+async fn remove_conflicting_gallery_slot(
+    transaction: &mut Transaction<'_, Postgres>,
+    owner_type: i16,
+    owner_id: i64,
+    image_kind: &str,
+    gallery_index: i16,
+    source_key: &str,
+) -> Result<(), PersistError> {
+    sqlx::query(
+        "DELETE FROM assets.image_assets
+          WHERE owner_type = $1
+            AND owner_id = $2
+            AND image_kind = $3
+            AND gallery_index = $4
+            AND NOT (source = 'tmdb' AND source_key = $5)",
+    )
+    .bind(owner_type)
+    .bind(owner_id)
+    .bind(image_kind)
+    .bind(gallery_index)
+    .bind(source_key)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| PersistError::Database)?;
+    Ok(())
 }
 
 async fn replace_variants(
@@ -397,6 +438,24 @@ async fn resolve_owner(
     Ok(owner)
 }
 
+fn owner_identity(
+    entity_type: ImageEntityType,
+    owner: OwnerIds,
+) -> Result<(i16, i64), PersistError> {
+    let (owner_type, owner_id): (i16, Option<i64>) = match entity_type {
+        ImageEntityType::Movie | ImageEntityType::Tv => (1, owner.title),
+        ImageEntityType::Person => (2, owner.person),
+        ImageEntityType::Company => (3, owner.company),
+        ImageEntityType::Network => (4, owner.network),
+        ImageEntityType::Collection => (5, owner.collection),
+        ImageEntityType::Season => (6, owner.season),
+        ImageEntityType::Episode => (7, owner.episode),
+    };
+    owner_id
+        .map(|owner_id| (owner_type, owner_id))
+        .ok_or(PersistError::OwnerNotFound)
+}
+
 async fn resolve_language(
     transaction: &mut Transaction<'_, Postgres>,
     language: Option<&str>,
@@ -542,6 +601,120 @@ mod tests {
         .fetch_one(&pool)
         .await?;
         assert_eq!(storage_path, second.storage_path);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn source_owner_reconciliation_moves_an_asset_when_gallery_index_changes(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO catalog.titles (media_type, tmdb_id, display_title, active)
+             VALUES ('movie', 42, 'Gallery reorder fixture', true)",
+        )
+        .execute(&pool)
+        .await?;
+
+        let first = movie_payload().map_err(|_| persist_error(PersistError::InvalidPayload))?;
+        persist_ready(
+            &pool,
+            &first,
+            &metadata(&first, "movies/42/posters/poster.jpg"),
+        )
+        .await
+        .map_err(persist_error)?;
+
+        let moved = first
+            .clone()
+            .with_asset_index(2)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        persist_ready(
+            &pool,
+            &moved,
+            &metadata(&moved, "movies/42/posters/poster-02.jpg"),
+        )
+        .await
+        .map_err(persist_error)?;
+
+        let rows: Vec<(i16, String, String)> = sqlx::query_as(
+            "SELECT gallery_index, source_key, storage_path
+               FROM assets.image_assets
+              WHERE title_id = (SELECT id FROM catalog.titles WHERE tmdb_id = 42)
+              ORDER BY gallery_index",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(
+            rows,
+            vec![(
+                2,
+                "/poster.jpg".to_owned(),
+                "movies/42/posters/poster-02.jpg".to_owned(),
+            )]
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn source_owner_reconciliation_replaces_a_stale_gallery_slot(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO catalog.titles (media_type, tmdb_id, display_title, active)
+             VALUES ('movie', 42, 'Gallery slot fixture', true)",
+        )
+        .execute(&pool)
+        .await?;
+
+        let first = movie_payload().map_err(|_| persist_error(PersistError::InvalidPayload))?;
+        persist_ready(
+            &pool,
+            &first,
+            &metadata(&first, "movies/42/posters/poster.jpg"),
+        )
+        .await
+        .map_err(persist_error)?;
+
+        let stale = ImageJobPayload::new(
+            ImageEntityType::Movie,
+            42,
+            ImageKind::Poster,
+            "/stale.jpg",
+            "https://image.tmdb.org/t/p/original/stale.jpg",
+            None,
+            None,
+        )
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?
+        .with_asset_index(2)
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        persist_ready(
+            &pool,
+            &stale,
+            &metadata(&stale, "movies/42/posters/poster-02.jpg"),
+        )
+        .await
+        .map_err(persist_error)?;
+
+        let moved = first
+            .with_asset_index(2)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        persist_ready(
+            &pool,
+            &moved,
+            &metadata(&moved, "movies/42/posters/poster-02.jpg"),
+        )
+        .await
+        .map_err(persist_error)?;
+
+        let rows: Vec<(i16, String)> = sqlx::query_as(
+            "SELECT gallery_index, source_key
+               FROM assets.image_assets
+              WHERE title_id = (SELECT id FROM catalog.titles WHERE tmdb_id = 42)
+              ORDER BY gallery_index",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(rows, vec![(2, "/poster.jpg".to_owned())]);
         Ok(())
     }
 
