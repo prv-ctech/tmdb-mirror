@@ -1,11 +1,6 @@
 name: tmdb-mirror
 
-# Standalone Unraid/Docker Compose example.
-#
-# Keep this file beside a mode-600 .env containing the settings from
-# .env.example. The .env must provide the host-specific TMDB_DEPLOY_HOST_IP,
-# TMDB_POSTGRES_HOST_PATH, TMDB_CONFIG_HOST_PATH, and TMDB_MEDIA_HOST_PATH
-# values. Do not put real credentials in this file.
+# Standalone Unraid Compose example. Keep .env beside this file.
 
 x-app-common: &app-common
   image: ghcr.io/prv-ctech/tmdb-mirror:main
