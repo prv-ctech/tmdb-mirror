@@ -41,9 +41,9 @@ Run the bounded checks in this order:
 
 ```bash
 ./scripts/stress-seed.sh --project-name tmdb_stress_test --count 100000
-./scripts/stress-http.sh --project-name tmdb_stress_test --concurrency 100 --requests-per-worker 100
 ./scripts/stress-artwork.sh --project-name tmdb_stress_test
 ./scripts/stress-media-assets.sh --project-name tmdb_stress_test
+./scripts/stress-http.sh --project-name tmdb_stress_test --concurrency 100 --requests-per-worker 100
 ./scripts/stress-trawl.sh --project-name tmdb_stress_test
 ./scripts/stress-resilience.sh --project-name tmdb_stress_test
 ./scripts/stress-scan.sh --project-name tmdb_stress_test --queue-limit 10
@@ -51,13 +51,23 @@ Run the bounded checks in this order:
 ```
 
 The seed creates a large synthetic catalog for indexed list/search/filter
-tests. Artwork uses real TMDB requests for representative movie, TV, anime,
-and image paths. The Trawl check is skipped when no Trawl URL is configured.
+tests. Artwork uses real TMDB requests for a multi-image movie, TV `119495`
+(posters, backdrops, logos, seasons, and trailers), TV `4586` (Trailer and
+Opening Credits), anime/live-adaptation classification fixtures, reusable
+people, companies, networks, and collections. Run artwork before HTTP so the
+gallery and video routes have live rows. The Trawl check is skipped when no
+Trawl URL is configured. When configured, `stress-trawl.sh` uses Trawl's
+documented JSON `/scrape` endpoint and verifies its status/metadata response;
+the native endpoint does not provide a binary image body for this worker.
 The export scan downloads the latest matching public movie and TV exports,
 counts their records, and bounds queued detail work with `--queue-limit`.
 
 The HTTP result records request count, failures, throughput, p50/p95/p99
-latency, and semantic route checks. Results and redacted diagnostics remain
+latency, gallery URL/path redaction checks, season/episode image routes, and
+video-type/YouTube URL checks. The artwork and media-asset results also report
+gallery counts, original and optimized rows, episode optimized-only rows,
+variant MIME/path violations, video counts by type/provider, HTTP status,
+permissions, worker IDs, and failures. Results and redacted diagnostics remain
 under the ignored runtime directory.
 
 The private backup API accepts `{"type":"full"}` or

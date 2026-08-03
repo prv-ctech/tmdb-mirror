@@ -82,7 +82,6 @@ case "${1:-}" in
         prepare_mount_root media /media
         prepare_directory media /config/media
         prepare_directory media /config/logs
-        prepare_directory media /media/.masters
         prepare_directory media /media/movies
         prepare_directory media /media/tv
         prepare_directory media /media/anime

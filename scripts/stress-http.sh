@@ -42,6 +42,11 @@ urls=(
     "$base_url/v1/tv?limit=20"
     "$base_url/v1/search?q=Cafe&limit=20"
     "$base_url/v1/anime?q=One%20Piece&limit=20"
+    "$base_url/v1/movies/550/images"
+    "$base_url/v1/tv/4586/images"
+    "$base_url/v1/tv/4586/videos"
+    "$base_url/v1/tv/4586/seasons/1/images"
+    "$base_url/v1/tv/4586/seasons/1/episodes/1/images"
     "$base_url/v1/movies?genreId=900000002&language=en&runtimeMin=40&runtimeMax=120&personId=900000002&companyId=900000002&limit=20"
 )
 
@@ -150,6 +155,29 @@ if curl --silent --show-error --fail --connect-timeout 5 --max-time 30 "$image_u
     printf '%s\tPASS\n' media_health >>"$semantic_file"
 else
     printf '%s\tFAIL\n' media_health >>"$semantic_file"
+    semantic_failures=$((semantic_failures + 1))
+fi
+
+videos_body="$work_dir/videos.json"
+if curl --silent --show-error --fail --connect-timeout 5 --max-time 30 \
+    "$base_url/v1/tv/4586/videos" -o "$videos_body" \
+    && grep -q 'Opening Credits' "$videos_body" \
+    && grep -q 'Trailer' "$videos_body" \
+    && grep -q 'https://www.youtube.com/watch?v=' "$videos_body"; then
+    printf '%s\tPASS\n' video_types_and_youtube_url >>"$semantic_file"
+else
+    printf '%s\tFAIL\n' video_types_and_youtube_url >>"$semantic_file"
+    semantic_failures=$((semantic_failures + 1))
+fi
+
+gallery_body="$work_dir/gallery.json"
+if curl --silent --show-error --fail --connect-timeout 5 --max-time 30 \
+    "$base_url/v1/tv/4586/images" -o "$gallery_body" \
+    && grep -q 'galleryIndex' "$gallery_body" \
+    && ! grep -q 'sourceKey\|storagePath\|sourceStoragePath' "$gallery_body"; then
+    printf '%s\tPASS\n' gallery_metadata_is_localized >>"$semantic_file"
+else
+    printf '%s\tFAIL\n' gallery_metadata_is_localized >>"$semantic_file"
     semantic_failures=$((semantic_failures + 1))
 fi
 

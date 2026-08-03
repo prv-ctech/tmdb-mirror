@@ -27,7 +27,7 @@ The application only knows these container paths:
 
 | Container path | Purpose |
 | --- | --- |
-| `/media` | Permanent public media and private `.masters` originals |
+| `/media` | Permanent public gallery originals and optimized images |
 | `/config` | NVMe worker scratch, raw exports, checkpoints, and logs |
 | `/config/backups/pgbackrest` | PostgreSQL-owned same-host pgBackRest repository |
 | PostgreSQL `/var/lib/postgresql` | PostgreSQL 18 data/WAL |
@@ -57,7 +57,7 @@ only these app-owned paths:
 
 ```text
 /config/work  /config/raw  /config/logs  /config/media
-/media/.masters  /media/movies  /media/tv  /media/anime/{movie,tv}
+/media/movies  /media/tv  /media/anime/{movie,tv}
 /media/casting  /media/networks  /media/companies  /media/collections
 ```
 
@@ -94,6 +94,8 @@ processes use the fixed `migrator`, `api_reader`, `api_job_submitter`,
 Their database permissions remain separate. The connection is fixed to the
 internal Compose service `postgres:5432`; do not add `DATABASE_*`, `TMDB_DB_*`,
 role identity, or per-process database settings.
+The PostgreSQL service starts as `0:0` so its entrypoint can prepare mounted
+data and pgBackRest children, then drops to PostgreSQL's unprivileged user.
 
 Keep `TMDB_RATE_LIMIT` at `40` or lower. The worker rejects a higher value
 before it starts upstream requests.
@@ -145,27 +147,32 @@ not cause an image-worker crash.
 
 ## Media policy
 
-`ALLOW_LOCAL_MEDIA=true` causes the worker to create image jobs in the same
-transaction as a committed title/entity and the API returns local URLs based on
-`TMDB_MEDIA_BASE_URL`. When false, no new image jobs are created and the API
-returns the original TMDB URL.
+`ALLOW_LOCAL_MEDIA=true` causes the worker to create gallery image jobs in the
+same transaction as a committed title/entity and the API returns local URLs
+based on `TMDB_MEDIA_BASE_URL`. When false, no new image jobs are created and
+image responses have no local URL.
 
-Public paths are deterministic:
+Public paths are deterministic and use TMDB IDs:
 
 ```text
-/media/movies/{tmdb_id}/cover.jpg
-/media/tv/{tmdb_id}/season1-episode5.jpg
-/media/anime/movie/{tmdb_id}/cover.jpg
-/media/anime/tv/{tmdb_id}/specials-episode1.jpg
-/media/casting/{local_id}/profile.jpg
-/media/networks/{local_id}/logo.jpg
-/media/companies/{local_id}/logo.jpg
-/media/collections/{local_id}/cover.jpg
+/media/tv/{tmdb_id}/posters/poster.jpg
+/media/tv/{tmdb_id}/posters/season01-poster.jpg
+/media/tv/{tmdb_id}/backdrops/backdrop-01.jpg
+/media/tv/{tmdb_id}/logos/logo.png
+/media/tv/{tmdb_id}/optimized/posters/poster-w640.jpg
+/media/tv/{tmdb_id}/optimized/thumbnails/season01-episode01-thumbnails-w640.jpg
+/media/casting/{tmdb_person_id}/profile.jpg
+/media/companies/{tmdb_company_id}/logos/logo.png
+/media/networks/{tmdb_network_id}/logos/logo.png
+/media/collections/{tmdb_collection_id}/posters/poster.jpg
 ```
 
-Original masters are content-addressed below `/media/.masters` and the embedded
-server rejects that subtree. Temporary files are created only below
-`/config/media`; they are removed after atomic publication.
+Original bytes are preserved outside `optimized/`. Optimized posters, seasons,
+profiles, and thumbnails are JPEG quality 85 with maximum width 640;
+backdrops use 1280 and logos use transparent PNG width 500. Episode thumbnails
+are optimized-only at width 640. No WebP derivative, `full` variant, video
+file, or `.masters` directory is created. Temporary files are created only
+below `/config/media` and are removed after atomic publication.
 
 ## Validation
 
@@ -180,10 +187,10 @@ docker compose --env-file "$TMDB_ENV_FILE" \
 ```
 
 Exercise both `ALLOW_LOCAL_MEDIA` modes, a movie, TV, anime movie, anime TV,
-season, episode, specials, cast, network, company, and collection asset. Verify
-that `/config` contains all scratch/checkpoint/log files, `/media` contains the
-final files, `.masters` is not downloadable, duplicate reusable assets point
-to one master, and a worker restart leaves no orphan job lease.
+season zero and regular seasons, episodes, cast, network, company, and
+collection galleries. Verify root source digests, optimized dimensions, local
+URLs, stable gallery numbering, duplicate source-path handling, and that a
+worker restart leaves no orphan job lease.
 
 The database remains MVCC/concurrent: independent API requests use separate
 bounded PostgreSQL connections, so one user's metadata read does not hold

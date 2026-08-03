@@ -84,6 +84,17 @@ dead_letters="$(psql_at "$password" "SELECT count(*) FROM ops.jobs WHERE job_typ
 new_dead_letters=$((dead_letters - dead_letters_before))
 worker_count="$(psql_at "$password" "SELECT count(DISTINCT event.worker_id) FROM ops.job_events event JOIN ops.jobs job ON job.id = event.job_id WHERE job.job_type = 'image.download' AND event.worker_id LIKE 'tmdb-stress-media-%'")"
 shared_groups="$(psql_at "$password" "SELECT count(*) FROM (SELECT source, source_key FROM assets.image_assets GROUP BY source, source_key HAVING count(DISTINCT owner_type || ':' || owner_id) > 1) groups")"
+gallery_counts="$(psql_at "$password" "SELECT COALESCE(json_object_agg(image_kind, asset_count ORDER BY image_kind), '{}'::json)::text FROM (SELECT image_kind, count(*) AS asset_count FROM assets.image_assets WHERE status = 'ready' GROUP BY image_kind) counts")"
+downloaded_originals="$(psql_at "$password" "SELECT count(*) FROM assets.image_assets WHERE status = 'ready' AND source_storage_path IS NOT NULL")"
+optimized_assets="$(psql_at "$password" "SELECT count(*) FROM assets.image_assets WHERE status = 'ready' AND storage_path ~ '(^|/)optimized/'")"
+optimized_variants="$(psql_at "$password" "SELECT count(*) FROM assets.image_variants")"
+episode_optimized_only="$(psql_at "$password" "SELECT count(*) FROM assets.image_assets WHERE status = 'ready' AND episode_id IS NOT NULL AND storage_path ~ '(^|/)optimized/' AND source_storage_path IS NULL")"
+invalid_variants="$(psql_at "$password" "SELECT count(*) FROM assets.image_variants WHERE mime_type NOT IN ('image/jpeg', 'image/png') OR storage_path !~ '(^|/)optimized/' OR (storage_path ~ '(^|/)optimized/thumbnails/' AND width > 640)")"
+video_counts="$(psql_at "$password" "SELECT COALESCE(json_object_agg(video_type || '/' || site, video_count ORDER BY video_type, site), '{}'::json)::text FROM (SELECT COALESCE(video_type, 'unknown') AS video_type, site, count(*) AS video_count FROM catalog.title_videos GROUP BY COALESCE(video_type, 'unknown'), site) counts")"
+media_permissions=true
+if ! compose exec -T media sh -ec 'test -d /media && test -d /media/movies && test -d /media/tv && test -d /media/anime/movie && test -d /media/anime/tv && test -d /media/casting && test -d /media/companies && test -d /media/networks && test -d /media/collections && test ! -e /media/.masters' </dev/null >/dev/null 2>&1; then
+    media_permissions=false
+fi
 
 cat >"$result_file" <<EOF
 {
@@ -97,6 +108,14 @@ cat >"$result_file" <<EOF
   "observed_worker_ids": $worker_count,
   "expected_worker_ids": $expected_workers,
   "shared_source_owner_groups": $shared_groups,
+  "gallery_counts_by_kind": $gallery_counts,
+  "downloaded_original_rows": $downloaded_originals,
+  "optimized_asset_rows": $optimized_assets,
+  "optimized_variant_rows": $optimized_variants,
+  "episode_optimized_only_rows": $episode_optimized_only,
+  "invalid_variant_rows": $invalid_variants,
+  "video_counts_by_type_and_site": $video_counts,
+  "media_permission_contract": $media_permissions,
   "dead_letter_image_jobs_before": $dead_letters_before,
   "dead_letter_image_jobs": $dead_letters,
   "new_dead_letter_image_jobs": $new_dead_letters
@@ -104,7 +123,7 @@ cat >"$result_file" <<EOF
 EOF
 cat "$result_file"
 printf 'Media-asset verification artifact: %s\n' "$result_file"
-if (( pending_image_jobs != 0 || missing > 0 || failed > 0 || worker_count != expected_workers || shared_groups == 0 || new_dead_letters != 0 )); then
+if (( pending_image_jobs != 0 || missing > 0 || failed > 0 || worker_count != expected_workers || shared_groups == 0 || downloaded_originals == 0 || optimized_assets == 0 || optimized_variants == 0 || episode_optimized_only == 0 || invalid_variants != 0 || new_dead_letters != 0 )) || [[ "$media_permissions" != true ]]; then
     die 'media-asset verification failed'
 fi
 printf '%s\n' 'Media-asset verification passed.'

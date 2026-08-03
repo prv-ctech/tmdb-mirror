@@ -28,7 +28,7 @@ pub const WORK_ROOT: &str = "/config/work";
 /// PostgreSQL-owned pgBackRest parent directory below [`CONFIG_ROOT`].
 ///
 /// Application workers deliberately do not prepare or write this path. The
-/// The `PostgreSQL` entrypoint creates `/config/backups/pgbackrest` as the
+/// `PostgreSQL` entrypoint creates `/config/backups/pgbackrest` as the
 /// only backup repository and keeps that child owned by the `PostgreSQL` OS
 /// user.
 pub const BACKUP_ROOT: &str = "/config/backups";
@@ -67,8 +67,6 @@ pub enum RuntimeStoragePath {
     ConfigLogs,
     /// `/config/media`
     ConfigMedia,
-    /// `/media/.masters`
-    MediaMasters,
     /// `/media/movies`
     MediaMovies,
     /// `/media/tv`
@@ -99,7 +97,6 @@ impl RuntimeStoragePath {
             Self::ConfigBackups => BACKUP_ROOT,
             Self::ConfigLogs => LOG_ROOT,
             Self::ConfigMedia => MEDIA_WORK_ROOT,
-            Self::MediaMasters => "/media/.masters",
             Self::MediaMovies => "/media/movies",
             Self::MediaTv => "/media/tv",
             Self::MediaAnime => "/media/anime",
@@ -119,7 +116,6 @@ impl RuntimeStoragePath {
             Self::ConfigBackups => config_root.join("backups"),
             Self::ConfigLogs => config_root.join("logs"),
             Self::ConfigMedia => config_root.join("media"),
-            Self::MediaMasters => media_root.join(".masters"),
             Self::MediaMovies => media_root.join("movies"),
             Self::MediaTv => media_root.join("tv"),
             Self::MediaAnime => media_root.join("anime"),
@@ -222,7 +218,6 @@ const WORKER_RUNTIME_PATHS: &[RuntimeStoragePath] = &[
 const MEDIA_RUNTIME_PATHS: &[RuntimeStoragePath] = &[
     RuntimeStoragePath::ConfigMedia,
     RuntimeStoragePath::ConfigLogs,
-    RuntimeStoragePath::MediaMasters,
     RuntimeStoragePath::MediaMovies,
     RuntimeStoragePath::MediaTv,
     RuntimeStoragePath::MediaAnime,
@@ -357,18 +352,18 @@ pub enum ReusableEntity {
 /// Deterministic public image variant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssetVariant {
-    /// A title poster/cover.  Index one is `cover`, later indexes are padded.
-    Cover { index: u16 },
-    /// A title backdrop/banner.  Index one is `banner`, later indexes are padded.
-    Banner { index: u16 },
+    /// A title or collection poster. Index one is `poster`, later indexes are padded.
+    Poster { index: u16 },
+    /// A title or collection backdrop. Numbering always starts at one.
+    Backdrop { index: u16 },
     /// A title or reusable entity logo.  Index one is `logo`, later indexes are padded.
     Logo { index: u16 },
     /// A reusable person profile image.  Index one is `profile`.
     Profile { index: u16 },
-    /// A TV season still.
-    Season { season: u16, index: u16 },
-    /// An episode still, with season zero represented as specials.
-    Episode {
+    /// A TV season poster.
+    SeasonPoster { season: u16, index: u16 },
+    /// An episode thumbnail, with season zero represented as specials.
+    EpisodeThumbnail {
         season: u16,
         episode: u16,
         index: u16,
@@ -380,11 +375,11 @@ pub enum AssetVariant {
 pub enum ImageFormat {
     /// Baseline JPEG derivative.
     Jpeg,
-    /// WebP derivative for clients that negotiate it.
+    /// Source WebP, retained only when TMDB supplies WebP bytes.
     Webp,
-    /// Source-preserving PNG fallback used before a derivative is available.
+    /// PNG source or optimized logo.
     Png,
-    /// Source-preserving GIF fallback used before a derivative is available.
+    /// GIF source. No GIF derivative is generated.
     Gif,
 }
 
@@ -442,8 +437,27 @@ pub fn title_asset(
     variant: AssetVariant,
     format: ImageFormat,
 ) -> Result<PathBuf, MediaPathError> {
+    if matches!(variant, AssetVariant::EpisodeThumbnail { .. }) {
+        return optimized_title_asset(scope, tmdb_id, variant, format, 640);
+    }
     let mut path = title_dir(scope, tmdb_id)?;
+    path.push(title_subdirectory(variant));
     path.push(variant_filename(variant, format)?);
+    Ok(path)
+}
+
+/// Returns an optimized title path below `optimized/`.
+pub fn optimized_title_asset(
+    scope: TitleScope,
+    tmdb_id: i64,
+    variant: AssetVariant,
+    format: ImageFormat,
+    width: u32,
+) -> Result<PathBuf, MediaPathError> {
+    let mut path = title_dir(scope, tmdb_id)?;
+    path.push("optimized");
+    path.push(optimized_subdirectory(variant));
+    path.push(optimized_filename(variant, format, width)?);
     Ok(path)
 }
 
@@ -465,43 +479,56 @@ pub fn reusable_asset(
         ReusableEntity::Company => "companies",
         ReusableEntity::Collection => "collections",
     };
-    let filename = match entity {
-        ReusableEntity::Cast => profile_filename(variant, format)?,
-        ReusableEntity::Network | ReusableEntity::Company | ReusableEntity::Collection => {
-            logo_or_cover_filename(entity, variant, format)?
-        }
-    };
-    Ok(PathBuf::from(directory).join(id.to_string()).join(filename))
-}
-
-/// Returns a private, content-addressed original-master path below [`MEDIA_ROOT`].
-///
-/// # Errors
-///
-/// Returns [`MediaPathError::InvalidDigest`] when `sha256` is not 64 hex characters.
-pub fn master_path(sha256: &str) -> Result<PathBuf, MediaPathError> {
-    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(MediaPathError::InvalidDigest);
+    let mut path = PathBuf::from(directory).join(id.to_string());
+    let subdirectory = reusable_subdirectory(entity, variant);
+    if !subdirectory.is_empty() {
+        path.push(subdirectory);
     }
-    let digest = sha256.to_ascii_lowercase();
-    Ok(PathBuf::from(".masters")
-        .join("sha256")
-        .join(&digest[..2])
-        .join(&digest[2..4])
-        .join(digest))
+    path.push(reusable_filename(entity, variant, format)?);
+    Ok(path)
 }
 
-/// Returns whether a relative public path is safe to expose through the
-/// embedded media server.  Private original masters are intentionally hidden.
+/// Returns an optimized path for a reusable entity.
+pub fn optimized_reusable_asset(
+    entity: ReusableEntity,
+    local_id: i64,
+    variant: AssetVariant,
+    format: ImageFormat,
+    width: u32,
+) -> Result<PathBuf, MediaPathError> {
+    let id = positive_id(local_id)?;
+    let directory = match entity {
+        ReusableEntity::Cast => "casting",
+        ReusableEntity::Network => "networks",
+        ReusableEntity::Company => "companies",
+        ReusableEntity::Collection => "collections",
+    };
+    let mut path = PathBuf::from(directory)
+        .join(id.to_string())
+        .join("optimized");
+    let subdirectory = match (entity, variant) {
+        (ReusableEntity::Cast, AssetVariant::Profile { .. }) => "",
+        _ => optimized_subdirectory(variant),
+    };
+    if !subdirectory.is_empty() {
+        path.push(subdirectory);
+    }
+    path.push(optimized_filename(variant, format, width)?);
+    Ok(path)
+}
+
+/// Returns whether a relative path is safe to expose through the embedded
+/// media server. Hidden and traversal paths are never public.
 #[must_use]
 pub fn is_public_relative(path: &str) -> bool {
     let candidate = std::path::Path::new(path);
     !path.is_empty()
         && !path.starts_with('.')
         && !candidate.is_absolute()
-        && candidate
-            .components()
-            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && candidate.components().all(|component| match component {
+            std::path::Component::Normal(value) => !value.to_string_lossy().starts_with('.'),
+            _ => false,
+        })
 }
 
 fn positive_id(id: i64) -> Result<i64, MediaPathError> {
@@ -523,55 +550,102 @@ fn numbered_name(prefix: &str, index: u16, extension: &str) -> Result<String, Me
     }
 }
 
+fn title_subdirectory(variant: AssetVariant) -> &'static str {
+    match variant {
+        AssetVariant::Poster { .. } | AssetVariant::SeasonPoster { .. } => "posters",
+        AssetVariant::Backdrop { .. } => "backdrops",
+        AssetVariant::Logo { .. } => "logos",
+        AssetVariant::Profile { .. } => "profiles",
+        AssetVariant::EpisodeThumbnail { .. } => "optimized",
+    }
+}
+
+fn optimized_subdirectory(variant: AssetVariant) -> &'static str {
+    match variant {
+        AssetVariant::Poster { .. } | AssetVariant::SeasonPoster { .. } => "posters",
+        AssetVariant::Backdrop { .. } => "backdrops",
+        AssetVariant::Logo { .. } => "logos",
+        AssetVariant::Profile { .. } => "profiles",
+        AssetVariant::EpisodeThumbnail { .. } => "thumbnails",
+    }
+}
+
 fn variant_filename(variant: AssetVariant, format: ImageFormat) -> Result<String, MediaPathError> {
     let extension = format.extension();
     match variant {
-        AssetVariant::Cover { index } => numbered_name("cover", index, extension),
-        AssetVariant::Banner { index } => numbered_name("banner", index, extension),
+        AssetVariant::Poster { index } => numbered_name("poster", index, extension),
+        AssetVariant::Backdrop { index } => backdrop_name(index, extension),
         AssetVariant::Logo { index } => numbered_name("logo", index, extension),
         AssetVariant::Profile { index } => numbered_name("profile", index, extension),
-        AssetVariant::Season { season, index } => {
-            let season = positive_number(season)?;
-            let base = format!("season{season}");
+        AssetVariant::SeasonPoster { season, index } => {
+            let base = if season == 0 {
+                "season-specials-poster".to_owned()
+            } else {
+                format!("season{season:02}-poster")
+            };
             numbered_name(&base, index, extension)
         }
-        AssetVariant::Episode {
+        AssetVariant::EpisodeThumbnail {
             season,
             episode,
             index,
         } => {
             let episode = positive_number(episode)?;
             let base = if season == 0 {
-                "specials".to_owned()
+                "season-specials".to_owned()
             } else {
-                format!("season{season}")
+                format!("season{season:02}")
             };
-            let base = format!("{base}-episode{episode}");
-            numbered_name(&base, index, extension)
+            numbered_name(
+                &format!("{base}-episode{episode:02}-thumbnails"),
+                index,
+                extension,
+            )
         }
     }
 }
 
-fn profile_filename(variant: AssetVariant, format: ImageFormat) -> Result<String, MediaPathError> {
-    match variant {
-        AssetVariant::Profile { index } => numbered_name("profile", index, format.extension()),
-        other => variant_filename(other, format),
+fn reusable_subdirectory(entity: ReusableEntity, variant: AssetVariant) -> &'static str {
+    match (entity, variant) {
+        (ReusableEntity::Collection, AssetVariant::Poster { .. }) => "posters",
+        (ReusableEntity::Collection, AssetVariant::Backdrop { .. }) => "backdrops",
+        (_, AssetVariant::Logo { .. }) => "logos",
+        _ => "",
     }
 }
 
-fn logo_or_cover_filename(
+fn backdrop_name(index: u16, extension: &str) -> Result<String, MediaPathError> {
+    let index = positive_number(index)?;
+    Ok(format!("backdrop-{index:02}.{extension}"))
+}
+
+fn reusable_filename(
     entity: ReusableEntity,
     variant: AssetVariant,
     format: ImageFormat,
 ) -> Result<String, MediaPathError> {
     match (entity, variant) {
-        (ReusableEntity::Collection, AssetVariant::Cover { index }) => {
-            numbered_name("cover", index, format.extension())
+        (ReusableEntity::Cast, AssetVariant::Profile { index }) => {
+            numbered_name("profile", index, format.extension())
         }
-        (_, AssetVariant::Logo { index }) => numbered_name("logo", index, format.extension()),
-        (_, AssetVariant::Cover { index }) => numbered_name("cover", index, format.extension()),
         _ => variant_filename(variant, format),
     }
+}
+
+fn optimized_filename(
+    variant: AssetVariant,
+    format: ImageFormat,
+    width: u32,
+) -> Result<String, MediaPathError> {
+    if width == 0 {
+        return Err(MediaPathError::InvalidNumber);
+    }
+    let original = variant_filename(variant, format)?;
+    let stem = Path::new(&original)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or(MediaPathError::InvalidNumber)?;
+    Ok(format!("{stem}-w{width}.{}", format.extension()))
 }
 
 #[cfg(test)]
@@ -626,7 +700,6 @@ mod tests {
             assert!(config.join(child).is_dir(), "missing /config/{child}");
         }
         for child in [
-            ".masters",
             "movies",
             "tv",
             "anime/movie",
@@ -669,38 +742,57 @@ mod tests {
             title_asset(
                 TitleScope::Movie,
                 11,
-                AssetVariant::Cover { index: 1 },
+                AssetVariant::Poster { index: 1 },
                 ImageFormat::Jpeg
             )
             .ok(),
-            Some(PathBuf::from("movies/11/cover.jpg"))
+            Some(PathBuf::from("movies/11/posters/poster.jpg"))
         );
         assert_eq!(
-            title_asset(
+            optimized_title_asset(
                 TitleScope::AnimeTv,
                 12,
-                AssetVariant::Episode {
+                AssetVariant::EpisodeThumbnail {
                     season: 0,
                     episode: 1,
                     index: 1
                 },
-                ImageFormat::Webp
+                ImageFormat::Jpeg,
+                640
             )
             .ok(),
-            Some(PathBuf::from("anime/tv/12/specials-episode1.webp"))
+            Some(PathBuf::from(
+                "anime/tv/12/optimized/thumbnails/season-specials-episode01-thumbnails-w640.jpg",
+            ))
+        );
+        assert_eq!(
+            title_asset(
+                TitleScope::Tv,
+                12,
+                AssetVariant::EpisodeThumbnail {
+                    season: 0,
+                    episode: 1,
+                    index: 1
+                },
+                ImageFormat::Jpeg
+            )
+            .ok(),
+            Some(PathBuf::from(
+                "tv/12/optimized/thumbnails/season-specials-episode01-thumbnails-w640.jpg",
+            ))
         );
         assert_eq!(
             title_asset(
                 TitleScope::Tv,
                 13,
-                AssetVariant::Season {
+                AssetVariant::SeasonPoster {
                     season: 1,
                     index: 2
                 },
                 ImageFormat::Jpeg
             )
             .ok(),
-            Some(PathBuf::from("tv/13/season1-02.jpg"))
+            Some(PathBuf::from("tv/13/posters/season01-poster-02.jpg"))
         );
     }
 
@@ -721,24 +813,30 @@ mod tests {
                 ReusableEntity::Network,
                 55,
                 AssetVariant::Logo { index: 2 },
-                ImageFormat::Webp
+                ImageFormat::Png
             )
             .ok(),
-            Some(PathBuf::from("networks/55/logo-02.webp"))
+            Some(PathBuf::from("networks/55/logos/logo-02.png"))
+        );
+        assert_eq!(
+            optimized_reusable_asset(
+                ReusableEntity::Cast,
+                44,
+                AssetVariant::Profile { index: 1 },
+                ImageFormat::Jpeg,
+                320
+            )
+            .ok(),
+            Some(PathBuf::from("casting/44/optimized/profile-w320.jpg"))
         );
     }
 
     #[test]
-    fn masters_are_private_and_digests_are_validated() {
-        let digest = "ab".repeat(32);
-        assert_eq!(
-            master_path(&digest).ok(),
-            Some(PathBuf::from(format!(".masters/sha256/ab/ab/{digest}")))
-        );
-        assert!(!is_public_relative(".masters/sha256/ab/ab/file"));
-        assert!(is_public_relative("movies/1/cover.jpg"));
-        assert!(!is_public_relative("../movies/1/cover.jpg"));
-        assert!(master_path("not-a-digest").is_err());
+    fn optimized_paths_are_public_and_dot_paths_are_private() {
+        assert!(!is_public_relative(".private/original"));
+        assert!(is_public_relative("movies/1/posters/poster.jpg"));
+        assert!(!is_public_relative("../movies/1/posters/poster.jpg"));
+        assert!(is_public_relative("tv/1/optimized/posters/poster-w640.jpg"));
     }
 
     #[test]
@@ -748,7 +846,7 @@ mod tests {
             title_asset(
                 TitleScope::Tv,
                 1,
-                AssetVariant::Episode {
+                AssetVariant::EpisodeThumbnail {
                     season: 1,
                     episode: 0,
                     index: 1

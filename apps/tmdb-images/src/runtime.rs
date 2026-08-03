@@ -81,11 +81,6 @@ pub async fn run() -> anyhow::Result<()> {
     let worker_config = load_worker_config(source, "tmdb-images")?;
     let worker_concurrency = load_image_worker_concurrency(source)?;
     let store = load_image_store()?;
-    store
-        .harden_private_masters()
-        .await
-        .map_err(|error| anyhow::anyhow!(error))
-        .context("harden private image masters")?;
     let downloader = load_downloader(source)?;
     let allow_local_media = parse_or(source, "ALLOW_LOCAL_MEDIA", false)?;
     let trawl_fallback_configured =
@@ -312,6 +307,7 @@ where
                     asset.file_size_bytes,
                     asset.sha256,
                     asset.image_kind,
+                    asset.gallery_index,
                     asset.iso_639_1 AS language,
                     CASE
                         WHEN asset.title_id IS NOT NULL THEN title.media_type
@@ -417,6 +413,7 @@ struct MediaAuditAssetRow {
     file_size_bytes: Option<i64>,
     sha256: Option<String>,
     image_kind: String,
+    gallery_index: i16,
     language: Option<String>,
     entity_type: Option<String>,
     entity_id: Option<i64>,
@@ -510,7 +507,10 @@ async fn verify_media_file(
     sha256: &str,
 ) -> bool {
     if !tmdb_media::is_public_relative(storage_path)
-        || !matches!(mime_type, "image/jpeg" | "image/webp")
+        || !matches!(
+            mime_type,
+            "image/jpeg" | "image/png" | "image/webp" | "image/gif"
+        )
         || width <= 0
         || height <= 0
         || file_size_bytes <= 0
@@ -567,7 +567,9 @@ fn hex_digest_matches(digest: &[u8], expected: &str) -> bool {
 fn mime_type_for_path(path: &Path) -> Option<&'static str> {
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("jpg" | "jpeg") => Some("image/jpeg"),
+        Some("png") => Some("image/png"),
         Some("webp") => Some("image/webp"),
+        Some("gif") => Some("image/gif"),
         _ => None,
     }
 }
@@ -594,13 +596,14 @@ fn repair_job(row: &MediaAuditAssetRow) -> Option<NewJob> {
         "seasonNumber": season_number,
         "episodeNumber": episode_number,
         "titleTmdbId": row.title_tmdb_id,
-        "assetIndex": 1,
+        "assetIndex": row.gallery_index,
     });
     let payload = ImageJobPayload::from_json(&value).ok()?;
     value = payload.to_json().ok()?;
     let dedup_key = format!(
-        "image:{entity_type}:{entity_id}:{}:{}",
+        "image:{entity_type}:{entity_id}:{}:{}:{}",
         row.image_kind,
+        row.gallery_index,
         source_digest(&row.source_key),
     );
     NewJob::new(
@@ -827,7 +830,6 @@ fn image_kind_name(kind: crate::image::ImageKind) -> &'static str {
         crate::image::ImageKind::Still => "still",
         crate::image::ImageKind::Profile => "profile",
         crate::image::ImageKind::Logo => "logo",
-        crate::image::ImageKind::Banner => "banner",
         crate::image::ImageKind::Other => "other",
     }
 }
@@ -1126,14 +1128,15 @@ mod tests {
         let mut encoded = std::io::Cursor::new(Vec::new());
         image::DynamicImage::new_rgb8(8, 4).write_to(&mut encoded, image::ImageFormat::Jpeg)?;
         let bytes = encoded.into_inner();
-        let path = public_dir.join("cover.jpg");
+        let path = public_dir.join("posters/poster.jpg");
+        tokio::fs::create_dir_all(path.parent().ok_or("poster path has no parent")?).await?;
         tokio::fs::write(&path, &bytes).await?;
         let root = tokio::fs::canonicalize(root.path()).await?;
         let digest = format!("{:x}", Sha256::digest(&bytes));
         assert!(
             verify_media_file(
                 &root,
-                "movies/1/cover.jpg",
+                "movies/1/posters/poster.jpg",
                 "image/jpeg",
                 8,
                 4,
@@ -1157,7 +1160,7 @@ mod tests {
         assert!(
             !verify_media_file(
                 &root,
-                "movies/1/cover.jpg",
+                "movies/1/posters/poster.jpg",
                 "image/jpeg",
                 8,
                 4,

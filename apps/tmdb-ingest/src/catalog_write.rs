@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use sha2::{Digest, Sha256};
@@ -7,8 +7,9 @@ use tmdb_domain::{MediaType, classify_anime};
 use tmdb_jobs::JobExecutionError;
 use tmdb_upstream::{
     ChangePage, TmdbAlternateTitle, TmdbCollection, TmdbCompany, TmdbContentRating, TmdbCredit,
-    TmdbCredits, TmdbEpisode, TmdbExternalIds, TmdbGenre, TmdbKeyword, TmdbMovie, TmdbNetwork,
-    TmdbReleaseDateCountry, TmdbSeason, TmdbSeasonSummary, TmdbTranslation, TmdbTv, TmdbVideo,
+    TmdbCredits, TmdbEpisode, TmdbExternalIds, TmdbGenre, TmdbImage, TmdbImages, TmdbKeyword,
+    TmdbMovie, TmdbNetwork, TmdbReleaseDateCountry, TmdbSeason, TmdbSeasonSummary, TmdbTranslation,
+    TmdbTv, TmdbVideo,
 };
 use uuid::Uuid;
 
@@ -131,6 +132,7 @@ pub(crate) async fn persist_movie_with_options(
         tmdb_id,
         movie.poster_path.as_deref(),
         movie.backdrop_path.as_deref(),
+        &movie.images,
         is_anime,
         allow_local_media,
     )
@@ -263,6 +265,7 @@ pub(crate) async fn persist_tv_with_options(
         tmdb_id,
         series.poster_path.as_deref(),
         series.backdrop_path.as_deref(),
+        &series.images,
         is_anime,
         allow_local_media,
     )
@@ -330,21 +333,20 @@ pub(crate) async fn persist_season_with_options(
     .await
     .map_err(database_error)?;
 
-    if season_number > 0 {
-        enqueue_image_job_with_position(
-            &mut transaction,
-            "season",
-            season_id,
-            "still",
-            season.poster_path.as_deref(),
-            anime,
-            Some(season.season_number),
-            None,
-            Some(tv_id),
-            allow_local_media,
-        )
-        .await?;
-    }
+    enqueue_gallery_images_with_position(
+        &mut transaction,
+        "season",
+        season_id,
+        "poster",
+        season.poster_path.as_deref(),
+        &season.images.posters,
+        anime,
+        Some(season.season_number),
+        None,
+        Some(tv_id),
+        allow_local_media,
+    )
+    .await?;
     for episode in &season.episodes {
         persist_episode(
             &mut transaction,
@@ -570,12 +572,13 @@ async fn replace_credits(
             let person_id = source_id(credit.id)?;
             let credit_id = stable_credit_id(credit, credit_type, position);
             upsert_person(transaction, person_id, credit).await?;
-            enqueue_image_job(
+            enqueue_gallery_images(
                 transaction,
                 "person",
                 person_id,
                 "profile",
                 credit.profile_path.as_deref(),
+                &credit.images.profiles,
                 false,
                 allow_local_media,
             )
@@ -656,21 +659,19 @@ async fn replace_season_summaries(
         .execute(&mut **transaction)
         .await
         .map_err(database_error)?;
-        if season.season_number > 0 {
-            enqueue_image_job_with_position(
-                transaction,
-                "season",
-                season_id,
-                "still",
-                season.poster_path.as_deref(),
-                anime,
-                Some(season.season_number),
-                None,
-                Some(tv_id),
-                allow_local_media,
-            )
-            .await?;
-        }
+        enqueue_image_job_with_position(
+            transaction,
+            "season",
+            season_id,
+            "poster",
+            season.poster_path.as_deref(),
+            anime,
+            Some(season.season_number),
+            None,
+            Some(tv_id),
+            allow_local_media,
+        )
+        .await?;
         enqueue_season_refresh(transaction, tv_id, season.season_number).await?;
     }
     Ok(())
@@ -799,12 +800,13 @@ async fn persist_episode(
     .execute(&mut **transaction)
     .await
     .map_err(database_error)?;
-    enqueue_image_job_with_position(
+    enqueue_gallery_images_with_position(
         transaction,
         "episode",
         episode_id,
         "still",
         episode.still_path.as_deref(),
+        &episode.images.stills,
         anime,
         Some(season_number),
         Some(episode.episode_number),
@@ -843,12 +845,13 @@ async fn replace_episode_credits(
             let person_id = source_id(credit.id)?;
             let credit_id = stable_credit_id(credit, credit_type, position);
             upsert_person(transaction, person_id, credit).await?;
-            enqueue_image_job(
+            enqueue_gallery_images(
                 transaction,
                 "person",
                 person_id,
                 "profile",
                 credit.profile_path.as_deref(),
+                &credit.images.profiles,
                 false,
                 allow_local_media,
             )
@@ -916,12 +919,13 @@ async fn replace_companies(
         .execute(&mut **transaction)
         .await
         .map_err(database_error)?;
-        enqueue_image_job(
+        enqueue_gallery_images(
             transaction,
             "company",
             company_id,
             "logo",
             company.logo_path.as_deref(),
+            &company.images.logos,
             false,
             allow_local_media,
         )
@@ -969,12 +973,13 @@ async fn replace_networks(
         .execute(&mut **transaction)
         .await
         .map_err(database_error)?;
-        enqueue_image_job(
+        enqueue_gallery_images(
             transaction,
             "network",
             network_id,
             "logo",
             network.logo_path.as_deref(),
+            &network.images.logos,
             false,
             allow_local_media,
         )
@@ -1057,22 +1062,24 @@ async fn replace_collection(
     .execute(&mut **transaction)
     .await
     .map_err(database_error)?;
-    enqueue_image_job(
+    enqueue_gallery_images(
         transaction,
         "collection",
         collection_id,
         "poster",
         collection.poster_path.as_deref(),
+        &collection.images.posters,
         false,
         allow_local_media,
     )
     .await?;
-    enqueue_image_job(
+    enqueue_gallery_images(
         transaction,
         "collection",
         collection_id,
         "backdrop",
         collection.backdrop_path.as_deref(),
+        &collection.images.backdrops,
         false,
         allow_local_media,
     )
@@ -1202,6 +1209,7 @@ async fn replace_common_parity_facets(
         .execute(&mut **transaction)
         .await
         .map_err(database_error)?;
+    let mut seen_videos = BTreeSet::new();
     for video in videos {
         let (Some(video_key), Some(site)) = (
             bounded_text(video.key.as_deref(), 128),
@@ -1209,6 +1217,9 @@ async fn replace_common_parity_facets(
         ) else {
             continue;
         };
+        if !seen_videos.insert((site.clone(), video_key.clone())) {
+            continue;
+        }
         sqlx::query(
             "INSERT INTO catalog.title_videos (
                  title_id, video_key, site, video_type, name, official,
@@ -1342,46 +1353,62 @@ async fn enqueue_title_images(
     entity_id: i64,
     poster_path: Option<&str>,
     backdrop_path: Option<&str>,
+    images: &TmdbImages,
     anime: bool,
     allow_local_media: bool,
 ) -> Result<(), JobExecutionError> {
-    enqueue_image_job(
+    enqueue_gallery_images(
         transaction,
         entity_type,
         entity_id,
         "poster",
         poster_path,
+        &images.posters,
         anime,
         allow_local_media,
     )
     .await?;
-    enqueue_image_job(
+    enqueue_gallery_images(
         transaction,
         entity_type,
         entity_id,
         "backdrop",
         backdrop_path,
+        &images.backdrops,
+        anime,
+        allow_local_media,
+    )
+    .await?;
+    enqueue_gallery_images(
+        transaction,
+        entity_type,
+        entity_id,
+        "logo",
+        None,
+        &images.logos,
         anime,
         allow_local_media,
     )
     .await
 }
 
-async fn enqueue_image_job(
+async fn enqueue_gallery_images(
     transaction: &mut Transaction<'_, Postgres>,
     entity_type: &str,
     entity_id: i64,
     kind: &str,
-    tmdb_path: Option<&str>,
+    primary_path: Option<&str>,
+    images: &[TmdbImage],
     anime: bool,
     allow_local_media: bool,
 ) -> Result<(), JobExecutionError> {
-    enqueue_image_job_with_position(
+    enqueue_gallery_images_with_position(
         transaction,
         entity_type,
         entity_id,
         kind,
-        tmdb_path,
+        primary_path,
+        images,
         anime,
         None,
         None,
@@ -1389,6 +1416,65 @@ async fn enqueue_image_job(
         allow_local_media,
     )
     .await
+}
+
+async fn enqueue_gallery_images_with_position(
+    transaction: &mut Transaction<'_, Postgres>,
+    entity_type: &str,
+    entity_id: i64,
+    kind: &str,
+    primary_path: Option<&str>,
+    images: &[TmdbImage],
+    anime: bool,
+    season_number: Option<u16>,
+    episode_number: Option<u16>,
+    title_tmdb_id: Option<i64>,
+    allow_local_media: bool,
+) -> Result<(), JobExecutionError> {
+    if !allow_local_media {
+        return Ok(());
+    }
+    let paths = ordered_gallery_paths(primary_path, images);
+    for (offset, path) in paths.into_iter().enumerate() {
+        let asset_index = u16::try_from(offset + 1)
+            .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+        enqueue_image_job_with_position_and_index(
+            transaction,
+            entity_type,
+            entity_id,
+            kind,
+            Some(path),
+            anime,
+            season_number,
+            episode_number,
+            title_tmdb_id,
+            asset_index,
+            allow_local_media,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn ordered_gallery_paths<'a>(
+    primary_path: Option<&'a str>,
+    images: &'a [TmdbImage],
+) -> Vec<&'a str> {
+    let primary_path = primary_path.filter(|path| valid_image_path(path));
+    let mut remaining = images
+        .iter()
+        .map(|image| image.file_path.as_str())
+        .filter(|path| valid_image_path(path) && Some(*path) != primary_path)
+        .collect::<Vec<_>>();
+    remaining.sort_unstable();
+    remaining.dedup();
+    remaining.truncate(if primary_path.is_some() { 98 } else { 99 });
+    let mut paths = Vec::with_capacity(1 + remaining.len());
+    if let Some(primary_path) = primary_path {
+        paths.push(primary_path);
+    }
+    paths.extend(remaining);
+    paths
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1404,13 +1490,48 @@ async fn enqueue_image_job_with_position(
     title_tmdb_id: Option<i64>,
     allow_local_media: bool,
 ) -> Result<(), JobExecutionError> {
+    enqueue_image_job_with_position_and_index(
+        transaction,
+        entity_type,
+        entity_id,
+        kind,
+        tmdb_path,
+        anime,
+        season_number,
+        episode_number,
+        title_tmdb_id,
+        1,
+        allow_local_media,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn enqueue_image_job_with_position_and_index(
+    transaction: &mut Transaction<'_, Postgres>,
+    entity_type: &str,
+    entity_id: i64,
+    kind: &str,
+    tmdb_path: Option<&str>,
+    anime: bool,
+    season_number: Option<u16>,
+    episode_number: Option<u16>,
+    title_tmdb_id: Option<i64>,
+    asset_index: u16,
+    allow_local_media: bool,
+) -> Result<(), JobExecutionError> {
     if !allow_local_media {
         return Ok(());
     }
     let Some(tmdb_path) = tmdb_path.filter(|path| valid_image_path(path)) else {
         return Ok(());
     };
-    let source_url = format!("https://image.tmdb.org/t/p/original{tmdb_path}");
+    let source_path = if kind == "logo" && tmdb_path.ends_with(".svg") {
+        format!("{}png", tmdb_path.trim_end_matches("svg"))
+    } else {
+        tmdb_path.to_owned()
+    };
+    let source_url = format!("https://image.tmdb.org/t/p/original{source_path}");
     let payload = serde_json::json!({
         "schemaVersion": IMAGE_JOB_PAYLOAD_VERSION,
         "entityType": entity_type,
@@ -1424,11 +1545,12 @@ async fn enqueue_image_job_with_position(
         "seasonNumber": season_number,
         "episodeNumber": episode_number,
         "titleTmdbId": title_tmdb_id,
+        "assetIndex": asset_index,
     });
     let payload = serde_json::to_string(&payload)
         .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
     let dedup_key = format!(
-        "image:{entity_type}:{entity_id}:{kind}:{}",
+        "image:{entity_type}:{entity_id}:{kind}:{asset_index}:{}",
         digest_hex(tmdb_path)
     );
     sqlx::query(
@@ -1486,8 +1608,8 @@ mod tests {
     use serde_json::Value;
     use sqlx::PgPool;
     use tmdb_upstream::{
-        TmdbCredit, TmdbCredits, TmdbEpisode, TmdbGenre, TmdbKeyword, TmdbMovie, TmdbSeason,
-        TmdbSeasonSummary, TmdbTv,
+        TmdbCredit, TmdbCredits, TmdbEpisode, TmdbGenre, TmdbImage, TmdbKeyword, TmdbMovie,
+        TmdbSeason, TmdbSeasonSummary, TmdbTv,
     };
     use tokio::sync::Barrier;
 
@@ -1506,6 +1628,32 @@ mod tests {
         assert!(title_priority > image_job_priority("person", "profile"));
         assert!(title_priority > image_job_priority("network", "logo"));
         assert!(title_priority > image_job_priority("collection", "poster"));
+    }
+
+    #[test]
+    fn gallery_paths_are_primary_first_unique_and_lexically_stable() {
+        let images = [
+            TmdbImage {
+                file_path: "/z.jpg".to_owned(),
+                ..TmdbImage::default()
+            },
+            TmdbImage {
+                file_path: "/a.jpg".to_owned(),
+                ..TmdbImage::default()
+            },
+            TmdbImage {
+                file_path: "/z.jpg".to_owned(),
+                ..TmdbImage::default()
+            },
+            TmdbImage {
+                file_path: "/primary.jpg".to_owned(),
+                ..TmdbImage::default()
+            },
+        ];
+        assert_eq!(
+            ordered_gallery_paths(Some("/primary.jpg"), &images),
+            ["/primary.jpg", "/a.jpg", "/z.jpg"]
+        );
     }
 
     #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
@@ -1545,7 +1693,7 @@ mod tests {
         assert!(rows.iter().any(|(_, _, dedup_key)| {
             dedup_key
                 == &format!(
-                    "image:movie:42:poster:{}",
+                    "image:movie:42:poster:1:{}",
                     digest_hex("/poster-fixture.jpg")
                 )
         }));

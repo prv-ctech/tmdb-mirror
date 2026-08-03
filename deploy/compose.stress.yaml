@@ -3,6 +3,7 @@
 services:
   postgres:
     image: ${TMDB_STRESS_POSTGRES_IMAGE:-tmdb-stress-postgres:local}
+    user: "0:0"
     restart: unless-stopped
     env_file: ["${TMDB_STRESS_ENV_FILE:?TMDB_STRESS_ENV_FILE must be set}"]
     shm_size: 1gb

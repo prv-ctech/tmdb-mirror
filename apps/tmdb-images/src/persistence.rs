@@ -62,15 +62,18 @@ pub(crate) async fn persist_ready(
         "INSERT INTO assets.image_assets (
              title_id, person_id, company_id, network_id, collection_id, season_id, episode_id,
              image_kind, source, source_key, source_url, storage_path, mime_type,
-             width, height, file_size_bytes, sha256, status, iso_639_1,
+             width, height, file_size_bytes, sha256, gallery_index,
+             source_mime_type, source_width, source_height, source_file_size_bytes,
+             source_sha256, source_storage_path, status, iso_639_1,
              downloaded_at, updated_at
          ) VALUES (
              $1, $2, $3, $4, $5, $6, $7,
              $8, 'tmdb', $9, $10, $11, $12,
-             $13, $14, $15, $16, 'ready', $17,
+             $13, $14, $15, $16, $17,
+             $18, $19, $20, $21, $22, $23, 'ready', $24,
              clock_timestamp(), clock_timestamp()
          )
-         ON CONFLICT (source, source_key, owner_type, owner_id) DO UPDATE SET
+         ON CONFLICT (owner_type, owner_id, image_kind, gallery_index) DO UPDATE SET
              title_id = EXCLUDED.title_id,
              person_id = EXCLUDED.person_id,
              company_id = EXCLUDED.company_id,
@@ -86,6 +89,13 @@ pub(crate) async fn persist_ready(
              height = EXCLUDED.height,
              file_size_bytes = EXCLUDED.file_size_bytes,
              sha256 = EXCLUDED.sha256,
+             gallery_index = EXCLUDED.gallery_index,
+             source_mime_type = EXCLUDED.source_mime_type,
+             source_width = EXCLUDED.source_width,
+             source_height = EXCLUDED.source_height,
+             source_file_size_bytes = EXCLUDED.source_file_size_bytes,
+             source_sha256 = EXCLUDED.source_sha256,
+             source_storage_path = EXCLUDED.source_storage_path,
              status = 'ready',
              iso_639_1 = EXCLUDED.iso_639_1,
              downloaded_at = clock_timestamp(),
@@ -108,6 +118,13 @@ pub(crate) async fn persist_ready(
     .bind(height)
     .bind(file_size)
     .bind(&metadata.sha256)
+    .bind(i16::try_from(payload.asset_index).map_err(|_| PersistError::InvalidPayload)?)
+    .bind(&metadata.source_mime_type)
+    .bind(i32::try_from(metadata.source_width).map_err(|_| PersistError::InvalidPayload)?)
+    .bind(i32::try_from(metadata.source_height).map_err(|_| PersistError::InvalidPayload)?)
+    .bind(i64::try_from(metadata.source_byte_size).map_err(|_| PersistError::InvalidPayload)?)
+    .bind(&metadata.source_sha256)
+    .bind(&metadata.source_storage_path)
     .bind(language)
     .fetch_one(&mut *transaction)
     .await
@@ -176,14 +193,43 @@ fn validate_metadata(
             metadata.mime_type.as_str(),
             "image/jpeg" | "image/png" | "image/webp" | "image/gif"
         )
+        || !matches!(
+            metadata.source_mime_type.as_str(),
+            "image/jpeg" | "image/png" | "image/webp" | "image/gif"
+        )
+        || metadata.source_byte_size == 0
+        || metadata.source_width == 0
+        || metadata.source_height == 0
+        || metadata.source_sha256.len() != 64
+        || !metadata
+            .source_sha256
+            .chars()
+            .all(|value| value.is_ascii_hexdigit())
         || metadata.sha256.len() != 64
         || !metadata
             .sha256
             .chars()
             .all(|value| value.is_ascii_hexdigit())
         || !safe_storage_path(&metadata.storage_path)
+        || metadata
+            .source_storage_path
+            .as_deref()
+            .is_some_and(|path| !safe_storage_path(path))
         || !valid_variants(metadata)
     {
+        return Err(PersistError::InvalidPayload);
+    }
+    let valid_layout = if payload.entity_type == ImageEntityType::Episode {
+        metadata.source_storage_path.is_none()
+            && is_optimized_thumbnail_path(&metadata.storage_path)
+            && metadata.mime_type == "image/jpeg"
+            && metadata.width <= 640
+            && metadata.variants.is_empty()
+    } else {
+        metadata.source_storage_path.as_deref() == Some(metadata.storage_path.as_str())
+            && !is_optimized_path(&metadata.storage_path)
+    };
+    if !valid_layout {
         return Err(PersistError::InvalidPayload);
     }
     Ok(())
@@ -203,17 +249,10 @@ fn valid_variants(metadata: &ImageMetadata) -> bool {
             return false;
         }
     }
-    // Empty is retained for legacy content-addressed records and focused
-    // metadata tests. Semantic publication always includes the primary JPEG.
-    metadata.variants.is_empty()
-        || metadata.variants.iter().any(|variant| {
-            variant.storage_path == metadata.storage_path
-                && variant.mime_type == metadata.mime_type
-                && variant.byte_size == metadata.byte_size
-                && variant.width == metadata.width
-                && variant.height == metadata.height
-                && variant.sha256 == metadata.sha256
-        })
+    metadata
+        .variants
+        .iter()
+        .all(|variant| variant.storage_path != metadata.storage_path)
 }
 
 fn valid_variant(variant: &ImageVariantMetadata) -> bool {
@@ -223,13 +262,25 @@ fn valid_variant(variant: &ImageVariantMetadata) -> bool {
             .key
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-        && matches!(variant.mime_type.as_str(), "image/jpeg" | "image/webp")
+        && !variant.key.contains("full")
+        && !variant.key.starts_with("webp_")
+        && matches!(variant.mime_type.as_str(), "image/jpeg" | "image/png")
         && variant.byte_size > 0
         && variant.width > 0
         && variant.height > 0
         && variant.sha256.len() == 64
         && variant.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && is_optimized_path(&variant.storage_path)
+        && (!is_optimized_thumbnail_path(&variant.storage_path) || variant.width <= 640)
         && safe_storage_path(&variant.storage_path)
+}
+
+fn is_optimized_path(path: &str) -> bool {
+    path.starts_with("optimized/") || path.contains("/optimized/")
+}
+
+fn is_optimized_thumbnail_path(path: &str) -> bool {
+    path.starts_with("optimized/thumbnails/") || path.contains("/optimized/thumbnails/")
 }
 
 fn safe_storage_path(value: &str) -> bool {
@@ -240,7 +291,11 @@ fn safe_storage_path(value: &str) -> bool {
         && !Path::new(value).is_absolute()
         && Path::new(value)
             .components()
-            .all(|component| !matches!(component, Component::CurDir | Component::ParentDir))
+            .all(|component| match component {
+                Component::Normal(value) => !value.to_string_lossy().starts_with('.'),
+                Component::CurDir | Component::ParentDir => false,
+                Component::RootDir | Component::Prefix(_) => false,
+            })
 }
 
 async fn resolve_owner(
@@ -367,7 +422,6 @@ fn db_image_kind(kind: ImageKind) -> &'static str {
         ImageKind::Still => "still",
         ImageKind::Profile => "profile",
         ImageKind::Logo => "logo",
-        ImageKind::Banner => "banner",
         ImageKind::Other => "other",
     }
 }
@@ -397,6 +451,7 @@ mod tests {
     }
 
     fn metadata(payload: &ImageJobPayload, storage_path: &str) -> ImageMetadata {
+        let episode = payload.entity_type == ImageEntityType::Episode;
         ImageMetadata {
             entity_type: payload.entity_type,
             entity_id: payload.entity_id,
@@ -405,12 +460,22 @@ mod tests {
             language: payload.language.clone(),
             source_revision: payload.source_revision.clone(),
             source_url: payload.source_url.clone(),
-            mime_type: "image/png".to_owned(),
+            mime_type: if episode {
+                "image/jpeg".to_owned()
+            } else {
+                "image/png".to_owned()
+            },
             byte_size: 70,
             width: 1,
             height: 1,
             sha256: "a".repeat(64),
             storage_path: storage_path.to_owned(),
+            source_mime_type: "image/png".to_owned(),
+            source_byte_size: 70,
+            source_width: 1,
+            source_height: 1,
+            source_sha256: "a".repeat(64),
+            source_storage_path: (!episode).then(|| storage_path.to_owned()),
             source: ImageSource::Direct,
             variants: Vec::new(),
         }
@@ -498,13 +563,13 @@ mod tests {
             None,
         )
         .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-        let mut image = metadata(&payload, "movies/43/cover.jpg");
+        let mut image = metadata(&payload, "movies/43/posters/poster.jpg");
         image.mime_type = "image/jpeg".to_owned();
         image.byte_size = 71;
         image.sha256 = "b".repeat(64);
         image.variants = vec![ImageVariantMetadata {
-            key: "jpeg_full".to_owned(),
-            storage_path: image.storage_path.clone(),
+            key: "jpeg_w640".to_owned(),
+            storage_path: "movies/43/optimized/posters/poster-w640.jpg".to_owned(),
             mime_type: image.mime_type.clone(),
             byte_size: image.byte_size,
             width: image.width,
@@ -525,16 +590,16 @@ mod tests {
         assert_eq!(
             rows,
             vec![(
-                "jpeg_full".to_owned(),
-                "movies/43/cover.jpg".to_owned(),
+                "jpeg_w640".to_owned(),
+                "movies/43/optimized/posters/poster-w640.jpg".to_owned(),
                 "b".repeat(64),
             )]
         );
 
         image.variants.push(ImageVariantMetadata {
-            key: "webp_full".to_owned(),
-            storage_path: "movies/43/cover.webp".to_owned(),
-            mime_type: "image/webp".to_owned(),
+            key: "png_w500".to_owned(),
+            storage_path: "movies/43/optimized/posters/poster-w500.png".to_owned(),
+            mime_type: "image/png".to_owned(),
             byte_size: 53,
             width: 1,
             height: 1,
@@ -553,8 +618,14 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                ("jpeg_full".to_owned(), "movies/43/cover.jpg".to_owned()),
-                ("webp_full".to_owned(), "movies/43/cover.webp".to_owned()),
+                (
+                    "jpeg_w640".to_owned(),
+                    "movies/43/optimized/posters/poster-w640.jpg".to_owned(),
+                ),
+                (
+                    "png_w500".to_owned(),
+                    "movies/43/optimized/posters/poster-w500.png".to_owned(),
+                ),
             ]
         );
         Ok(())
@@ -630,14 +701,20 @@ mod tests {
         persist_ready(
             &pool,
             &first,
-            &metadata(&first, "tv/100/season1-episode1.jpg"),
+            &metadata(
+                &first,
+                "tv/100/optimized/thumbnails/season01-episode01-thumbnails-w640.jpg",
+            ),
         )
         .await
         .map_err(persist_error)?;
         persist_ready(
             &pool,
             &second,
-            &metadata(&second, "tv/100/season1-episode2.jpg"),
+            &metadata(
+                &second,
+                "tv/100/optimized/thumbnails/season01-episode02-thumbnails-w640.jpg",
+            ),
         )
         .await
         .map_err(persist_error)?;
@@ -653,8 +730,14 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                (300, "tv/100/season1-episode1.jpg".to_owned()),
-                (301, "tv/100/season1-episode2.jpg".to_owned()),
+                (
+                    300,
+                    "tv/100/optimized/thumbnails/season01-episode01-thumbnails-w640.jpg".to_owned(),
+                ),
+                (
+                    301,
+                    "tv/100/optimized/thumbnails/season01-episode02-thumbnails-w640.jpg".to_owned(),
+                ),
             ]
         );
         Ok(())
@@ -696,7 +779,7 @@ mod tests {
             persist_ready(
                 &pool,
                 &anime_mismatch,
-                &metadata(&anime_mismatch, "anime/tv/700/cover.jpg"),
+                &metadata(&anime_mismatch, "anime/tv/700/posters/poster.jpg"),
             )
             .await,
             Err(PersistError::OwnerNotFound)
@@ -717,7 +800,7 @@ mod tests {
             persist_ready(
                 &pool,
                 &wrong_parent,
-                &metadata(&wrong_parent, "tv/701/season1.jpg"),
+                &metadata(&wrong_parent, "tv/700/posters/season01-poster.jpg",),
             )
             .await,
             Err(PersistError::OwnerNotFound)

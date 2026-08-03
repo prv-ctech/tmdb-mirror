@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -10,7 +10,8 @@ use sqlx::PgPool;
 use tmdb_domain::MediaType;
 use tmdb_jobs::{ClaimedJob, JobError, JobExecutionError, JobExecutor, JobRepository, NewJob};
 use tmdb_upstream::{
-    DailyExportParser, MAX_DAILY_EXPORT_BYTES, TmdbClient, TmdbClientError, TmdbTrendingItem,
+    DailyExportParser, MAX_DAILY_EXPORT_BYTES, TmdbClient, TmdbClientError, TmdbImages,
+    TmdbTrendingItem,
 };
 
 #[path = "catalog_locks.rs"]
@@ -366,6 +367,113 @@ impl IngestExecutor {
     }
 }
 
+const MAX_SHARED_GALLERY_ENTITIES: usize = 256;
+
+async fn hydrate_movie_galleries(
+    client: &TmdbClient,
+    movie: &mut tmdb_upstream::TmdbMovie,
+    allow_local_media: bool,
+) -> Result<(), TmdbClientError> {
+    if !allow_local_media {
+        return Ok(());
+    }
+    movie.images = client.fetch_movie_images(movie.id as u32).await?;
+    movie.videos = client.fetch_movie_videos(movie.id as u32).await?;
+    hydrate_credit_galleries(client, &mut movie.credits).await?;
+    for company in movie
+        .production_companies
+        .iter_mut()
+        .take(MAX_SHARED_GALLERY_ENTITIES)
+    {
+        company.images = client.fetch_company_images(company.id as u32).await?;
+    }
+    if let Some(collection) = movie.belongs_to_collection.as_mut() {
+        collection.images = client.fetch_collection_images(collection.id as u32).await?;
+    }
+    Ok(())
+}
+
+async fn hydrate_tv_galleries(
+    client: &TmdbClient,
+    series: &mut tmdb_upstream::TmdbTv,
+    allow_local_media: bool,
+) -> Result<(), TmdbClientError> {
+    if !allow_local_media {
+        return Ok(());
+    }
+    series.images = client.fetch_tv_images(series.id as u32).await?;
+    series.videos = client.fetch_tv_videos(series.id as u32).await?;
+    hydrate_credit_galleries(client, &mut series.credits).await?;
+    for company in series
+        .production_companies
+        .iter_mut()
+        .take(MAX_SHARED_GALLERY_ENTITIES)
+    {
+        company.images = client.fetch_company_images(company.id as u32).await?;
+    }
+    for network in series.networks.iter_mut().take(MAX_SHARED_GALLERY_ENTITIES) {
+        network.images = client.fetch_network_images(network.id as u32).await?;
+    }
+    Ok(())
+}
+
+async fn hydrate_credit_galleries(
+    client: &TmdbClient,
+    credits: &mut tmdb_upstream::TmdbCredits,
+) -> Result<(), TmdbClientError> {
+    let mut cache = HashMap::<u64, TmdbImages>::new();
+    hydrate_credit_galleries_with_cache(client, credits, &mut cache).await
+}
+
+async fn hydrate_credit_galleries_with_cache(
+    client: &TmdbClient,
+    credits: &mut tmdb_upstream::TmdbCredits,
+    cache: &mut HashMap<u64, TmdbImages>,
+) -> Result<(), TmdbClientError> {
+    for credit in credits
+        .cast
+        .iter()
+        .chain(credits.crew.iter())
+        .take(MAX_SHARED_GALLERY_ENTITIES)
+    {
+        if cache.len() >= MAX_SHARED_GALLERY_ENTITIES && !cache.contains_key(&credit.id) {
+            continue;
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(credit.id) {
+            entry.insert(client.fetch_person_images(credit.id as u32).await?);
+        }
+    }
+    for credit in credits.cast.iter_mut().chain(credits.crew.iter_mut()) {
+        if let Some(images) = cache.get(&credit.id) {
+            credit.images = images.clone();
+        }
+    }
+    Ok(())
+}
+
+async fn hydrate_season_galleries(
+    client: &TmdbClient,
+    tv_id: u32,
+    season: &mut tmdb_upstream::TmdbSeason,
+    allow_local_media: bool,
+) -> Result<(), TmdbClientError> {
+    if !allow_local_media {
+        return Ok(());
+    }
+    season.images = client
+        .fetch_season_images(tv_id, season.season_number)
+        .await?;
+    let mut person_cache = HashMap::<u64, TmdbImages>::new();
+    for episode in &mut season.episodes {
+        episode.images = client
+            .fetch_episode_images(tv_id, season.season_number, episode.episode_number)
+            .await?;
+        hydrate_credit_galleries_with_cache(client, &mut episode.credits, &mut person_cache)
+            .await?;
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl JobExecutor for IngestExecutor {
     fn supported_job_types(&self) -> Option<&'static [&'static str]> {
@@ -379,7 +487,7 @@ impl JobExecutor for IngestExecutor {
         let dedup_key = parsed.dedup_key();
         match parsed {
             IngestJob::RefreshMovie { tmdb_id } => {
-                let movie = match self.client.fetch_movie(tmdb_id).await {
+                let mut movie = match self.client.fetch_movie(tmdb_id).await {
                     Ok(movie) => {
                         self.record_upstream_state("ready").await;
                         movie
@@ -406,6 +514,13 @@ impl JobExecutor for IngestExecutor {
                         return Err(map_upstream_error(&error));
                     }
                 };
+                if let Err(error) =
+                    hydrate_movie_galleries(&self.client, &mut movie, self.allow_local_media).await
+                {
+                    self.record_upstream_state("degraded").await;
+                    log_upstream_failure("movie_gallery", "movie", tmdb_id, None, &error);
+                    return Err(map_upstream_error(&error));
+                }
                 if let Some(database) = &self.database {
                     catalog_write::persist_movie_with_options(
                         database,
@@ -421,7 +536,7 @@ impl JobExecutor for IngestExecutor {
                 }))
             }
             IngestJob::RefreshTv { tmdb_id } => {
-                let series = match self.client.fetch_tv(tmdb_id).await {
+                let mut series = match self.client.fetch_tv(tmdb_id).await {
                     Ok(series) => {
                         self.record_upstream_state("ready").await;
                         series
@@ -448,6 +563,13 @@ impl JobExecutor for IngestExecutor {
                         return Err(map_upstream_error(&error));
                     }
                 };
+                if let Err(error) =
+                    hydrate_tv_galleries(&self.client, &mut series, self.allow_local_media).await
+                {
+                    self.record_upstream_state("degraded").await;
+                    log_upstream_failure("tv_gallery", "tv", tmdb_id, None, &error);
+                    return Err(map_upstream_error(&error));
+                }
                 if let Some(database) = &self.database {
                     catalog_write::persist_tv_with_options(
                         database,
@@ -530,7 +652,7 @@ impl JobExecutor for IngestExecutor {
                 tv_id,
                 season_number,
             } => {
-                let season = match self.client.fetch_season(tv_id, season_number).await {
+                let mut season = match self.client.fetch_season(tv_id, season_number).await {
                     Ok(season) => {
                         self.record_upstream_state("ready").await;
                         season
@@ -565,6 +687,24 @@ impl JobExecutor for IngestExecutor {
                         return Err(map_upstream_error(&error));
                     }
                 };
+                if let Err(error) = hydrate_season_galleries(
+                    &self.client,
+                    tv_id,
+                    &mut season,
+                    self.allow_local_media,
+                )
+                .await
+                {
+                    self.record_upstream_state("degraded").await;
+                    log_upstream_failure(
+                        "season_gallery",
+                        "tv",
+                        tv_id,
+                        Some(season_number),
+                        &error,
+                    );
+                    return Err(map_upstream_error(&error));
+                }
                 if let Some(database) = &self.database {
                     catalog_write::persist_season_with_options(
                         database,

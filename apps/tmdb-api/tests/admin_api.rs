@@ -37,7 +37,7 @@ impl AdminApiStore for FakeAdminStore {
         Ok(AdminStatus {
             build: AdminBuildStatus {
                 version: "test".to_owned(),
-                schema_revision: Some("0027".to_owned()),
+                schema_revision: Some("0028".to_owned()),
             },
             database: AdminDatabaseStatus {
                 reachable: true,
@@ -214,7 +214,7 @@ async fn status_and_bounded_job_history_are_available_to_an_admin()
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 4096).await?)?;
-    assert_eq!(body["data"]["build"]["schemaRevision"], "0027");
+    assert_eq!(body["data"]["build"]["schemaRevision"], "0028");
 
     let response = app
         .clone()

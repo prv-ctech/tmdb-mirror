@@ -38,7 +38,7 @@ submit_refresh() {
     printf '%s\t%s\t%s\n' "$media_type" "$tmdb_id" "$job_id"
 }
 
-targets=("movie 550" "tv 1399" "tv 37854" "movie 900667" "movie 1132850" "tv 63648")
+targets=("movie 550" "tv 1399" "tv 37854" "movie 900667" "movie 1132850" "tv 63648" "tv 119495" "tv 4586")
 target_file="$RESULT_ROOT/artwork-targets-$stamp.tsv"
 : >"$target_file"
 for target in "${targets[@]}"; do
@@ -69,6 +69,12 @@ death_note_anime="$(psql_at "$password" "SELECT CASE WHEN COALESCE(is_anime, fal
 one_piece_anime="$(psql_at "$password" "SELECT CASE WHEN COALESCE(is_anime, false) THEN 'true' ELSE 'false' END FROM catalog.titles WHERE media_type = 'tv' AND tmdb_id = 37854")"
 skye_anime_paths="$(psql_at "$password" "SELECT count(*) FROM assets.image_assets asset JOIN catalog.titles title ON title.id = asset.title_id WHERE title.media_type = 'movie' AND title.tmdb_id = 1132850 AND asset.status = 'ready' AND asset.storage_path LIKE 'anime/%'")"
 death_note_anime_paths="$(psql_at "$password" "SELECT count(*) FROM assets.image_assets asset JOIN catalog.titles title ON title.id = asset.title_id WHERE title.media_type = 'tv' AND title.tmdb_id = 63648 AND asset.status = 'ready' AND asset.storage_path LIKE 'anime/%'")"
+gallery_counts="$(psql_at "$password" "SELECT COALESCE(json_object_agg(image_kind, asset_count ORDER BY image_kind), '{}'::json)::text FROM (SELECT image_kind, count(*) AS asset_count FROM assets.image_assets WHERE status = 'ready' GROUP BY image_kind) counts")"
+optimized_files="$(psql_at "$password" "SELECT count(*) FROM assets.image_assets WHERE status = 'ready' AND storage_path ~ '(^|/)optimized/'")"
+optimized_variants="$(psql_at "$password" "SELECT count(*) FROM assets.image_variants")"
+episode_optimized_only="$(psql_at "$password" "SELECT count(*) FROM assets.image_assets WHERE status = 'ready' AND episode_id IS NOT NULL AND storage_path ~ '(^|/)optimized/' AND source_storage_path IS NULL")"
+webp_derivatives="$(psql_at "$password" "SELECT count(*) FROM assets.image_variants WHERE mime_type = 'image/webp' OR storage_path ~* '\\.webp$'")"
+video_counts="$(psql_at "$password" "SELECT COALESCE(json_object_agg(video_type || '/' || site, video_count ORDER BY video_type, site), '{}'::json)::text FROM (SELECT COALESCE(video_type, 'unknown') AS video_type, site, count(*) AS video_count FROM catalog.title_videos GROUP BY COALESCE(video_type, 'unknown'), site) counts")"
 http_status=0
 conditional_status=0
 if [[ -n "$asset_path" && "$asset_path" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && "$asset_path" != *..* ]]; then
@@ -90,6 +96,12 @@ cat >"$result_file" <<EOF
   "targets": $(wc -l <"$target_file"),
   "failed_jobs": $failed_jobs,
   "ready_tmdb_assets": $ready_assets,
+  "gallery_counts_by_kind": $gallery_counts,
+  "optimized_asset_rows": $optimized_files,
+  "optimized_variant_rows": $optimized_variants,
+  "episode_optimized_only_rows": $episode_optimized_only,
+  "webp_derivative_rows": $webp_derivatives,
+  "video_counts_by_type_and_site": $video_counts,
   "skye_hoshi_is_anime": $([[ "$skye_anime" == true ]] && echo true || echo false),
   "death_note_is_anime": $([[ "$death_note_anime" == true ]] && echo true || echo false),
   "one_piece_is_anime": $([[ "$one_piece_anime" == true ]] && echo true || echo false),
@@ -102,7 +114,7 @@ cat >"$result_file" <<EOF
 EOF
 cat "$result_file"
 printf 'Artwork stress artifact: %s\n' "$result_file"
-if (( failed_jobs > 0 || ready_assets == 0 || http_status != 200 || conditional_status != 304 )) \
+if (( failed_jobs > 0 || ready_assets == 0 || optimized_variants == 0 || episode_optimized_only == 0 || webp_derivatives != 0 || http_status != 200 || conditional_status != 304 )) \
     || [[ "$skye_anime" != false || "$death_note_anime" != false || "$one_piece_anime" != true ]] \
     || (( skye_anime_paths != 0 || death_note_anime_paths != 0 )); then
     die 'real artwork/image download checks failed'

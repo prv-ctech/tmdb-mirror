@@ -205,6 +205,23 @@ pub trait CatalogApiStore: Send + Sync + 'static {
     ) -> Result<Option<Vec<CatalogImageAsset>>, CatalogError> {
         Err(CatalogError::Query)
     }
+    async fn list_season_images(
+        &self,
+        _key: TitleKey,
+        _season_number: i32,
+        _anime_scope: AnimeScope,
+    ) -> Result<Option<Vec<CatalogImageAsset>>, CatalogError> {
+        Err(CatalogError::Query)
+    }
+    async fn list_episode_images(
+        &self,
+        _key: TitleKey,
+        _season_number: i32,
+        _episode_number: i32,
+        _anime_scope: AnimeScope,
+    ) -> Result<Option<Vec<CatalogImageAsset>>, CatalogError> {
+        Err(CatalogError::Query)
+    }
     async fn list_translations(
         &self,
         _key: TitleKey,
@@ -460,6 +477,23 @@ impl CatalogApiStore for CatalogRepository {
     ) -> Result<Option<Vec<CatalogImageAsset>>, CatalogError> {
         Self::list_images(self, key, anime_scope).await
     }
+    async fn list_season_images(
+        &self,
+        key: TitleKey,
+        season_number: i32,
+        anime_scope: AnimeScope,
+    ) -> Result<Option<Vec<CatalogImageAsset>>, CatalogError> {
+        Self::list_season_images(self, key, season_number, anime_scope).await
+    }
+    async fn list_episode_images(
+        &self,
+        key: TitleKey,
+        season_number: i32,
+        episode_number: i32,
+        anime_scope: AnimeScope,
+    ) -> Result<Option<Vec<CatalogImageAsset>>, CatalogError> {
+        Self::list_episode_images(self, key, season_number, episode_number, anime_scope).await
+    }
     async fn list_translations(
         &self,
         key: TitleKey,
@@ -665,6 +699,14 @@ fn build_catalog_routes(state: CatalogApiState) -> Router {
             get(anime_release_dates),
         )
         .route("/anime/{media_type}/{tmdb_id}/images", get(anime_images))
+        .route(
+            "/anime/{media_type}/{tmdb_id}/seasons/{season_number}/images",
+            get(anime_season_images),
+        )
+        .route(
+            "/anime/{media_type}/{tmdb_id}/seasons/{season_number}/episodes/{episode_number}/images",
+            get(anime_episode_images),
+        )
         .route("/trending/{trend_window}", get(list_trending))
         .route("/anime/trending/{trend_window}", get(list_anime_trending))
         .route("/calendar/movies", get(movie_calendar))
@@ -685,12 +727,20 @@ fn build_catalog_routes(state: CatalogApiState) -> Router {
         .route("/tv/{tmdb_id}/seasons", get(tv_seasons))
         .route("/tv/{tmdb_id}/seasons/{season_number}", get(tv_season))
         .route(
+            "/tv/{tmdb_id}/seasons/{season_number}/images",
+            get(tv_season_images),
+        )
+        .route(
             "/tv/{tmdb_id}/seasons/{season_number}/episodes",
             get(tv_episodes),
         )
         .route(
             "/tv/{tmdb_id}/seasons/{season_number}/episodes/{episode_number}",
             get(tv_episode),
+        )
+        .route(
+            "/tv/{tmdb_id}/seasons/{season_number}/episodes/{episode_number}/images",
+            get(tv_episode_images),
         )
         .layer(Extension(state))
         .method_not_allowed_fallback(problem::method_not_allowed)
@@ -759,12 +809,20 @@ async fn openapi() -> axum::Json<Value> {
             "Get a TV season",
         ),
         (
+            "/v1/tv/{tmdb_id}/seasons/{season_number}/images",
+            "Get season image metadata",
+        ),
+        (
             "/v1/tv/{tmdb_id}/seasons/{season_number}/episodes",
             "List season episodes",
         ),
         (
             "/v1/tv/{tmdb_id}/seasons/{season_number}/episodes/{episode_number}",
             "Get a TV episode",
+        ),
+        (
+            "/v1/tv/{tmdb_id}/seasons/{season_number}/episodes/{episode_number}/images",
+            "Get episode image metadata",
         ),
         ("/v1/anime", "List isolated anime movies and TV series"),
         ("/v1/anime/popular", "List popular isolated anime"),
@@ -801,6 +859,14 @@ async fn openapi() -> axum::Json<Value> {
         (
             "/v1/anime/{media_type}/{tmdb_id}/images",
             "Get anime image metadata",
+        ),
+        (
+            "/v1/anime/{media_type}/{tmdb_id}/seasons/{season_number}/images",
+            "Get anime season image metadata",
+        ),
+        (
+            "/v1/anime/{media_type}/{tmdb_id}/seasons/{season_number}/episodes/{episode_number}/images",
+            "Get anime episode image metadata",
         ),
         (
             "/v1/trending/{trend_window}",
@@ -1822,7 +1888,11 @@ async fn get_anime(
         .await
     {
         Ok(Some(detail)) if detail.title.media_type == media_type && detail.title.is_anime => {
-            detail_response(detail)
+            detail_response(
+                detail,
+                state.allow_local_media,
+                state.media_base_url.as_deref(),
+            )
         }
         Ok(Some(_) | None) => not_found_response(&request_id),
         Err(error) => store_error_response(error, &request_id),
@@ -1847,7 +1917,11 @@ async fn get_fixed_media(
     let key = TitleKey::new(media_type, tmdb_id);
     match state.store.get_detail(key, AnimeScope::OnlyNonAnime).await {
         Ok(Some(detail)) if detail.title.media_type == media_type && !detail.title.is_anime => {
-            detail_response(detail)
+            detail_response(
+                detail,
+                state.allow_local_media,
+                state.media_base_url.as_deref(),
+            )
         }
         Ok(Some(_) | None) => not_found_response(&request_id),
         Err(error) => store_error_response(error, &request_id),
@@ -1879,7 +1953,19 @@ async fn list_people(
         .list_people(query.term.as_deref(), scope, query.limit)
         .await
     {
-        Ok(items) => (StatusCode::OK, Json(serde_json::json!({ "data": items }))).into_response(),
+        Ok(items) => {
+            let data = items
+                .into_iter()
+                .map(|item| {
+                    person_response(
+                        item,
+                        state.allow_local_media,
+                        state.media_base_url.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (StatusCode::OK, Json(serde_json::json!({ "data": data }))).into_response()
+        }
         Err(error) => store_error_response(error, &request_id),
     }
 }
@@ -2028,13 +2114,11 @@ async fn list_dimension(
                 items
                     .into_iter()
                     .map(|item| {
-                        serde_json::json!({
-                            "id": item.id,
-                            "name": item.name,
-                            "originCountry": item.origin_country,
-                            "logoPath": item.logo_path,
-                            "companyRole": item.company_role,
-                        })
+                        company_response(
+                            item,
+                            state.allow_local_media,
+                            state.media_base_url.as_deref(),
+                        )
                     })
                     .collect::<Vec<_>>()
             }),
@@ -2046,12 +2130,11 @@ async fn list_dimension(
                 items
                     .into_iter()
                     .map(|item| {
-                        serde_json::json!({
-                            "id": item.id,
-                            "name": item.name,
-                            "originCountry": item.origin_country,
-                            "logoPath": item.logo_path,
-                        })
+                        network_response(
+                            item,
+                            state.allow_local_media,
+                            state.media_base_url.as_deref(),
+                        )
                     })
                     .collect::<Vec<_>>()
             }),
@@ -2062,7 +2145,13 @@ async fn list_dimension(
             .map(|items| {
                 items
                     .into_iter()
-                    .map(|item| serde_json::to_value(item).unwrap_or_default())
+                    .map(|item| {
+                        collection_response(
+                            item,
+                            state.allow_local_media,
+                            state.media_base_url.as_deref(),
+                        )
+                    })
                     .collect::<Vec<_>>()
             }),
     };
@@ -2095,7 +2184,22 @@ async fn scoped_resource(
             .store
             .list_credits(key, anime_scope)
             .await
-            .map(|value| value.map(|items| serde_json::to_value(items).unwrap_or_default())),
+            .map(|value| {
+                value.map(|items| {
+                    serde_json::Value::Array(
+                        items
+                            .into_iter()
+                            .map(|item| {
+                                credit_response(
+                                    item,
+                                    state.allow_local_media,
+                                    state.media_base_url.as_deref(),
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+            }),
         ResourceKind::Images => state
             .store
             .list_images(key, anime_scope)
@@ -2232,10 +2336,6 @@ fn image_response(
     let Some(object) = value.as_object_mut() else {
         return value;
     };
-    let remote = object
-        .get("sourceUrl")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
     let local = if allow_local_media {
         object
             .get("storagePath")
@@ -2248,9 +2348,30 @@ fn image_response(
     } else {
         None
     };
+    object.remove("sourceKey");
+    object.remove("sourceUrl");
+    object.remove("storagePath");
+    object.remove("sourceStoragePath");
+    let variant_fallback = if allow_local_media {
+        object
+            .get("variants")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|variants| variants.first())
+            .and_then(|variant| variant.get("storagePath"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|path| tmdb_media::is_public_relative(path))
+            .map(|path| match media_base_url {
+                Some(base) => format!("{}/{}", base.trim_end_matches('/'), path),
+                None => format!("/media/{path}"),
+            })
+    } else {
+        None
+    };
     object.insert(
         "url".to_owned(),
-        serde_json::Value::String(local.or(remote).unwrap_or_default()),
+        local
+            .or(variant_fallback)
+            .map_or(serde_json::Value::Null, serde_json::Value::String),
     );
     if let Some(variants) = object
         .get_mut("variants")
@@ -2275,6 +2396,7 @@ fn image_response(
             if let Some(local) = local {
                 variant_object.insert("url".to_owned(), serde_json::Value::String(local));
             }
+            variant_object.remove("storagePath");
         }
     }
     value
@@ -2368,6 +2490,203 @@ async fn anime_images(
         request_id,
         media_type,
         ResourceKind::Images,
+        AnimeScope::OnlyAnime,
+    )
+    .await
+}
+
+async fn scoped_season_images(
+    state: CatalogApiState,
+    raw_id: String,
+    raw_season: String,
+    query: Option<String>,
+    request_id: Option<Extension<RequestId>>,
+    media_type: MediaType,
+    anime_scope: AnimeScope,
+) -> Response {
+    let request_id = request_id_string(request_id);
+    if query.is_some_and(|value| !value.is_empty()) {
+        return error_response(CatalogApiError::InvalidQuery, &request_id);
+    }
+    let tmdb_id = match parse_tmdb_id(&raw_id) {
+        Ok(id) => id,
+        Err(error) => return error_response(error, &request_id),
+    };
+    let Some(season_number) = raw_season
+        .parse::<i32>()
+        .ok()
+        .filter(|value| (0..=1000).contains(value))
+    else {
+        return error_response(CatalogApiError::InvalidQuery, &request_id);
+    };
+    match state
+        .store
+        .list_season_images(
+            TitleKey::new(media_type, tmdb_id),
+            season_number,
+            anime_scope,
+        )
+        .await
+    {
+        Ok(Some(data)) => {
+            let data = data
+                .into_iter()
+                .map(|item| {
+                    image_response(
+                        item,
+                        state.allow_local_media,
+                        state.media_base_url.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (StatusCode::OK, Json(serde_json::json!({"data": data}))).into_response()
+        }
+        Ok(None) => not_found_response(&request_id),
+        Err(error) => store_error_response(error, &request_id),
+    }
+}
+
+async fn scoped_episode_images(
+    state: CatalogApiState,
+    raw_id: String,
+    raw_season: String,
+    raw_episode: String,
+    query: Option<String>,
+    request_id: Option<Extension<RequestId>>,
+    media_type: MediaType,
+    anime_scope: AnimeScope,
+) -> Response {
+    let request_id = request_id_string(request_id);
+    if query.is_some_and(|value| !value.is_empty()) {
+        return error_response(CatalogApiError::InvalidQuery, &request_id);
+    }
+    let tmdb_id = match parse_tmdb_id(&raw_id) {
+        Ok(id) => id,
+        Err(error) => return error_response(error, &request_id),
+    };
+    let Some(season_number) = raw_season
+        .parse::<i32>()
+        .ok()
+        .filter(|value| (0..=1000).contains(value))
+    else {
+        return error_response(CatalogApiError::InvalidQuery, &request_id);
+    };
+    let Some(episode_number) = raw_episode
+        .parse::<i32>()
+        .ok()
+        .filter(|value| (0..=100_000).contains(value))
+    else {
+        return error_response(CatalogApiError::InvalidQuery, &request_id);
+    };
+    match state
+        .store
+        .list_episode_images(
+            TitleKey::new(media_type, tmdb_id),
+            season_number,
+            episode_number,
+            anime_scope,
+        )
+        .await
+    {
+        Ok(Some(data)) => {
+            let data = data
+                .into_iter()
+                .map(|item| {
+                    image_response(
+                        item,
+                        state.allow_local_media,
+                        state.media_base_url.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (StatusCode::OK, Json(serde_json::json!({"data": data}))).into_response()
+        }
+        Ok(None) => not_found_response(&request_id),
+        Err(error) => store_error_response(error, &request_id),
+    }
+}
+
+async fn tv_season_images(
+    Extension(state): Extension<CatalogApiState>,
+    Path((raw_id, raw_season)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    scoped_season_images(
+        state,
+        raw_id,
+        raw_season,
+        query,
+        request_id,
+        MediaType::Tv,
+        AnimeScope::OnlyNonAnime,
+    )
+    .await
+}
+
+async fn tv_episode_images(
+    Extension(state): Extension<CatalogApiState>,
+    Path((raw_id, raw_season, raw_episode)): Path<(String, String, String)>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    scoped_episode_images(
+        state,
+        raw_id,
+        raw_season,
+        raw_episode,
+        query,
+        request_id,
+        MediaType::Tv,
+        AnimeScope::OnlyNonAnime,
+    )
+    .await
+}
+
+async fn anime_season_images(
+    Extension(state): Extension<CatalogApiState>,
+    Path((raw_media_type, raw_id, raw_season)): Path<(String, String, String)>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    let Ok(media_type) = MediaType::from_str(&raw_media_type) else {
+        return error_response(
+            CatalogApiError::InvalidQuery,
+            &request_id_string(request_id),
+        );
+    };
+    scoped_season_images(
+        state,
+        raw_id,
+        raw_season,
+        query,
+        request_id,
+        media_type,
+        AnimeScope::OnlyAnime,
+    )
+    .await
+}
+
+async fn anime_episode_images(
+    Extension(state): Extension<CatalogApiState>,
+    Path((raw_media_type, raw_id, raw_season, raw_episode)): Path<(String, String, String, String)>,
+    RawQuery(query): RawQuery,
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    let Ok(media_type) = MediaType::from_str(&raw_media_type) else {
+        return error_response(
+            CatalogApiError::InvalidQuery,
+            &request_id_string(request_id),
+        );
+    };
+    scoped_episode_images(
+        state,
+        raw_id,
+        raw_season,
+        raw_episode,
+        query,
+        request_id,
+        media_type,
         AnimeScope::OnlyAnime,
     )
     .await
@@ -2584,7 +2903,19 @@ async fn tv_seasons(
         )
         .await
     {
-        Ok(Some(data)) => (StatusCode::OK, Json(serde_json::json!({"data": data}))).into_response(),
+        Ok(Some(data)) => {
+            let data = data
+                .into_iter()
+                .map(|item| {
+                    season_response(
+                        item,
+                        state.allow_local_media,
+                        state.media_base_url.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (StatusCode::OK, Json(serde_json::json!({"data": data}))).into_response()
+        }
         Ok(None) => not_found_response(&request_id),
         Err(error) => store_error_response(error, &request_id),
     }
@@ -2620,7 +2951,19 @@ async fn tv_episodes(
         )
         .await
     {
-        Ok(Some(data)) => (StatusCode::OK, Json(serde_json::json!({"data": data}))).into_response(),
+        Ok(Some(data)) => {
+            let data = data
+                .into_iter()
+                .map(|item| {
+                    episode_response(
+                        item,
+                        state.allow_local_media,
+                        state.media_base_url.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (StatusCode::OK, Json(serde_json::json!({"data": data}))).into_response()
+        }
         Ok(None) => not_found_response(&request_id),
         Err(error) => store_error_response(error, &request_id),
     }
@@ -2667,7 +3010,17 @@ async fn tv_episode(
             .into_iter()
             .find(|episode| episode.episode_number == episode_number)
         {
-            Some(data) => (StatusCode::OK, Json(serde_json::json!({"data": data}))).into_response(),
+            Some(data) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "data": episode_response(
+                        data,
+                        state.allow_local_media,
+                        state.media_base_url.as_deref(),
+                    )
+                })),
+            )
+                .into_response(),
             None => not_found_response(&request_id),
         },
         Ok(None) => not_found_response(&request_id),
@@ -2708,7 +3061,17 @@ async fn tv_season(
             .into_iter()
             .find(|season| season.season_number == season_number)
         {
-            Some(data) => (StatusCode::OK, Json(serde_json::json!({"data": data}))).into_response(),
+            Some(data) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "data": season_response(
+                        data,
+                        state.allow_local_media,
+                        state.media_base_url.as_deref(),
+                    )
+                })),
+            )
+                .into_response(),
             None => not_found_response(&request_id),
         },
         Ok(None) => not_found_response(&request_id),
@@ -2795,8 +3158,8 @@ struct CatalogDetailBody {
     adult: bool,
     video: bool,
     homepage: Option<String>,
-    poster_path: Option<String>,
-    backdrop_path: Option<String>,
+    poster_url: Option<String>,
+    backdrop_url: Option<String>,
     source_updated_at: Option<DateTime<Utc>>,
     facets: CatalogFacetsResponse,
 }
@@ -2867,7 +3230,7 @@ struct CatalogCompanyResponse {
     id: i64,
     name: Option<String>,
     origin_country: Option<String>,
-    logo_path: Option<String>,
+    logo_url: Option<String>,
     company_role: Option<String>,
 }
 
@@ -2877,11 +3240,15 @@ struct CatalogNetworkResponse {
     id: i64,
     name: Option<String>,
     origin_country: Option<String>,
-    logo_path: Option<String>,
+    logo_url: Option<String>,
 }
 
-impl From<CatalogDetail> for CatalogDetailBody {
-    fn from(detail: CatalogDetail) -> Self {
+impl CatalogDetailBody {
+    fn from_detail(
+        detail: CatalogDetail,
+        allow_local_media: bool,
+        media_base_url: Option<&str>,
+    ) -> Self {
         let CatalogDetail {
             title,
             movie,
@@ -2911,10 +3278,14 @@ impl From<CatalogDetail> for CatalogDetailBody {
             adult,
             video,
             homepage,
-            poster_path,
-            backdrop_path,
+            poster_url: local_media_url(poster_path.as_deref(), allow_local_media, media_base_url),
+            backdrop_url: local_media_url(
+                backdrop_path.as_deref(),
+                allow_local_media,
+                media_base_url,
+            ),
             source_updated_at,
-            facets: facets.into(),
+            facets: CatalogFacetsResponse::from_facets(facets, allow_local_media, media_base_url),
         }
     }
 }
@@ -2942,15 +3313,27 @@ impl From<tmdb_db::CatalogTvDetails> for CatalogTvDetailsResponse {
     }
 }
 
-impl From<tmdb_db::CatalogFacets> for CatalogFacetsResponse {
-    fn from(facets: tmdb_db::CatalogFacets) -> Self {
+impl CatalogFacetsResponse {
+    fn from_facets(
+        facets: tmdb_db::CatalogFacets,
+        allow_local_media: bool,
+        media_base_url: Option<&str>,
+    ) -> Self {
         Self {
             genres: facets.genres.into_iter().map(Into::into).collect(),
             keywords: facets.keywords.into_iter().map(Into::into).collect(),
             tags: facets.tags.into_iter().map(Into::into).collect(),
             languages: facets.languages.into_iter().map(Into::into).collect(),
-            companies: facets.companies.into_iter().map(Into::into).collect(),
-            networks: facets.networks.into_iter().map(Into::into).collect(),
+            companies: facets
+                .companies
+                .into_iter()
+                .map(|value| company_body(value, allow_local_media, media_base_url))
+                .collect(),
+            networks: facets
+                .networks
+                .into_iter()
+                .map(|value| network_body(value, allow_local_media, media_base_url))
+                .collect(),
         }
     }
 }
@@ -2993,26 +3376,38 @@ impl From<tmdb_db::CatalogLanguage> for CatalogLanguageResponse {
     }
 }
 
-impl From<tmdb_db::CatalogCompany> for CatalogCompanyResponse {
-    fn from(value: tmdb_db::CatalogCompany) -> Self {
-        Self {
-            id: value.id,
-            name: value.name,
-            origin_country: value.origin_country,
-            logo_path: value.logo_path,
-            company_role: value.company_role,
-        }
+fn company_body(
+    value: tmdb_db::CatalogCompany,
+    allow_local_media: bool,
+    media_base_url: Option<&str>,
+) -> CatalogCompanyResponse {
+    CatalogCompanyResponse {
+        id: value.id,
+        name: value.name,
+        origin_country: value.origin_country,
+        logo_url: local_media_url(
+            value.logo_path.as_deref(),
+            allow_local_media,
+            media_base_url,
+        ),
+        company_role: value.company_role,
     }
 }
 
-impl From<tmdb_db::CatalogNetwork> for CatalogNetworkResponse {
-    fn from(value: tmdb_db::CatalogNetwork) -> Self {
-        Self {
-            id: value.id,
-            name: value.name,
-            origin_country: value.origin_country,
-            logo_path: value.logo_path,
-        }
+fn network_body(
+    value: tmdb_db::CatalogNetwork,
+    allow_local_media: bool,
+    media_base_url: Option<&str>,
+) -> CatalogNetworkResponse {
+    CatalogNetworkResponse {
+        id: value.id,
+        name: value.name,
+        origin_country: value.origin_country,
+        logo_url: local_media_url(
+            value.logo_path.as_deref(),
+            allow_local_media,
+            media_base_url,
+        ),
     }
 }
 
@@ -3034,6 +3429,144 @@ fn detail_from_title(title: CatalogTitle) -> CatalogDetail {
         source_updated_at: None,
         facets: tmdb_db::CatalogFacets::default(),
     }
+}
+
+fn local_media_url(
+    path: Option<&str>,
+    allow_local_media: bool,
+    media_base_url: Option<&str>,
+) -> Option<String> {
+    if !allow_local_media {
+        return None;
+    }
+    path.filter(|path| tmdb_media::is_public_relative(path))
+        .map(|path| match media_base_url {
+            Some(base) => format!("{}/{}", base.trim_end_matches('/'), path),
+            None => format!("/media/{path}"),
+        })
+}
+
+fn person_response(
+    person: CatalogPerson,
+    allow_local_media: bool,
+    media_base_url: Option<&str>,
+) -> Value {
+    let mut value = serde_json::to_value(person).unwrap_or_default();
+    if let Some(object) = value.as_object_mut() {
+        let profile_path = object
+            .remove("profilePath")
+            .and_then(|value| value.as_str().map(str::to_owned));
+        object.insert(
+            "profileUrl".to_owned(),
+            serde_json::to_value(local_media_url(
+                profile_path.as_deref(),
+                allow_local_media,
+                media_base_url,
+            ))
+            .unwrap_or(Value::Null),
+        );
+    }
+    value
+}
+
+fn credit_response(
+    credit: CatalogCredit,
+    allow_local_media: bool,
+    media_base_url: Option<&str>,
+) -> Value {
+    let mut value = serde_json::to_value(credit).unwrap_or_default();
+    if let Some(person) = value.get_mut("person").and_then(Value::as_object_mut) {
+        let profile_path = person
+            .remove("profilePath")
+            .and_then(|value| value.as_str().map(str::to_owned));
+        person.insert(
+            "profileUrl".to_owned(),
+            serde_json::to_value(local_media_url(
+                profile_path.as_deref(),
+                allow_local_media,
+                media_base_url,
+            ))
+            .unwrap_or(Value::Null),
+        );
+    }
+    value
+}
+
+fn company_response(
+    company: tmdb_db::CatalogCompany,
+    allow_local_media: bool,
+    media_base_url: Option<&str>,
+) -> Value {
+    serde_json::to_value(company_body(company, allow_local_media, media_base_url))
+        .unwrap_or_default()
+}
+
+fn network_response(
+    network: tmdb_db::CatalogNetwork,
+    allow_local_media: bool,
+    media_base_url: Option<&str>,
+) -> Value {
+    serde_json::to_value(network_body(network, allow_local_media, media_base_url))
+        .unwrap_or_default()
+}
+
+fn collection_response(
+    collection: tmdb_db::CatalogCollection,
+    allow_local_media: bool,
+    media_base_url: Option<&str>,
+) -> Value {
+    serde_json::json!({
+        "id": collection.id,
+        "name": collection.name,
+        "posterUrl": local_media_url(collection.poster_path.as_deref(), allow_local_media, media_base_url),
+        "backdropUrl": local_media_url(collection.backdrop_path.as_deref(), allow_local_media, media_base_url),
+    })
+}
+
+fn season_response(
+    season: CatalogSeason,
+    allow_local_media: bool,
+    media_base_url: Option<&str>,
+) -> Value {
+    let mut value = serde_json::to_value(season).unwrap_or_default();
+    if let Some(object) = value.as_object_mut() {
+        let poster_path = object
+            .remove("posterPath")
+            .and_then(|value| value.as_str().map(str::to_owned));
+        object.insert(
+            "posterUrl".to_owned(),
+            serde_json::to_value(local_media_url(
+                poster_path.as_deref(),
+                allow_local_media,
+                media_base_url,
+            ))
+            .unwrap_or(Value::Null),
+        );
+    }
+    value
+}
+
+fn episode_response(
+    episode: CatalogEpisode,
+    allow_local_media: bool,
+    media_base_url: Option<&str>,
+) -> Value {
+    let mut value = serde_json::to_value(episode).unwrap_or_default();
+    if let Some(object) = value.as_object_mut() {
+        let still_path = object
+            .remove("stillPath")
+            .and_then(|value| value.as_str().map(str::to_owned));
+        object.insert(
+            "thumbnailUrl".to_owned(),
+            serde_json::to_value(local_media_url(
+                still_path.as_deref(),
+                allow_local_media,
+                media_base_url,
+            ))
+            .unwrap_or(Value::Null),
+        );
+    }
+    value
 }
 
 #[derive(Debug, Serialize)]
@@ -3109,11 +3642,15 @@ fn items_response(items: Vec<CatalogTitle>) -> Response {
     (StatusCode::OK, Json(body)).into_response()
 }
 
-fn detail_response(detail: CatalogDetail) -> Response {
+fn detail_response(
+    detail: CatalogDetail,
+    allow_local_media: bool,
+    media_base_url: Option<&str>,
+) -> Response {
     (
         StatusCode::OK,
         Json(CatalogDetailResponse {
-            data: detail.into(),
+            data: CatalogDetailBody::from_detail(detail, allow_local_media, media_base_url),
         }),
     )
         .into_response()

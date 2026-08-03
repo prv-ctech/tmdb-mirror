@@ -1,7 +1,7 @@
 //! Embedded read-only HTTP server for the public `/media` mount.
 //!
 //! The handler owns the public boundary instead of delegating the directory to
-//! a generic file server so it can reject private masters, prevent path escape,
+//! a generic file server so it can reject hidden paths, prevent path escape,
 //! and provide deterministic conditional GETs for image clients.
 
 use std::{
@@ -161,14 +161,15 @@ mod tests {
         let root = tempfile::tempdir()?;
         let movie = root.path().join("movies/1");
         tokio::fs::create_dir_all(&movie).await?;
-        tokio::fs::write(movie.join("cover.jpg"), b"public-jpeg").await?;
+        tokio::fs::create_dir_all(movie.join("posters")).await?;
+        tokio::fs::write(movie.join("posters/poster.jpg"), b"public-jpeg").await?;
         let app = media_router(root.path().to_path_buf());
 
         let first = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/media/movies/1/cover.jpg")
+                    .uri("/media/movies/1/posters/poster.jpg")
                     .body(Body::empty())?,
             )
             .await?;
@@ -179,7 +180,7 @@ mod tests {
         let second = app
             .oneshot(
                 Request::builder()
-                    .uri("/media/movies/1/cover.jpg")
+                    .uri("/media/movies/1/posters/poster.jpg")
                     .header(header::IF_NONE_MATCH, etag)
                     .body(Body::empty())?,
             )
@@ -189,13 +190,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_masters_and_escape_attempts_are_not_served()
+    async fn private_paths_and_escape_attempts_are_not_served()
     -> Result<(), Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
-        tokio::fs::create_dir_all(root.path().join(".masters")).await?;
-        tokio::fs::write(root.path().join(".masters/master"), b"private").await?;
+        tokio::fs::create_dir_all(root.path().join(".private")).await?;
+        tokio::fs::write(root.path().join(".private/original"), b"private").await?;
         let app = media_router(root.path().to_path_buf());
-        for uri in ["/media/.masters/master", "/media/%2e%2e/.masters/master"] {
+        for uri in [
+            "/media/.private/original",
+            "/media/%2e%2e/.private/original",
+        ] {
             let response = app
                 .clone()
                 .oneshot(Request::builder().uri(uri).body(Body::empty())?)

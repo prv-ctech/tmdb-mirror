@@ -380,6 +380,7 @@ pub struct CatalogEpisode {
 pub struct CatalogImageAsset {
     pub id: i64,
     pub image_kind: String,
+    pub gallery_index: i16,
     pub source: String,
     pub source_key: String,
     pub source_url: Option<String>,
@@ -389,13 +390,19 @@ pub struct CatalogImageAsset {
     pub height: Option<i32>,
     pub file_size_bytes: Option<i64>,
     pub sha256: Option<String>,
+    pub source_mime_type: Option<String>,
+    pub source_width: Option<i32>,
+    pub source_height: Option<i32>,
+    pub source_file_size_bytes: Option<i64>,
+    pub source_sha256: Option<String>,
+    pub source_storage_path: Option<String>,
     pub status: String,
     pub iso_639_1: Option<String>,
-    /// Verified local JPEG/WebP representations, ordered by stable variant key.
+    /// Verified optimized representations, ordered by stable variant key.
     pub variants: Vec<CatalogImageVariant>,
 }
 
-/// One local image representation available for responsive clients.
+/// One local optimized image representation available to clients.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogImageVariant {
@@ -454,6 +461,7 @@ pub struct CatalogVideo {
     pub country_code: Option<String>,
     pub published_at: Option<DateTime<Utc>>,
     pub size: Option<i32>,
+    pub url: Option<String>,
 }
 
 /// A regional release date or television content rating/certification.
@@ -733,8 +741,20 @@ impl CatalogRepository {
                     title.adult,
                     title.video,
                     title.homepage,
-                    title.poster_path,
-                    title.backdrop_path,
+                    (SELECT asset.storage_path
+                       FROM assets.image_assets AS asset
+                      WHERE asset.title_id = title.id
+                        AND asset.image_kind = 'poster'
+                        AND asset.gallery_index = 1
+                        AND asset.status = 'ready'
+                      LIMIT 1) AS poster_path,
+                    (SELECT asset.storage_path
+                       FROM assets.image_assets AS asset
+                      WHERE asset.title_id = title.id
+                        AND asset.image_kind = 'backdrop'
+                        AND asset.gallery_index = 1
+                        AND asset.status = 'ready'
+                      LIMIT 1) AS backdrop_path,
                     title.source_updated_at,
                     movie.title_id AS movie_title_id,
                     movie.budget AS movie_budget,
@@ -817,7 +837,15 @@ impl CatalogRepository {
                                 'id', company.id,
                                 'name', company.name,
                                 'origin_country', company.origin_country,
-                                'logo_path', company.logo_path,
+                                'logo_path', (
+                                    SELECT asset.storage_path
+                                      FROM assets.image_assets AS asset
+                                     WHERE asset.company_id = company.id
+                                       AND asset.image_kind = 'logo'
+                                       AND asset.gallery_index = 1
+                                       AND asset.status = 'ready'
+                                     LIMIT 1
+                                ),
                                 'company_role', relation.company_role
                             )
                             ORDER BY company.id
@@ -835,7 +863,15 @@ impl CatalogRepository {
                                 'id', network.id,
                                 'name', network.name,
                                 'origin_country', network.origin_country,
-                                'logo_path', network.logo_path
+                                'logo_path', (
+                                    SELECT asset.storage_path
+                                      FROM assets.image_assets AS asset
+                                     WHERE asset.network_id = network.id
+                                       AND asset.image_kind = 'logo'
+                                       AND asset.gallery_index = 1
+                                       AND asset.status = 'ready'
+                                     LIMIT 1
+                                )
                             )
                             ORDER BY network.id
                         ),
@@ -992,7 +1028,14 @@ impl CatalogRepository {
             "SELECT DISTINCT person.id, person.name, person.known_for_department,
                     person.gender, person.biography, person.birthday, person.deathday,
                     person.place_of_birth, person.homepage, person.imdb_id, person.adult,
-                    person.popularity, person.profile_path
+                    person.popularity,
+                    (SELECT asset.storage_path
+                       FROM assets.image_assets AS asset
+                      WHERE asset.person_id = person.id
+                        AND asset.image_kind = 'profile'
+                        AND asset.gallery_index = 1
+                        AND asset.status = 'ready'
+                      LIMIT 1) AS profile_path
                FROM catalog.people AS person
                JOIN catalog.title_credits AS credit ON credit.person_id = person.id
                JOIN catalog.titles AS title ON title.id = credit.title_id
@@ -1041,7 +1084,14 @@ impl CatalogRepository {
         };
         let limit_placeholder = if term.is_some() { "$2" } else { "$1" };
         let statement = format!(
-            "SELECT company.id, company.name, company.origin_country, company.logo_path
+            "SELECT company.id, company.name, company.origin_country,
+                    (SELECT asset.storage_path
+                       FROM assets.image_assets AS asset
+                      WHERE asset.company_id = company.id
+                        AND asset.image_kind = 'logo'
+                        AND asset.gallery_index = 1
+                        AND asset.status = 'ready'
+                      LIMIT 1) AS logo_path
                FROM catalog.companies AS company
               WHERE {term_clause}EXISTS (
                     SELECT 1
@@ -1104,7 +1154,14 @@ impl CatalogRepository {
         };
         let limit_placeholder = if term.is_some() { "$2" } else { "$1" };
         let statement = format!(
-            "SELECT network.id, network.name, network.origin_country, network.logo_path
+            "SELECT network.id, network.name, network.origin_country,
+                    (SELECT asset.storage_path
+                       FROM assets.image_assets AS asset
+                      WHERE asset.network_id = network.id
+                        AND asset.image_kind = 'logo'
+                        AND asset.gallery_index = 1
+                        AND asset.status = 'ready'
+                      LIMIT 1) AS logo_path
                FROM catalog.networks AS network
               WHERE {term_clause}EXISTS (
                     SELECT 1
@@ -1166,7 +1223,26 @@ impl CatalogRepository {
         };
         let limit_placeholder = if term.is_some() { "$2" } else { "$1" };
         let statement = format!(
-            "SELECT DISTINCT collection.id, collection.name, collection.poster_path, collection.backdrop_path FROM catalog.collections AS collection JOIN catalog.title_collections AS relation ON relation.collection_id = collection.id JOIN catalog.titles AS title ON title.id = relation.title_id WHERE title.active AND {scope}{clause} ORDER BY collection.id LIMIT {limit_placeholder}",
+            "SELECT DISTINCT collection.id, collection.name,
+                    (SELECT asset.storage_path
+                       FROM assets.image_assets AS asset
+                      WHERE asset.collection_id = collection.id
+                        AND asset.image_kind = 'poster'
+                        AND asset.gallery_index = 1
+                        AND asset.status = 'ready'
+                      LIMIT 1) AS poster_path,
+                    (SELECT asset.storage_path
+                       FROM assets.image_assets AS asset
+                      WHERE asset.collection_id = collection.id
+                        AND asset.image_kind = 'backdrop'
+                        AND asset.gallery_index = 1
+                        AND asset.status = 'ready'
+                      LIMIT 1) AS backdrop_path
+               FROM catalog.collections AS collection
+               JOIN catalog.title_collections AS relation ON relation.collection_id = collection.id
+               JOIN catalog.titles AS title ON title.id = relation.title_id
+              WHERE title.active AND {scope}{clause}
+              ORDER BY collection.id LIMIT {limit_placeholder}",
             scope = anime_scope.predicate()
         );
         let rows = if let Some(term) = term {
@@ -1384,7 +1460,15 @@ impl CatalogRepository {
             "SELECT person.id AS person_id, person.name, person.known_for_department,
                     person.gender, person.biography, person.birthday, person.deathday,
                     person.place_of_birth, person.homepage, person.imdb_id, person.adult,
-                    person.popularity, person.profile_path, credit.credit_id,
+                    person.popularity,
+                    (SELECT asset.storage_path
+                       FROM assets.image_assets AS asset
+                      WHERE asset.person_id = person.id
+                        AND asset.image_kind = 'profile'
+                        AND asset.gallery_index = 1
+                        AND asset.status = 'ready'
+                      LIMIT 1) AS profile_path,
+                    credit.credit_id,
                     credit.credit_type, credit.department, credit.job, credit.character,
                     credit.cast_order, credit.episode_count
                FROM catalog.titles AS title
@@ -1424,7 +1508,14 @@ impl CatalogRepository {
         }
         let statement = format!(
             "SELECT season.id, season.title_id, season.season_number, season.name,
-                    season.overview, season.air_date, season.episode_count, season.poster_path
+                    season.overview, season.air_date, season.episode_count,
+                    (SELECT asset.storage_path
+                       FROM assets.image_assets AS asset
+                      WHERE asset.season_id = season.id
+                        AND asset.image_kind = 'poster'
+                        AND asset.gallery_index = 1
+                        AND asset.status = 'ready'
+                      LIMIT 1) AS poster_path
                FROM catalog.titles AS title JOIN catalog.seasons AS season ON season.title_id = title.id
               WHERE title.media_type = 'tv' AND title.tmdb_id = $1 AND title.active AND {scope}
               ORDER BY season.season_number, season.id",
@@ -1460,7 +1551,13 @@ impl CatalogRepository {
         let statement = format!(
             "SELECT episode.id, episode.season_id, episode.title_id, episode.episode_number,
                     episode.name, episode.overview, episode.air_date, episode.runtime_minutes,
-                    episode.still_path, episode.vote_average, episode.vote_count
+                    (SELECT asset.storage_path
+                       FROM assets.image_assets AS asset
+                      WHERE asset.episode_id = episode.id
+                        AND asset.image_kind = 'still'
+                        AND asset.status = 'ready'
+                      LIMIT 1) AS still_path,
+                    episode.vote_average, episode.vote_count
                FROM catalog.titles AS title JOIN catalog.seasons AS season ON season.title_id = title.id
                JOIN catalog.episodes AS episode ON episode.season_id = season.id
               WHERE title.media_type = 'tv' AND title.tmdb_id = $1 AND season.season_number = $2
@@ -1495,11 +1592,87 @@ impl CatalogRepository {
         let Some(title_id) = title_id else {
             return Ok(None);
         };
-        let rows = sqlx::query_as::<_, ImageRow>(
-            "SELECT asset.id, asset.image_kind, asset.source, asset.source_key,
+        let rows = self.list_image_rows("title_id", title_id).await?;
+        Ok(Some(rows.into_iter().map(Into::into).collect()))
+    }
+
+    /// Lists image metadata owned by one TV season.
+    pub async fn list_season_images(
+        &self,
+        key: TitleKey,
+        season_number: i32,
+        anime_scope: AnimeScope,
+    ) -> Result<Option<Vec<CatalogImageAsset>>, CatalogError> {
+        if key.media_type() != MediaType::Tv || !(0..=1000).contains(&season_number) {
+            return Err(CatalogError::InvalidInput);
+        }
+        let Some(title_id) = self.scoped_title_id(key, anime_scope).await? else {
+            return Ok(None);
+        };
+        let Some(season_id) = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM catalog.seasons WHERE title_id = $1 AND season_number = $2",
+        )
+        .bind(title_id)
+        .bind(season_number)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| CatalogError::Query)?
+        else {
+            return Ok(Some(Vec::new()));
+        };
+        let rows = self.list_image_rows("season_id", season_id).await?;
+        Ok(Some(rows.into_iter().map(Into::into).collect()))
+    }
+
+    /// Lists image metadata owned by one TV episode.
+    pub async fn list_episode_images(
+        &self,
+        key: TitleKey,
+        season_number: i32,
+        episode_number: i32,
+        anime_scope: AnimeScope,
+    ) -> Result<Option<Vec<CatalogImageAsset>>, CatalogError> {
+        if key.media_type() != MediaType::Tv
+            || !(0..=1000).contains(&season_number)
+            || !(0..=100_000).contains(&episode_number)
+        {
+            return Err(CatalogError::InvalidInput);
+        }
+        let Some(title_id) = self.scoped_title_id(key, anime_scope).await? else {
+            return Ok(None);
+        };
+        let Some(episode_id) = sqlx::query_scalar::<_, i64>(
+            "SELECT episode.id
+               FROM catalog.episodes AS episode
+               JOIN catalog.seasons AS season ON season.id = episode.season_id
+              WHERE episode.title_id = $1 AND season.season_number = $2
+                AND episode.episode_number = $3",
+        )
+        .bind(title_id)
+        .bind(season_number)
+        .bind(episode_number)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| CatalogError::Query)?
+        else {
+            return Ok(Some(Vec::new()));
+        };
+        let rows = self.list_image_rows("episode_id", episode_id).await?;
+        Ok(Some(rows.into_iter().map(Into::into).collect()))
+    }
+
+    async fn list_image_rows(
+        &self,
+        owner_column: &str,
+        owner_id: i64,
+    ) -> Result<Vec<ImageRow>, CatalogError> {
+        let statement = format!(
+            "SELECT asset.id, asset.image_kind, asset.gallery_index, asset.source, asset.source_key,
                     asset.source_url, asset.storage_path, asset.mime_type, asset.width,
                     asset.height, asset.file_size_bytes, asset.sha256, asset.status,
-                    asset.iso_639_1,
+                    asset.iso_639_1, asset.source_mime_type, asset.source_width,
+                    asset.source_height, asset.source_file_size_bytes,
+                    asset.source_sha256, asset.source_storage_path,
                     COALESCE(
                         pg_catalog.jsonb_agg(
                             pg_catalog.jsonb_build_object(
@@ -1517,15 +1690,15 @@ impl CatalogRepository {
                FROM assets.image_assets AS asset
                LEFT JOIN assets.image_variants AS variant
                  ON variant.image_asset_id = asset.id
-              WHERE asset.title_id = $1
+              WHERE asset.{owner_column} = $1
               GROUP BY asset.id
-              ORDER BY asset.image_kind, asset.id",
-        )
-        .bind(title_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|_| CatalogError::Query)?;
-        Ok(Some(rows.into_iter().map(Into::into).collect()))
+              ORDER BY asset.image_kind, asset.gallery_index, asset.id"
+        );
+        sqlx::query_as::<_, ImageRow>(sqlx::AssertSqlSafe(statement))
+            .bind(owner_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| CatalogError::Query)
     }
 
     /// Lists localized title translations in a title's public isolation scope.
@@ -2687,6 +2860,7 @@ impl From<EpisodeRow> for CatalogEpisode {
 struct ImageRow {
     id: i64,
     image_kind: String,
+    gallery_index: i16,
     source: String,
     source_key: String,
     source_url: Option<String>,
@@ -2696,6 +2870,12 @@ struct ImageRow {
     height: Option<i32>,
     file_size_bytes: Option<i64>,
     sha256: Option<String>,
+    source_mime_type: Option<String>,
+    source_width: Option<i32>,
+    source_height: Option<i32>,
+    source_file_size_bytes: Option<i64>,
+    source_sha256: Option<String>,
+    source_storage_path: Option<String>,
     status: String,
     iso_639_1: Option<String>,
     variants: Json<Vec<ImageVariantRow>>,
@@ -2716,6 +2896,7 @@ impl From<ImageRow> for CatalogImageAsset {
         Self {
             id: row.id,
             image_kind: row.image_kind,
+            gallery_index: row.gallery_index,
             source: row.source,
             source_key: row.source_key,
             source_url: row.source_url,
@@ -2725,6 +2906,12 @@ impl From<ImageRow> for CatalogImageAsset {
             height: row.height,
             file_size_bytes: row.file_size_bytes,
             sha256: row.sha256,
+            source_mime_type: row.source_mime_type,
+            source_width: row.source_width,
+            source_height: row.source_height,
+            source_file_size_bytes: row.source_file_size_bytes,
+            source_sha256: row.source_sha256,
+            source_storage_path: row.source_storage_path,
             status: row.status,
             iso_639_1: row.iso_639_1,
             variants: row
@@ -2823,6 +3010,7 @@ struct VideoRow {
 
 impl From<VideoRow> for CatalogVideo {
     fn from(row: VideoRow) -> Self {
+        let url = provider_url(&row.site, &row.video_key);
         Self {
             key: row.video_key,
             site: row.site,
@@ -2833,8 +3021,14 @@ impl From<VideoRow> for CatalogVideo {
             country_code: row.country_code,
             published_at: row.published_at,
             size: row.size,
+            url,
         }
     }
+}
+
+fn provider_url(site: &str, key: &str) -> Option<String> {
+    site.eq_ignore_ascii_case("youtube")
+        .then(|| format!("https://www.youtube.com/watch?v={key}"))
 }
 
 #[derive(Debug, FromRow)]

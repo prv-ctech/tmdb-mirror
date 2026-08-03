@@ -34,10 +34,12 @@ struct MockState {
     responses: Arc<Mutex<VecDeque<MockResponse>>>,
     calls: Arc<AtomicUsize>,
     saw_bearer: Arc<AtomicUsize>,
+    uris: Arc<Mutex<Vec<String>>>,
 }
 
 async fn mock_handler(State(state): State<MockState>, request: http::Request<Body>) -> Response {
     state.calls.fetch_add(1, Ordering::Relaxed);
+    state.uris.lock().await.push(request.uri().to_string());
     if request
         .headers()
         .get(AUTHORIZATION)
@@ -74,6 +76,7 @@ async fn mock_server(
         responses: Arc::new(Mutex::new(responses.into_iter().collect())),
         calls: Arc::new(AtomicUsize::new(0)),
         saw_bearer: Arc::new(AtomicUsize::new(0)),
+        uris: Arc::new(Mutex::new(Vec::new())),
     };
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -150,6 +153,67 @@ async fn television_numeric_tvdb_id_is_normalized() {
     .await;
     let tv = client(&base_url).fetch_tv(42).await.expect("tv JSON");
     assert_eq!(tv.external_ids.tvdb_id.as_deref(), Some("309164"));
+    task.abort();
+}
+
+#[tokio::test]
+async fn gallery_and_video_endpoints_parse_metadata_and_use_bounded_languages() {
+    let (base_url, state, task) = mock_server(vec![
+        MockResponse {
+            status: StatusCode::OK,
+            body: r#"{"backdrops":[{"file_path":"/backdrop.jpg","width":1920,"height":1080,"aspect_ratio":1.777,"iso_639_1":null,"vote_average":7.5,"vote_count":4}],"posters":[{"file_path":"/poster.jpg","width":1000,"height":1500,"iso_639_1":"en","vote_average":8.0,"vote_count":5}],"logos":[{"file_path":"/logo.png","width":500,"height":200,"file_type":".svg"}]}"#,
+            retry_after: None,
+        },
+        MockResponse {
+            status: StatusCode::OK,
+            body: r#"{"results":[{"key":"youtube-key","site":"YouTube","type":"Opening Credits","name":"Intro","official":false,"iso_639_1":"en","iso_3166_1":"US","published_at":"2024-01-01T00:00:00.000Z","size":1080}]}"#,
+            retry_after: None,
+        },
+    ])
+    .await;
+
+    let images = client(&base_url)
+        .fetch_tv_images(119_495)
+        .await
+        .expect("typed gallery");
+    assert_eq!(images.posters.len(), 1);
+    assert_eq!(images.backdrops[0].file_path, "/backdrop.jpg");
+    assert_eq!(images.logos[0].file_type.as_deref(), Some(".svg"));
+
+    let videos = client(&base_url)
+        .fetch_tv_videos(4_586)
+        .await
+        .expect("typed videos");
+    assert_eq!(
+        videos.results[0].video_type.as_deref(),
+        Some("Opening Credits")
+    );
+    assert_eq!(videos.results[0].site.as_deref(), Some("YouTube"));
+
+    let uris = state.uris.lock().await.clone();
+    assert!(uris[0].contains("language=en-US"));
+    assert!(uris[0].contains("include_image_language=en%2Cnull"));
+    assert!(uris[1].contains("include_video_language=en%2Cnull"));
+    task.abort();
+}
+
+#[tokio::test]
+async fn episode_images_allow_specials_season_and_reject_zero_episode() {
+    let (base_url, _state, task) = mock_server(vec![MockResponse {
+        status: StatusCode::OK,
+        body: r#"{"posters":[],"backdrops":[{"file_path":"/still.jpg","width":1280,"height":720}]}"#,
+        retry_after: None,
+    }])
+    .await;
+    let images = client(&base_url)
+        .fetch_episode_images(119_495, 0, 1)
+        .await
+        .expect("specials episode gallery");
+    assert_eq!(images.backdrops[0].width, 1280);
+    assert!(matches!(
+        client(&base_url).fetch_episode_images(119_495, 0, 0).await,
+        Err(TmdbClientError::InvalidPath)
+    ));
     task.abort();
 }
 

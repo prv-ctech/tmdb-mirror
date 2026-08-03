@@ -19,6 +19,7 @@ x-app-common: &app-common
 services:
   postgres:
     image: ghcr.io/prv-ctech/tmdb-mirror-postgres:main
+    user: "0:0"
     container_name: tmdb-mirror-postgres
     restart: unless-stopped
     env_file:

@@ -9,10 +9,11 @@ set -Eeuo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 if [[ -n "${TMDB_DOCKER_BIN:-}" ]]; then
     docker_bin="$TMDB_DOCKER_BIN"
-elif command -v docker.exe >/dev/null 2>&1; then
-    docker_bin="$(command -v docker.exe)"
-else
+elif command -v docker >/dev/null 2>&1; then
     docker_bin="$(command -v docker)"
+else
+    printf '%s\n' 'Docker CLI is unavailable' >&2
+    exit 1
 fi
 
 docker() {
@@ -20,11 +21,7 @@ docker() {
 }
 
 docker_path() {
-    if [[ "$docker_bin" == *.exe ]] && command -v wslpath >/dev/null 2>&1; then
-        wslpath -w "$1" | tr '\\' '/'
-    else
-        printf '%s\n' "$1"
-    fi
+    printf '%s\n' "$1"
 }
 
 image_tag="tmdb-mirror-postgres-pitr-test:${RANDOM}${RANDOM}"

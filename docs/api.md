@@ -88,8 +88,10 @@ the filters above, but not `q`, `type`, or `anime`.
 | `GET` | `/v1/tv/{tmdb_id}/images` | TV image metadata and URLs |
 | `GET` | `/v1/tv/{tmdb_id}/seasons` | All seasons |
 | `GET` | `/v1/tv/{tmdb_id}/seasons/{season_number}` | One season |
+| `GET` | `/v1/tv/{tmdb_id}/seasons/{season_number}/images` | Season gallery |
 | `GET` | `/v1/tv/{tmdb_id}/seasons/{season_number}/episodes` | All episodes in one season |
 | `GET` | `/v1/tv/{tmdb_id}/seasons/{season_number}/episodes/{episode_number}` | One episode |
+| `GET` | `/v1/tv/{tmdb_id}/seasons/{season_number}/episodes/{episode_number}/images` | Episode thumbnail metadata |
 
 The following title facets are available on the matching detail routes below;
 movies use `/release-dates`, while TV uses `/certifications`:
@@ -122,6 +124,8 @@ searches both namespaces.
 | `GET` | `/v1/anime/{media_type}/{tmdb_id}` | Anime movie or TV metadata |
 | `GET` | `/v1/anime/{media_type}/{tmdb_id}/credits` | Anime cast and crew |
 | `GET` | `/v1/anime/{media_type}/{tmdb_id}/images` | Anime image metadata and URLs |
+| `GET` | `/v1/anime/{media_type}/{tmdb_id}/seasons/{season_number}/images` | Anime season gallery |
+| `GET` | `/v1/anime/{media_type}/{tmdb_id}/seasons/{season_number}/episodes/{episode_number}/images` | Anime episode thumbnail metadata |
 | `GET` | `/v1/anime/{media_type}/{tmdb_id}/translations` | Anime translations |
 | `GET` | `/v1/anime/{media_type}/{tmdb_id}/alternate-titles` | Anime alternate titles |
 | `GET` | `/v1/anime/{media_type}/{tmdb_id}/external-ids` | Anime external IDs |
@@ -184,16 +188,24 @@ GET /v1/calendar/movies?start=2026-08-01&end=2026-08-31&limit=50
 GET /v1/calendar/tv?start=2026-08-01&end=2026-08-31
 ```
 
-## Images and media files
+## Images, galleries, and media files
 
-Image metadata contains the source identity, status, dimensions, MIME type,
-checksum, and responsive `variants`. It also contains a `url` selected by the
-media policy:
+Image routes return one row per unique TMDB source path. Each row includes
+`imageKind`, `galleryIndex`, source dimensions, source MIME type, source size,
+SHA-256 metadata, and local `url` values for the original and optimized files.
+Internal TMDB source keys and filesystem paths are not public response fields.
 
-- With `ALLOW_LOCAL_MEDIA=true`, `url` uses `TMDB_MEDIA_BASE_URL` and points to
-  a verified file on the media listener.
-- With `ALLOW_LOCAL_MEDIA=false`, `url` falls back to the original TMDB URL and
-  no new local image jobs are created.
+The first detail image is gallery index 1. Additional posters are
+`poster-02`, `poster-03`, and so on; backdrops start at `backdrop-01`; season
+zero uses `season-specials-poster`. Episode stills are optimized-only
+thumbnails. Originals are stored outside `optimized/`; optimized files use
+JPEG quality 85 with maximum widths 640 for posters/seasons/thumbnails, 1280
+for backdrops, 320 for profiles, and transparent PNG width 500 for logos.
+No WebP derivative, `full` variant, video file, or `.masters` directory exists.
+
+With `ALLOW_LOCAL_MEDIA=true`, `url` uses `TMDB_MEDIA_BASE_URL` and points to a
+verified file on the media listener. With it disabled, local URLs are null and
+no new image jobs are created.
 
 The media listener exposes:
 
@@ -203,8 +215,14 @@ The media listener exposes:
 | `GET` | `/media/{path}` | Verified public file, with `ETag` and immutable cache headers |
 
 Send `If-None-Match` with the returned `ETag` to receive `304 Not Modified`.
-Path traversal, missing files, and `/media/.masters/...` return `404`. Masters
-are content-addressed private originals and are never public.
+Path traversal and missing files return `404`.
+
+Title videos remain metadata references. The API returns every TMDB video type,
+including Trailer, Teaser, Clip, Featurette, Opening Credits, and Bloopers.
+YouTube URLs are derived from `site=YouTube` and `key` as
+`https://www.youtube.com/watch?v=<key>`. Unknown providers keep their `site`
+and `key` but return `url: null`; no URL column or `/videos` media folder is
+used.
 
 ## Private admin API
 
@@ -307,5 +325,5 @@ Common statuses are:
 | `501` | Requested catalog ordering is not implemented |
 | `503` | Database, schema, queue, or ranking dependency is unavailable |
 
-The API never returns credentials, raw SQL, filesystem master paths, or raw
-upstream error bodies in a problem response.
+The API never returns credentials, raw SQL, filesystem paths, or raw upstream
+error bodies in a problem response.

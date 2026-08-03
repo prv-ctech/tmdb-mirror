@@ -1,7 +1,7 @@
 # TMDB Mirror
 
 Rust + PostgreSQL 18 mirror of TMDB metadata with catalog search, strict anime
-isolation, local responsive image storage, durable worker jobs, and four
+isolation, local optimized image storage, durable worker jobs, and four
 runtime services: PostgreSQL, API, main worker, and media worker.
 
 ## Run with Docker Compose
@@ -43,9 +43,8 @@ docker compose --env-file "$TMDB_ENV_FILE" \
 ```
 
 The external `prv.network` must already exist. The application paths inside
-containers are fixed: `/config` for scratch, exports,
-checkpoints, logs, and backups; `/media` for public files and private
-`.masters` originals. Masters are never served.
+containers are fixed: `/config` for scratch, exports, checkpoints, logs, and
+backups; `/media` for public image files.
 
 To reuse existing host directories, edit the `source:` values in the Compose
 file. Host mount paths are deployment settings, not application environment.
@@ -80,6 +79,14 @@ and full/differential backup requests. Admin writes require
 See the complete [API reference](docs/api.md), or query the public and private
 OpenAPI documents at `/v1/openapi.json` and `/admin/v1/openapi.json` from their
 respective listeners.
+
+## Media galleries
+
+TMDB posters, backdrops, logos, season images, episode thumbnails, and
+reusable-entity galleries are downloaded from the dedicated TMDB image
+endpoints. Originals stay in TMDB-ID folders; one JPEG or PNG derivative is
+stored below `optimized/`. Episode thumbnails are optimized-only. Videos are
+database metadata with derived provider URLs; no video files are downloaded.
 
 ## Development and stress testing
 

@@ -21,14 +21,14 @@ async fn catalog_migration_exposes_shared_titles_dimensions_and_search_projectio
         versions,
         [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27,
+            25, 26, 27, 28,
         ]
     );
 
     let revision: String = sqlx::query_scalar("SELECT schema_revision FROM ops.readiness")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(revision, "0027");
+    assert_eq!(revision, "0028");
 
     let objects: Vec<String> = sqlx::query_scalar(
         "SELECT format('%I.%I', n.nspname, c.relname)
@@ -141,11 +141,14 @@ async fn repository_returns_verified_image_variant_metadata_with_the_parent_asse
     let title_id = insert_title(&pool, "movie", 91_001, "Image Fixture", 1.0, false).await?;
     let asset_id: i64 = sqlx::query_scalar(
         "INSERT INTO assets.image_assets (
-             title_id, image_kind, source_key, storage_path, mime_type,
-             width, height, file_size_bytes, sha256, status, downloaded_at
+             title_id, image_kind, gallery_index, source_key, storage_path, mime_type,
+             width, height, file_size_bytes, sha256, source_mime_type, source_width,
+             source_height, source_file_size_bytes, source_sha256, source_storage_path,
+             status, downloaded_at
          ) VALUES (
-             $1, 'poster', 'movie:91001:poster:primary', 'movies/91001/cover.jpg', 'image/jpeg',
-             1200, 1800, 1200, repeat('a', 64), 'ready', clock_timestamp()
+             $1, 'poster', 1, 'movie:91001:poster:1', 'movies/91001/posters/poster.jpg', 'image/jpeg',
+             1200, 1800, 1200, repeat('a', 64), 'image/jpeg', 1200, 1800, 1200,
+             repeat('a', 64), 'movies/91001/posters/poster.jpg', 'ready', clock_timestamp()
          ) RETURNING id",
     )
     .bind(title_id)
@@ -156,8 +159,8 @@ async fn repository_returns_verified_image_variant_metadata_with_the_parent_asse
              image_asset_id, variant_key, storage_path, mime_type,
              width, height, file_size_bytes, sha256
          ) VALUES
-             ($1, 'jpeg_full', 'movies/91001/cover.jpg', 'image/jpeg', 1200, 1800, 1200, repeat('a', 64)),
-             ($1, 'webp_w320', 'movies/91001/cover-w320.webp', 'image/webp', 320, 480, 320, repeat('b', 64))",
+             ($1, 'jpeg_w640', 'movies/91001/optimized/posters/poster-w640.jpg', 'image/jpeg', 640, 960, 640, repeat('b', 64)),
+             ($1, 'png_w500', 'movies/91001/optimized/posters/poster-w500.png', 'image/png', 500, 750, 500, repeat('c', 64))",
     )
     .bind(asset_id)
     .execute(&pool)
@@ -174,11 +177,11 @@ async fn repository_returns_verified_image_variant_metadata_with_the_parent_asse
         .ok_or_else(|| test_error("title images were not found"))?;
     assert_eq!(images.len(), 1);
     assert_eq!(images[0].variants.len(), 2);
-    assert_eq!(images[0].variants[0].variant_key, "jpeg_full");
-    assert_eq!(images[0].variants[1].variant_key, "webp_w320");
+    assert_eq!(images[0].variants[0].variant_key, "jpeg_w640");
+    assert_eq!(images[0].variants[1].variant_key, "png_w500");
     assert_eq!(
         images[0].variants[1].storage_path,
-        "movies/91001/cover-w320.webp"
+        "movies/91001/optimized/posters/poster-w500.png"
     );
     Ok(())
 }
@@ -565,7 +568,7 @@ async fn repository_reads_scope_isolated_detail_and_all_committed_facets(
             id: 101,
             name: Some("Detail Studio".to_owned()),
             origin_country: Some("JP".to_owned()),
-            logo_path: Some("/studio.svg".to_owned()),
+            logo_path: None,
             company_role: Some("production".to_owned()),
         }]
     );
@@ -575,7 +578,7 @@ async fn repository_reads_scope_isolated_detail_and_all_committed_facets(
             id: 201,
             name: Some("Detail Network".to_owned()),
             origin_country: Some("JP".to_owned()),
-            logo_path: Some("/network.svg".to_owned()),
+            logo_path: None,
         }]
     );
 

@@ -28,8 +28,6 @@ if [[ -n "${TMDB_DOCKER_BIN:-}" ]]; then
     DOCKER_BIN="$TMDB_DOCKER_BIN"
 elif command -v docker >/dev/null 2>&1; then
     DOCKER_BIN="$(command -v docker)"
-elif command -v docker.exe >/dev/null 2>&1; then
-    DOCKER_BIN="$(command -v docker.exe)"
 else
     DOCKER_BIN=''
 fi
@@ -40,11 +38,7 @@ docker_command() {
 }
 
 docker_path() {
-    if [[ "$DOCKER_BIN" == *.exe && -x "$(command -v wslpath 2>/dev/null || true)" ]]; then
-        wslpath -w "$1" | tr '\\' '/'
-    else
-        printf '%s\n' "$1"
-    fi
+    printf '%s\n' "$1"
 }
 
 refresh_paths() {
@@ -252,7 +246,7 @@ wait_for_migrations() {
             continue
         fi
         version="$(psql_at "$password" "SELECT COALESCE(max(version), 0) FROM ops._sqlx_migrations WHERE success" 2>/dev/null || true)"
-        if [[ "$version" =~ ^[0-9]+$ ]] && (( version >= 27 )); then
+        if [[ "$version" =~ ^[0-9]+$ ]] && (( version >= 28 )); then
             return 0
         fi
         sleep 2

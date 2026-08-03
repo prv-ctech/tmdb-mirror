@@ -30,24 +30,24 @@ source_key="$(psql_at "$password" "SELECT source_key FROM assets.image_assets WH
 response_file="$(mktemp)"
 trap 'rm -f "$response_file"' EXIT
 status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
-    --connect-timeout 10 --max-time 30 -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
-    --data-urlencode "url=https://image.tmdb.org/t/p/w185$source_key" \
-    --data-urlencode 'maxTimeout=20000' "$STRESS_TRAWL_URL/scrape")"
+    --connect-timeout 10 --max-time 30 -X POST -H 'Content-Type: application/json' \
+    --data "{\"url\":\"https://image.tmdb.org/t/p/w185$source_key\",\"maxTimeout\":20000}" \
+    "$STRESS_TRAWL_URL/scrape")"
 upstream=0
 grep -Eq '"statusCode"[[:space:]]*:[[:space:]]*200|"status"[[:space:]]*:[[:space:]]*200' "$response_file" && upstream=200 || true
-has_body=false
-grep -Eq '"body"[[:space:]]*:[[:space:]]*("[^"]+"|\[[^]]+\])' "$response_file" && has_body=true || true
+response_metadata=false
+grep -Eq '"url"[[:space:]]*:|"html"[[:space:]]*:|"tier"[[:space:]]*:' "$response_file" && response_metadata=true || true
 cat >"$result_file" <<EOF
 {
   "checked_at_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "configured": true,
   "trawl_http_status": $status,
   "upstream_http_status": $upstream,
-  "body_present": $has_body
+  "response_metadata_present": $response_metadata
 }
 EOF
 cat "$result_file"
-if [[ "$status" != 200 || "$upstream" != 200 || "$has_body" != true ]]; then
+if [[ "$status" != 200 || "$upstream" != 200 || "$response_metadata" != true ]]; then
     die 'Trawl probe failed'
 fi
 printf '%s\n' 'Trawl probe passed.'

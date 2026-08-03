@@ -81,6 +81,8 @@ pub struct TmdbMovie {
     /// Public trailers, teasers, clips, and other provider videos.
     #[serde(default)]
     pub videos: TmdbVideos,
+    #[serde(default)]
+    pub images: TmdbImages,
     /// Regional release dates and certifications returned by `release_dates`.
     #[serde(default)]
     pub release_dates: TmdbReleaseDates,
@@ -157,6 +159,8 @@ pub struct TmdbTv {
     /// Public trailers, teasers, clips, and other provider videos.
     #[serde(default)]
     pub videos: TmdbVideos,
+    #[serde(default)]
+    pub images: TmdbImages,
     /// TV content ratings returned by `content_ratings`.
     #[serde(default)]
     pub content_ratings: TmdbContentRatings,
@@ -251,6 +255,42 @@ where
 pub struct TmdbVideos {
     #[serde(default)]
     pub results: Vec<TmdbVideo>,
+}
+
+/// Image galleries returned by a TMDB title, season, episode, or reusable
+/// entity image endpoint.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TmdbImages {
+    #[serde(default)]
+    pub backdrops: Vec<TmdbImage>,
+    #[serde(default)]
+    pub logos: Vec<TmdbImage>,
+    #[serde(default)]
+    pub posters: Vec<TmdbImage>,
+    #[serde(default)]
+    pub profiles: Vec<TmdbImage>,
+    #[serde(default)]
+    pub stills: Vec<TmdbImage>,
+}
+
+/// One image record from a TMDB gallery endpoint.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TmdbImage {
+    pub file_path: String,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+    #[serde(default)]
+    pub aspect_ratio: Option<f64>,
+    #[serde(default)]
+    pub iso_639_1: Option<String>,
+    #[serde(default)]
+    pub vote_average: Option<f64>,
+    #[serde(default)]
+    pub vote_count: Option<u64>,
+    #[serde(default)]
+    pub file_type: Option<String>,
 }
 
 /// One public video reference from TMDB.
@@ -388,6 +428,8 @@ pub struct TmdbCredit {
     /// Adult flag.
     #[serde(default)]
     pub adult: bool,
+    #[serde(default)]
+    pub images: TmdbImages,
 }
 
 /// A season summary embedded in a TV details response.
@@ -436,6 +478,8 @@ pub struct TmdbSeason {
     /// Season poster path.
     #[serde(default)]
     pub poster_path: Option<String>,
+    #[serde(default)]
+    pub images: TmdbImages,
     /// Episodes in this season.
     #[serde(default)]
     pub episodes: Vec<TmdbEpisode>,
@@ -472,6 +516,8 @@ pub struct TmdbEpisode {
     /// Episode cast and crew.
     #[serde(default)]
     pub credits: TmdbCredits,
+    #[serde(default)]
+    pub images: TmdbImages,
 }
 
 /// A TMDB movie or television genre.
@@ -546,6 +592,8 @@ pub struct TmdbCompany {
     /// Country of registration.
     #[serde(default)]
     pub origin_country: Option<String>,
+    #[serde(default)]
+    pub images: TmdbImages,
 }
 
 /// A TMDB television network.
@@ -562,6 +610,8 @@ pub struct TmdbNetwork {
     /// Country of origin.
     #[serde(default)]
     pub origin_country: Option<String>,
+    #[serde(default)]
+    pub images: TmdbImages,
 }
 
 /// A TMDB collection summary.
@@ -578,6 +628,8 @@ pub struct TmdbCollection {
     /// Backdrop path, if available.
     #[serde(default)]
     pub backdrop_path: Option<String>,
+    #[serde(default)]
+    pub images: TmdbImages,
 }
 
 /// A TMDB person summary.
@@ -594,6 +646,8 @@ pub struct TmdbPerson {
     /// Profile image path.
     #[serde(default)]
     pub profile_path: Option<String>,
+    #[serde(default)]
+    pub images: TmdbImages,
 }
 
 /// One ID returned by a TMDB change-list endpoint.

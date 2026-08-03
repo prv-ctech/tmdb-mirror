@@ -14,7 +14,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 
 use crate::policy::{PolicyError, RequestGate, RetryPolicy};
-use crate::{ChangeHistory, ChangePage, TmdbMovie, TmdbSeason, TmdbTrendingPage, TmdbTv};
+use crate::{
+    ChangeHistory, ChangePage, TmdbImages, TmdbMovie, TmdbSeason, TmdbTrendingPage, TmdbTv,
+    TmdbVideos,
+};
 
 /// Hard upper bound for one streamed daily export download.
 pub const MAX_DAILY_EXPORT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -189,6 +192,125 @@ impl TmdbClient {
         self.fetch_json(
             &format!("tv/{tv_id}/season/{season_number}"),
             &[("append_to_response", "credits".to_owned())],
+            true,
+        )
+        .await
+    }
+
+    /// Fetches the complete English and untagged movie image gallery.
+    pub async fn fetch_movie_images(&self, tmdb_id: u32) -> Result<TmdbImages, TmdbClientError> {
+        self.fetch_images(&format!("movie/{tmdb_id}/images"), tmdb_id != 0)
+            .await
+    }
+
+    /// Fetches the complete English and untagged TV image gallery.
+    pub async fn fetch_tv_images(&self, tmdb_id: u32) -> Result<TmdbImages, TmdbClientError> {
+        self.fetch_images(&format!("tv/{tmdb_id}/images"), tmdb_id != 0)
+            .await
+    }
+
+    /// Fetches a season image gallery, including season zero specials.
+    pub async fn fetch_season_images(
+        &self,
+        tv_id: u32,
+        season_number: u16,
+    ) -> Result<TmdbImages, TmdbClientError> {
+        if tv_id == 0 {
+            return Err(TmdbClientError::InvalidPath);
+        }
+        self.fetch_images(&format!("tv/{tv_id}/season/{season_number}/images"), true)
+            .await
+    }
+
+    /// Fetches an episode image gallery.
+    pub async fn fetch_episode_images(
+        &self,
+        tv_id: u32,
+        season_number: u16,
+        episode_number: u16,
+    ) -> Result<TmdbImages, TmdbClientError> {
+        if tv_id == 0 || episode_number == 0 {
+            return Err(TmdbClientError::InvalidPath);
+        }
+        self.fetch_images(
+            &format!("tv/{tv_id}/season/{season_number}/episode/{episode_number}/images"),
+            true,
+        )
+        .await
+    }
+
+    /// Fetches a person's profile image gallery.
+    pub async fn fetch_person_images(&self, tmdb_id: u32) -> Result<TmdbImages, TmdbClientError> {
+        self.fetch_images(&format!("person/{tmdb_id}/images"), tmdb_id != 0)
+            .await
+    }
+
+    /// Fetches a production-company logo gallery.
+    pub async fn fetch_company_images(&self, tmdb_id: u32) -> Result<TmdbImages, TmdbClientError> {
+        self.fetch_images(&format!("company/{tmdb_id}/images"), tmdb_id != 0)
+            .await
+    }
+
+    /// Fetches a broadcast-network logo gallery.
+    pub async fn fetch_network_images(&self, tmdb_id: u32) -> Result<TmdbImages, TmdbClientError> {
+        self.fetch_images(&format!("network/{tmdb_id}/images"), tmdb_id != 0)
+            .await
+    }
+
+    /// Fetches a collection poster/backdrop gallery.
+    pub async fn fetch_collection_images(
+        &self,
+        tmdb_id: u32,
+    ) -> Result<TmdbImages, TmdbClientError> {
+        self.fetch_images(&format!("collection/{tmdb_id}/images"), tmdb_id != 0)
+            .await
+    }
+
+    /// Fetches all title-level movie video records.
+    pub async fn fetch_movie_videos(&self, tmdb_id: u32) -> Result<TmdbVideos, TmdbClientError> {
+        self.fetch_videos(&format!("movie/{tmdb_id}/videos"), tmdb_id != 0)
+            .await
+    }
+
+    /// Fetches all title-level TV video records.
+    pub async fn fetch_tv_videos(&self, tmdb_id: u32) -> Result<TmdbVideos, TmdbClientError> {
+        self.fetch_videos(&format!("tv/{tmdb_id}/videos"), tmdb_id != 0)
+            .await
+    }
+
+    async fn fetch_images(
+        &self,
+        path: &str,
+        valid_id: bool,
+    ) -> Result<TmdbImages, TmdbClientError> {
+        if !valid_id {
+            return Err(TmdbClientError::InvalidPath);
+        }
+        self.fetch_json(
+            path,
+            &[
+                ("language", "en-US".to_owned()),
+                ("include_image_language", "en,null".to_owned()),
+            ],
+            true,
+        )
+        .await
+    }
+
+    async fn fetch_videos(
+        &self,
+        path: &str,
+        valid_id: bool,
+    ) -> Result<TmdbVideos, TmdbClientError> {
+        if !valid_id {
+            return Err(TmdbClientError::InvalidPath);
+        }
+        self.fetch_json(
+            path,
+            &[
+                ("language", "en-US".to_owned()),
+                ("include_video_language", "en,null".to_owned()),
+            ],
             true,
         )
         .await
