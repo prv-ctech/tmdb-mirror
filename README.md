@@ -7,8 +7,7 @@ runtime services: PostgreSQL, API, main worker, and media worker.
 ## Run with Docker Compose
 
 `deploy/compose.production.yaml` is the canonical checkout deployment. It
-pulls the published Linux AMD64 images and reads the host-specific bindings
-from the ignored runtime environment:
+pulls the published Linux AMD64 images and uses relative `./data` bind mounts:
 
 | Service | Host port | Purpose |
 | --- | ---: | --- |
@@ -43,16 +42,16 @@ docker compose --env-file "$TMDB_ENV_FILE" \
   -f deploy/compose.production.yaml ps
 ```
 
-The external `prv.network` must already exist. Set
-`TMDB_DEPLOY_HOST_IP`, `TMDB_API_HOST_PORT`, `TMDB_MEDIA_HOST_PORT`,
-`TMDB_POSTGRES_HOST_PATH`, `TMDB_CONFIG_HOST_PATH`, and
-`TMDB_MEDIA_HOST_PATH` in the ignored runtime environment. The application
-paths inside containers are fixed: `/config` for scratch, exports,
+The external `prv.network` must already exist. The application paths inside
+containers are fixed: `/config` for scratch, exports,
 checkpoints, logs, and backups; `/media` for public files and private
 `.masters` originals. Masters are never served.
 
-`docker-compose-example.yaml` is a standalone copy-pasteable Compose file for
-Unraid. It does not use Compose `include`; place it beside the `.env` file.
+To reuse existing host directories, edit the `source:` values in the Compose
+file. Host mount paths are deployment settings, not application environment.
+
+`docker-compose-example.yaml` is a standalone copy-pasteable Compose file. It
+does not use Compose `include`; place it beside the `.env` file.
 New checkout deployments can use the canonical file above. See
 [production deployment](docs/deployment-production.md) for bind mounts,
 permissions, media policy, and validation.

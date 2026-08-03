@@ -1,7 +1,7 @@
 name: tmdb-mirror
 
-# Host-specific values are read from the ignored runtime env file. This keeps
-# private LAN addresses and bind roots out of the repository.
+# Host paths are relative to this Compose file. Edit the bind sources for an
+# existing host data layout.
 x-app-common: &app-common
   image: ghcr.io/prv-ctech/tmdb-mirror:main
   restart: unless-stopped
@@ -58,12 +58,12 @@ services:
       - effective_io_concurrency=256
     volumes:
       - type: bind
-        source: ${TMDB_POSTGRES_HOST_PATH:?TMDB_POSTGRES_HOST_PATH must be set}
+        source: ./data/postgres18
         target: /var/lib/postgresql
         bind:
           create_host_path: true
       - type: bind
-        source: ${TMDB_CONFIG_HOST_PATH:?TMDB_CONFIG_HOST_PATH must be set}
+        source: ./data/config
         target: /config
         bind:
           create_host_path: true
@@ -83,7 +83,7 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "${TMDB_DEPLOY_HOST_IP:?TMDB_DEPLOY_HOST_IP must be set}:${TMDB_API_HOST_PORT:-9001}:8080"
+      - "9001:8080"
     healthcheck:
       test: [CMD, curl, --fail, --silent, --show-error, http://127.0.0.1:8080/health/live]
       interval: 10s
@@ -107,7 +107,7 @@ services:
         condition: service_healthy
     volumes:
       - type: bind
-        source: ${TMDB_CONFIG_HOST_PATH:?TMDB_CONFIG_HOST_PATH must be set}
+        source: ./data/config
         target: /config
         bind:
           create_host_path: true
@@ -126,17 +126,17 @@ services:
         condition: service_healthy
     volumes:
       - type: bind
-        source: ${TMDB_MEDIA_HOST_PATH:?TMDB_MEDIA_HOST_PATH must be set}
+        source: ./data/media
         target: /media
         bind:
           create_host_path: true
       - type: bind
-        source: ${TMDB_CONFIG_HOST_PATH:?TMDB_CONFIG_HOST_PATH must be set}
+        source: ./data/config
         target: /config
         bind:
           create_host_path: true
     ports:
-      - "${TMDB_DEPLOY_HOST_IP:?TMDB_DEPLOY_HOST_IP must be set}:${TMDB_MEDIA_HOST_PORT:-9002}:8090"
+      - "9002:8090"
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SETPCAP]
     healthcheck:
       test: [CMD, curl, --fail, --silent, http://127.0.0.1:8090/health/live]
