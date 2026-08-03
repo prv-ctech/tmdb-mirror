@@ -151,11 +151,11 @@ Every relationship has foreign keys. Uniqueness and check constraints prevent du
 
 Anime is a first-class category spanning movies and television.
 
-- TMDB keyword ID 210024 is the default positive rule.
-- A versioned classification row records the result, rule version, evidence, source, calculation time, and optional administrator override.
-- Raw TMDB keywords are never modified to force a classification.
-- An administrator override can set anime or non-anime and include a reason. Overrides survive re-ingestion until explicitly removed.
-- Classification refresh is idempotent and can be run for one title or the complete catalog.
+- A title is anime only when it has TMDB keyword ID 210024 and genre ID 16 (`Animation`).
+- The persisted `titles.is_anime` flag is derived during movie or TV ingestion.
+- Raw TMDB keywords and genres are never modified to force a classification.
+- Missing either signal means ordinary media; original language and live-action keywords are not classification overrides.
+- Re-ingestion recalculates the flag from the current TMDB metadata.
 
 Public behavior is strict:
 
@@ -166,7 +166,7 @@ Public behavior is strict:
 - Ordinary detail endpoints do not expose anime records; an anime title is retrieved through its anime detail route.
 - General GET /v1/search always excludes anime. Anime search is performed through GET /v1/anime?q=... so anime cannot leak into an ordinary search by an omitted or malformed category parameter.
 
-The acceptance fixture for One Piece must demonstrate mixed anime movie/TV results, correct media-type filtering, exclusion from ordinary routes, exclusion of the live-action series unless explicitly overridden, and a documented correction path for TMDB records missing the keyword.
+The acceptance fixture for One Piece must demonstrate mixed anime movie/TV results, correct media-type filtering, exclusion from ordinary routes, and ordinary handling for live-action or incomplete metadata.
 
 ## 8. Index and search design
 
@@ -271,7 +271,7 @@ Administrative routes include:
 - Job list, detail, retry, and cancel.
 - Full inventory, changes sync, missing-data repair, and prune submission.
 - Targeted movie, TV, episode, person, collection, company, and network refresh.
-- Anime override creation/removal and classification rebuild.
+- Anime classification consistency across ingest, API, worker, and media paths.
 - Search projection/index rebuild and validation.
 - Primary/gallery image backfill and failed-image retry.
 - Ingestion, migration, database, and worker status summaries.
@@ -418,7 +418,7 @@ The user's rule is that assumptions are replaced by tests wherever an executable
 
 ### 17.1 Automated correctness
 
-- Rust unit tests for domain validation, anime rules/overrides, retry decisions, cursor encoding, filter parsing, ranking components, and path safety.
+- Rust unit tests for domain validation, strict anime rules, retry decisions, cursor encoding, filter parsing, ranking components, and path safety.
 - Property tests for cursor round trips, idempotency keys, path sharding, and classification invariants.
 - PostgreSQL integration tests run against real PostgreSQL 18, never SQLite.
 - Migration tests apply every migration from an empty cluster and upgrade from every supported released schema.
@@ -431,7 +431,7 @@ The user's rule is that assumptions are replaced by tests wherever an executable
 
 - Production-scale import tests use a snapshot or read-only extraction from the live database.
 - Constraint, orphan, duplicate, row-count, relationship-count, and checksum reports are saved as artifacts.
-- Known fixtures include One Piece mixed anime results, ordinary-route exclusion, live-action exclusion, multilingual titles, people with multiple characters, companies/networks, episodes, missing images, and local overrides.
+- Known fixtures include One Piece mixed anime results, ordinary-route exclusion, keyword-only and genre-only negatives, live-action exclusion, multilingual titles, people with multiple characters, companies/networks, episodes, and missing images.
 
 ### 17.3 Performance
 

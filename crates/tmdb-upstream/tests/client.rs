@@ -109,7 +109,7 @@ fn client(base_url: &str) -> TmdbClient {
 async fn successful_details_are_typed_and_authorized() {
     let (base_url, state, task) = mock_server(vec![MockResponse {
         status: StatusCode::OK,
-        body: r#"{"id":42,"title":"One Piece","vote_count":100,"keywords":{"keywords":[{"id":210024,"name":"anime"}]}}"#,
+        body: r#"{"id":42,"title":"One Piece","vote_count":100,"keywords":{"keywords":[{"id":210024,"name":"anime"}]},"genres":[{"id":16,"name":"Animation"}]}"#,
         retry_after: None,
     }])
     .await;
@@ -120,6 +120,7 @@ async fn successful_details_are_typed_and_authorized() {
         movie.keywords.first().map(|keyword| keyword.id),
         Some(210_024)
     );
+    assert_eq!(movie.genres.first().map(|genre| genre.id), Some(16));
     assert_eq!(state.calls.load(Ordering::Relaxed), 1);
     assert_eq!(state.saw_bearer.load(Ordering::Relaxed), 1);
     task.abort();
@@ -129,12 +130,13 @@ async fn successful_details_are_typed_and_authorized() {
 async fn television_keyword_results_are_unwrapped() {
     let (base_url, _state, task) = mock_server(vec![MockResponse {
         status: StatusCode::OK,
-        body: r#"{"id":42,"name":"One Piece","keywords":{"results":[{"id":210024,"name":"anime"}]}}"#,
+        body: r#"{"id":42,"name":"One Piece","keywords":{"results":[{"id":210024,"name":"anime"}]},"genres":[{"id":16,"name":"Animation"}]}"#,
         retry_after: None,
     }])
     .await;
     let tv = client(&base_url).fetch_tv(42).await.expect("tv JSON");
     assert_eq!(tv.keywords.first().map(|keyword| keyword.id), Some(210_024));
+    assert_eq!(tv.genres.first().map(|genre| genre.id), Some(16));
     task.abort();
 }
 

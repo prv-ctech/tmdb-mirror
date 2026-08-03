@@ -38,7 +38,7 @@ submit_refresh() {
     printf '%s\t%s\t%s\n' "$media_type" "$tmdb_id" "$job_id"
 }
 
-targets=("movie 550" "tv 1399" "tv 37854" "movie 900667")
+targets=("movie 550" "tv 1399" "tv 37854" "movie 900667" "movie 1132850" "tv 63648")
 target_file="$RESULT_ROOT/artwork-targets-$stamp.tsv"
 : >"$target_file"
 for target in "${targets[@]}"; do
@@ -64,6 +64,11 @@ done
 
 ready_assets="$(psql_at "$password" "SELECT count(*) FROM assets.image_assets WHERE source = 'tmdb' AND status = 'ready'")"
 asset_path="$(psql_at "$password" "SELECT storage_path FROM assets.image_assets WHERE source = 'tmdb' AND status = 'ready' ORDER BY id LIMIT 1")"
+skye_anime="$(psql_at "$password" "SELECT CASE WHEN COALESCE(is_anime, false) THEN 'true' ELSE 'false' END FROM catalog.titles WHERE media_type = 'movie' AND tmdb_id = 1132850")"
+death_note_anime="$(psql_at "$password" "SELECT CASE WHEN COALESCE(is_anime, false) THEN 'true' ELSE 'false' END FROM catalog.titles WHERE media_type = 'tv' AND tmdb_id = 63648")"
+one_piece_anime="$(psql_at "$password" "SELECT CASE WHEN COALESCE(is_anime, false) THEN 'true' ELSE 'false' END FROM catalog.titles WHERE media_type = 'tv' AND tmdb_id = 37854")"
+skye_anime_paths="$(psql_at "$password" "SELECT count(*) FROM assets.image_assets asset JOIN catalog.titles title ON title.id = asset.title_id WHERE title.media_type = 'movie' AND title.tmdb_id = 1132850 AND asset.status = 'ready' AND asset.storage_path LIKE 'anime/%'")"
+death_note_anime_paths="$(psql_at "$password" "SELECT count(*) FROM assets.image_assets asset JOIN catalog.titles title ON title.id = asset.title_id WHERE title.media_type = 'tv' AND title.tmdb_id = 63648 AND asset.status = 'ready' AND asset.storage_path LIKE 'anime/%'")"
 http_status=0
 conditional_status=0
 if [[ -n "$asset_path" && "$asset_path" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && "$asset_path" != *..* ]]; then
@@ -85,6 +90,11 @@ cat >"$result_file" <<EOF
   "targets": $(wc -l <"$target_file"),
   "failed_jobs": $failed_jobs,
   "ready_tmdb_assets": $ready_assets,
+  "skye_hoshi_is_anime": $([[ "$skye_anime" == true ]] && echo true || echo false),
+  "death_note_is_anime": $([[ "$death_note_anime" == true ]] && echo true || echo false),
+  "one_piece_is_anime": $([[ "$one_piece_anime" == true ]] && echo true || echo false),
+  "skye_hoshi_anime_asset_paths": $skye_anime_paths,
+  "death_note_anime_asset_paths": $death_note_anime_paths,
   "representative_asset_path_present": $([[ -n "$asset_path" ]] && echo true || echo false),
   "media_http_status": $http_status,
   "media_conditional_status": $conditional_status
@@ -92,7 +102,9 @@ cat >"$result_file" <<EOF
 EOF
 cat "$result_file"
 printf 'Artwork stress artifact: %s\n' "$result_file"
-if (( failed_jobs > 0 || ready_assets == 0 || http_status != 200 || conditional_status != 304 )); then
+if (( failed_jobs > 0 || ready_assets == 0 || http_status != 200 || conditional_status != 304 )) \
+    || [[ "$skye_anime" != false || "$death_note_anime" != false || "$one_piece_anime" != true ]] \
+    || (( skye_anime_paths != 0 || death_note_anime_paths != 0 )); then
     die 'real artwork/image download checks failed'
 fi
 printf '%s\n' 'Real artwork and image serving checks passed.'

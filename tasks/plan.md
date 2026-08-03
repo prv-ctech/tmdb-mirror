@@ -52,3 +52,38 @@ Build and run a reproducible, isolated stress-testing environment for the Rust T
 
 - Repeat formatting, unit/integration tests, strict clippy, image builds, Compose config validation, and the stress smoke/load suite.
 - Hand off intentional changes and report the measured results and any work that remains outside the tested scope. Commit or push only after explicit user authorization.
+
+## Follow-up plan: anime/live-action classification
+
+### Research findings (2026-08-03)
+
+- Before this implementation, ingest set `is_anime` from TMDB keyword `210024` only. `original_language` is stored but unused by classification.
+- TMDB movie `1132850` (Skye Hoshi) is `en`, has the `anime` keyword, and has no `Animation` genre (`16`).
+- TMDB TV `63648` (Death Note) is `ja`, has no `anime` keyword, and is already non-anime under the current rule.
+- Live TMDB discovery counts for keyword `210024`: 2,428 movies and 4,380 TV titles. Adding genre `16` returns 2,351 movies and 4,335 TV titles; 77 movies and 45 TV titles do not have that genre.
+- English titles are not safe to exclude: 66 movies and 46 TV titles have both the `anime` keyword and `Animation` genre. The explicit TMDB live-action keyword family had no direct overlap with `anime` in the sampled movie/TV discovery queries.
+
+### Applied rule
+
+Use `anime keyword AND Animation genre` as the strict positive rule. The
+keyword is TMDB ID `210024`; the genre is TMDB ID `16`. Ignore
+`original_language`, live-action keywords, and manual overrides.
+
+Titles missing either signal remain ordinary media. Raw TMDB keywords and
+genres remain unchanged.
+
+### Implementation slices
+
+1. Centralize the rule in `tmdb-domain` and remove the ingest-only duplicate predicate.
+2. Update movie and TV ingest fixtures so both metadata signals are required.
+3. Reset the disposable development database/media state instead of reclassifying old files.
+4. Add regression fixtures for Skye Hoshi, Death Note, One Piece, English-language anime, and keyword-only/genre-only cases.
+5. Re-run database/API/image/download tests and the bounded real-TMDB stress checks.
+
+### Acceptance criteria
+
+- Skye Hoshi is absent from anime routes and appears in ordinary movies.
+- Death Note remains ordinary TV.
+- English-language anime with genre `16` remains anime.
+- Keyword-only and genre-only titles remain ordinary media.
+- A fresh development reset has no stale anime files, duplicate assets, or broken public URLs.

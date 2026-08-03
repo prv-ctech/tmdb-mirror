@@ -93,8 +93,8 @@ docker compose --env-file deploy/env.example \
 
 For the full bounded Docker Desktop test, use the Linux/Bash harness in
 [stress testing](docs/stress-testing.md). It reads the real TMDB stress token
-from the ignored `.secrets.txt` file (with `secrets.txt` as a local fallback),
-injects it only into a mode-600 runtime file, and uses a unique project with
+from the ignored `secrets.txt` file, injects it only into a mode-600 runtime
+file, and uses a unique project with
 loopback-only ports. Do not put that token in `.env`, Compose YAML, source, or
 test artifacts.
 

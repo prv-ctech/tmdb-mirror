@@ -10,8 +10,8 @@ Create the ignored secret file and fill in the TMDB v4 read token, v3 API key,
 and optional existing Trawl URL:
 
 ```bash
-cp secrets.txt.example .secrets.txt
-chmod 600 .secrets.txt
+cp secrets.txt.example secrets.txt
+chmod 600 secrets.txt
 ./scripts/test-stress-secrets.sh
 ./scripts/stress-tmdb-auth.sh
 ./scripts/stress-bootstrap.sh \
@@ -22,9 +22,8 @@ chmod 600 .secrets.txt
   --postgres-port 55433
 ```
 
-The loader prefers `.secrets.txt` and accepts `secrets.txt` as a local-only
-fallback. Secret values are never written to the general Compose environment,
-logs, JSON results, Docker build context, or Git.
+The loader reads `secrets.txt`. Secret values are never written to the general
+Compose environment, logs, JSON results, Docker build context, or Git.
 
 The bootstrap builds the pinned Rust image and the local PostgreSQL/pgBackRest
 image, applies migrations, starts the four-container stack, waits for health,

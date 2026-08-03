@@ -3,8 +3,5 @@
 mod anime;
 mod media;
 
-pub use anime::{
-    ANIME_KEYWORD_ID, ANIME_RULE_VERSION, AnimeDecision, AnimeOverride, AnimeOverrideError,
-    AnimeSource, classify_anime,
-};
+pub use anime::{ANIMATION_GENRE_ID, ANIME_KEYWORD_ID, classify_anime};
 pub use media::{MediaType, ParseMediaTypeError, TitleKey};

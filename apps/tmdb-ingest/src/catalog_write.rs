@@ -3,7 +3,7 @@ use std::time::Duration;
 use chrono::{DateTime, NaiveDate, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
-use tmdb_domain::MediaType;
+use tmdb_domain::{MediaType, classify_anime};
 use tmdb_jobs::JobExecutionError;
 use tmdb_upstream::{
     ChangePage, TmdbAlternateTitle, TmdbCollection, TmdbCompany, TmdbContentRating, TmdbCredit,
@@ -19,7 +19,7 @@ use super::catalog_locks::{
     changes_write_resources, movie_write_resources, prelock_catalog_write_resources,
     season_write_resources, tv_write_resources,
 };
-use super::{contains_anime_keyword, normalize_language, parse_source_date, source_id};
+use super::{normalize_language, parse_source_date, source_id};
 
 /// Persists a movie and optionally creates local-media jobs in the same
 /// catalog transaction.
@@ -44,7 +44,10 @@ pub(crate) async fn persist_movie_with_options(
     let resources = movie_write_resources(movie, tmdb_id)?;
     let mut transaction = pool.begin().await.map_err(database_error)?;
     prelock_catalog_write_resources(&mut transaction, resources).await?;
-    let is_anime = contains_anime_keyword(&movie.keywords);
+    let is_anime = classify_anime(
+        movie.keywords.iter().map(|keyword| keyword.id),
+        movie.genres.iter().map(|genre| genre.id),
+    );
     let title_id = upsert_title(
         &mut transaction,
         "movie",
@@ -161,7 +164,10 @@ pub(crate) async fn persist_tv_with_options(
     let resources = tv_write_resources(series, tmdb_id)?;
     let mut transaction = pool.begin().await.map_err(database_error)?;
     prelock_catalog_write_resources(&mut transaction, resources).await?;
-    let is_anime = contains_anime_keyword(&series.keywords);
+    let is_anime = classify_anime(
+        series.keywords.iter().map(|keyword| keyword.id),
+        series.genres.iter().map(|genre| genre.id),
+    );
     let title_id = upsert_title(
         &mut transaction,
         "tv",
@@ -1480,8 +1486,8 @@ mod tests {
     use serde_json::Value;
     use sqlx::PgPool;
     use tmdb_upstream::{
-        TmdbCredit, TmdbCredits, TmdbEpisode, TmdbGenre, TmdbMovie, TmdbSeason, TmdbSeasonSummary,
-        TmdbTv,
+        TmdbCredit, TmdbCredits, TmdbEpisode, TmdbGenre, TmdbKeyword, TmdbMovie, TmdbSeason,
+        TmdbSeasonSummary, TmdbTv,
     };
     use tokio::sync::Barrier;
 
@@ -1543,6 +1549,56 @@ mod tests {
                     digest_hex("/poster-fixture.jpg")
                 )
         }));
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn movie_and_tv_persistence_require_keyword_and_animation_genre(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let keyword_only_movie = TmdbMovie {
+            id: 44,
+            title: Some("Keyword-only live adaptation".to_owned()),
+            keywords: vec![TmdbKeyword {
+                id: 210_024,
+                name: Some("anime".to_owned()),
+            }],
+            genres: vec![TmdbGenre {
+                id: 28,
+                name: Some("Action".to_owned()),
+            }],
+            ..TmdbMovie::default()
+        };
+        let anime_tv = TmdbTv {
+            id: 45,
+            name: Some("Strict anime TV fixture".to_owned()),
+            keywords: vec![TmdbKeyword {
+                id: 210_024,
+                name: Some("anime".to_owned()),
+            }],
+            genres: vec![TmdbGenre {
+                id: 16,
+                name: Some("Animation".to_owned()),
+            }],
+            ..TmdbTv::default()
+        };
+
+        persist_movie_with_options(&pool, &keyword_only_movie, false)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+        persist_tv_with_options(&pool, &anime_tv, false)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+
+        let rows: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT media_type, is_anime
+               FROM catalog.titles
+              WHERE tmdb_id IN (44, 45)
+              ORDER BY tmdb_id",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(rows, [("movie".to_owned(), false), ("tv".to_owned(), true)]);
         Ok(())
     }
 

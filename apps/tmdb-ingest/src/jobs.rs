@@ -10,8 +10,7 @@ use sqlx::PgPool;
 use tmdb_domain::MediaType;
 use tmdb_jobs::{ClaimedJob, JobError, JobExecutionError, JobExecutor, JobRepository, NewJob};
 use tmdb_upstream::{
-    DailyExportParser, MAX_DAILY_EXPORT_BYTES, TmdbClient, TmdbClientError, TmdbKeyword,
-    TmdbTrendingItem,
+    DailyExportParser, MAX_DAILY_EXPORT_BYTES, TmdbClient, TmdbClientError, TmdbTrendingItem,
 };
 
 #[path = "catalog_locks.rs"]
@@ -975,12 +974,6 @@ fn normalize_language(value: &str) -> Result<String, JobExecutionError> {
     Ok(value)
 }
 
-fn contains_anime_keyword(keywords: &[TmdbKeyword]) -> bool {
-    keywords
-        .iter()
-        .any(|keyword| keyword.id == u64::from(tmdb_domain::ANIME_KEYWORD_ID))
-}
-
 fn log_upstream_failure(
     operation: &'static str,
     media_type: &'static str,
@@ -1190,19 +1183,6 @@ mod tests {
         assert!(normalize_language("e").is_err());
         assert!(normalize_language("eng!").is_err());
         Ok(())
-    }
-
-    #[test]
-    fn anime_scope_uses_the_tmdb_keyword_for_both_media_types() {
-        let keywords = vec![TmdbKeyword {
-            id: tmdb_domain::ANIME_KEYWORD_ID.into(),
-            name: Some("anime".to_owned()),
-        }];
-        assert!(contains_anime_keyword(&keywords));
-        assert!(!contains_anime_keyword(&[TmdbKeyword {
-            id: 42,
-            name: Some("animation".to_owned()),
-        }]));
     }
 
     #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]

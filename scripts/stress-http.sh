@@ -121,11 +121,31 @@ check_body() {
     fi
 }
 
+check_status() {
+    local name="$1" url="$2" expected="$3" status
+    status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+        --connect-timeout 5 --max-time 30 "$url" || printf '000')"
+    if [[ "$status" == "$expected" ]]; then
+        printf '%s\tPASS\n' "$name" >>"$semantic_file"
+    else
+        printf '%s\tFAIL\n' "$name" >>"$semantic_file"
+        semantic_failures=$((semantic_failures + 1))
+    fi
+}
+
 : >"$semantic_file"
 check_body ordinary_routes_exclude_anime "$base_url/v1/movies?limit=100" absent-anime
 check_body anime_route_returns_data "$base_url/v1/anime?q=One%20Piece&limit=20" present
 check_body accent_search "$base_url/v1/search?q=Caf%C3%A9&limit=20" present
 check_body multi_facet_filter "$base_url/v1/movies?genreId=900000002&language=en&runtimeMin=40&runtimeMax=120&personId=900000002&companyId=900000002&limit=20" present
+check_status anime_movie_detail_accepts_both_signals "$base_url/v1/anime/movie/900000017" 200
+check_status ordinary_movie_detail_accepts_keyword_only "$base_url/v1/movies/900000019" 200
+check_status anime_movie_detail_rejects_keyword_only "$base_url/v1/anime/movie/900000019" 404
+check_status ordinary_movie_detail_rejects_anime "$base_url/v1/movies/900000017" 404
+check_status anime_tv_detail_accepts_both_signals "$base_url/v1/anime/tv/900000034" 200
+check_status ordinary_tv_detail_accepts_keyword_only "$base_url/v1/tv/900000038" 200
+check_status anime_tv_detail_rejects_keyword_only "$base_url/v1/anime/tv/900000038" 404
+check_status ordinary_tv_detail_rejects_anime "$base_url/v1/tv/900000034" 404
 if curl --silent --show-error --fail --connect-timeout 5 --max-time 30 "$image_url/healthz" >/dev/null; then
     printf '%s\tPASS\n' media_health >>"$semantic_file"
 else

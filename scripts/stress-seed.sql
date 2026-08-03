@@ -21,6 +21,10 @@ SELECT :seed_base + value, 'Stress Genre ' || value
 FROM generate_series(1, 20) AS value
 ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name;
 
+INSERT INTO catalog.genres (id, name)
+VALUES (16, 'Animation')
+ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name;
+
 INSERT INTO catalog.keywords (id, name)
 VALUES (:seed_base + 1, 'stress keyword'),
        (210024, 'anime')
@@ -141,7 +145,12 @@ ON CONFLICT (title_id) DO UPDATE SET
     series_type = EXCLUDED.series_type;
 
 INSERT INTO catalog.title_genres (title_id, genre_id)
-SELECT :seed_base + value, :seed_base + (1 + (value % 20))
+SELECT :seed_base + value,
+       CASE
+           WHEN value % 17 = 0
+             OR (value % 23 = 0 AND value % 19 <> 0) THEN 16
+           ELSE :seed_base + (1 + (value % 20))
+       END
 FROM generate_series(1, :seed_count) AS value
 ON CONFLICT DO NOTHING;
 
@@ -154,6 +163,7 @@ INSERT INTO catalog.title_keywords (title_id, keyword_id)
 SELECT :seed_base + value, 210024
 FROM generate_series(1, :seed_count) AS value
 WHERE value % 17 = 0
+   OR (value % 19 = 0 AND value % 17 <> 0)
 ON CONFLICT DO NOTHING;
 
 INSERT INTO catalog.title_tags (title_id, tag_id)

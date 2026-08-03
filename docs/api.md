@@ -109,9 +109,10 @@ catalog.
 
 ## Anime
 
-Anime routes return only titles classified by the `anime` keyword. The popular
-anime route becomes anime-only search when `q` is supplied. `type=movie` or
-`type=tv` narrows a list or search; omitting it searches both namespaces.
+Anime routes return only titles with both the TMDB `anime` keyword and the
+`Animation` genre. The popular anime route becomes anime-only search when `q`
+is supplied. `type=movie` or `type=tv` narrows a list or search; omitting it
+searches both namespaces.
 
 | Method | Path | Purpose |
 | --- | --- | --- |

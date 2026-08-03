@@ -20,10 +20,10 @@ repository understandable, reproducible, and safe to publish.
 
 - Never commit, push, print, log, screenshot, or place in test artifacts a
   token, password, private key, cookie, or other private value.
-- The local stress secret source is `.secrets.txt`; `secrets.txt` is accepted
-  as a backwards-compatible fallback. Both must remain ignored by Git and
-  Docker. Read secret values only into a mode-600 ignored runtime env file or
-  process environment at execution time.
+- The local stress secret source is `secrets.txt`. Keep both `secrets.txt` and
+  `.secrets.txt` ignored by Git and Docker as a defensive guard. Read secret
+  values only into a mode-600 ignored runtime env file or process environment
+  at execution time.
 - Never put a real TMDB token in `.env`, Compose YAML, source, fixtures,
   generated reports, Docker build args, or shell history. Do not run commands
   that echo the token or expose it through `docker compose config` output.

@@ -26,10 +26,12 @@ EXPORT_ROOT="$RUNTIME_ROOT/exports"
 
 if [[ -n "${TMDB_DOCKER_BIN:-}" ]]; then
     DOCKER_BIN="$TMDB_DOCKER_BIN"
+elif command -v docker >/dev/null 2>&1; then
+    DOCKER_BIN="$(command -v docker)"
 elif command -v docker.exe >/dev/null 2>&1; then
     DOCKER_BIN="$(command -v docker.exe)"
 else
-    DOCKER_BIN="$(command -v docker || true)"
+    DOCKER_BIN=''
 fi
 
 docker_command() {
@@ -93,12 +95,10 @@ require_runtime_files() {
 select_secrets_file() {
     if [[ -n "${TMDB_STRESS_SECRETS_FILE:-}" ]]; then
         printf '%s\n' "$TMDB_STRESS_SECRETS_FILE"
-    elif [[ -f "$REPO_ROOT/.secrets.txt" ]]; then
-        printf '%s\n' "$REPO_ROOT/.secrets.txt"
     elif [[ -f "$REPO_ROOT/secrets.txt" ]]; then
         printf '%s\n' "$REPO_ROOT/secrets.txt"
     else
-        die "no local secrets file found; expected .secrets.txt or secrets.txt"
+        die "no local secrets file found; expected secrets.txt"
     fi
 }
 

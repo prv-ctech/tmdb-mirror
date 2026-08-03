@@ -31,3 +31,10 @@
 - [x] Fix discovered defects and add regression tests.
 - [x] Run full verification matrix and collect final artifacts.
 - [x] Document exact measured results and remaining limits; commit or push only after explicit user authorization.
+
+## Anime classification follow-up
+
+- [x] Use the strict `anime` keyword `210024` plus `Animation` genre `16` predicate in movie and TV ingest.
+- [x] Add regression and API/media tests for keyword-only, genre-only, live-action, and English-language titles.
+- [x] Reset the disposable development database/media state and reseed consistent relationships.
+- [x] Run the full affected stress matrix before enabling the new rule.

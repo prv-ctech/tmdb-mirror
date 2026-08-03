@@ -196,47 +196,20 @@ git commit -m "build: create reproducible Rust workspace"
 
 **Interfaces:**
 - Produces: `MediaType::{Movie,Tv}` and `TitleKey::new(MediaType, NonZeroU32)`.
-- Produces: `classify_anime(&BTreeSet<u32>, Option<AnimeOverride>) -> AnimeDecision`.
-- Produces constants `ANIME_KEYWORD_ID=210024` and `ANIME_RULE_VERSION="anime-keyword-210024-v1"`.
+- Produces: `classify_anime(keyword_ids, genre_ids) -> bool`, requiring keyword
+  `210024` and genre `16`.
+- Produces constants `ANIME_KEYWORD_ID=210024` and `ANIMATION_GENRE_ID=16`.
 
 - [ ] **Step 1: Write classification tests**
 
 ```rust
-use std::collections::BTreeSet;
-use tmdb_domain::{
-    classify_anime, AnimeOverride, AnimeSource, MediaType, TitleKey,
-    ANIME_KEYWORD_ID, ANIME_RULE_VERSION,
-};
+use tmdb_domain::{classify_anime, ANIMATION_GENRE_ID, ANIME_KEYWORD_ID};
 
 #[test]
-fn keyword_classifies_movie_and_tv_as_anime() -> Result<(), Box<dyn std::error::Error>> {
-    let tmdb_id = std::num::NonZeroU32::new(1).ok_or("fixture ID must be non-zero")?;
-    for media_type in [MediaType::Movie, MediaType::Tv] {
-        let key = TitleKey::new(media_type, tmdb_id);
-        let decision = classify_anime(&BTreeSet::from([ANIME_KEYWORD_ID]), None);
-        assert!(decision.is_anime);
-        assert_eq!(decision.source, AnimeSource::TmdbKeyword);
-        assert_eq!(decision.rule_version, ANIME_RULE_VERSION);
-        assert_eq!(key.tmdb_id().get(), 1);
-    }
-    Ok(())
-}
-
-#[test]
-fn administrator_override_has_precedence_and_keeps_reason() -> Result<(), Box<dyn std::error::Error>> {
-    let decision = classify_anime(
-        &BTreeSet::from([ANIME_KEYWORD_ID]),
-        Some(AnimeOverride::try_new(false, "live action")?),
-    );
-    assert!(!decision.is_anime);
-    assert_eq!(decision.source, AnimeSource::AdministratorOverride);
-    assert_eq!(decision.reason.as_deref(), Some("live action"));
-    Ok(())
-}
-
-#[test]
-fn empty_override_reason_is_rejected() {
-    assert!(AnimeOverride::try_new(true, "   ").is_err());
+fn anime_requires_both_tmdb_signals() {
+    assert!(classify_anime([ANIME_KEYWORD_ID], [ANIMATION_GENRE_ID]));
+    assert!(!classify_anime([ANIME_KEYWORD_ID], []));
+    assert!(!classify_anime([], [ANIMATION_GENRE_ID]));
 }
 ```
 
@@ -267,7 +240,8 @@ Implement `Display` and `FromStr` for MediaType, accepting exactly `movie` and `
 
 - [ ] **Step 4: Implement the pure anime decision**
 
-Override precedence is absolute. Without an override, keyword 210024 yields true; otherwise false. AnimeDecision records is_anime, source, rule_version, evidence_keyword_ids, and optional non-empty trimmed reason.
+The rule is a pure strict conjunction: keyword 210024 and genre 16 must both
+be present. There is no override or fallback path in the development baseline.
 
 - [ ] **Step 5: Run domain tests and lints**
 

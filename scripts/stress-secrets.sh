@@ -30,6 +30,6 @@ fi
 cat <<'USAGE'
 Usage: scripts/stress-secrets.sh --self-test
 
-The reusable parser is sourced by the other Linux stress scripts. It reads
-ignored .secrets.txt first, then ignored secrets.txt, without sourcing values.
+The reusable parser is sourced by the other Linux stress scripts. It reads the
+ignored secrets.txt file without sourcing values.
 USAGE
