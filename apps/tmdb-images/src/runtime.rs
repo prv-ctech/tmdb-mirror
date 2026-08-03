@@ -77,12 +77,7 @@ pub async fn run() -> anyhow::Result<()> {
     prepare_media_storage()?;
     let source = EnvSource;
     let environment = load_environment(source)?;
-    let database = load_database_for_role(
-        &source,
-        environment,
-        "TMDB_IMAGE_WRITER_USER",
-        "TMDB_IMAGE_WRITER_PASSWORD",
-    )?;
+    let database = load_database_for_role(&source, environment, "image_writer")?;
     let worker_config = load_worker_config(source, "tmdb-images")?;
     let worker_concurrency = load_image_worker_concurrency(source)?;
     let store = load_image_store()?;

@@ -68,6 +68,12 @@ repository understandable, reproducible, and safe to publish.
   `.env` beside the file. The checkout production file may use
   `TMDB_ENV_FILE` only to select an external, ignored runtime env file; never
   use it for host paths or ports.
+- Database role names are fixed in the PostgreSQL bootstrap. All six internal
+  roles use `POSTGRES_PASSWORD`; never add per-role `*_USER` or `*_PASSWORD`
+  entries to the runtime template.
+- Listener addresses, `PGDATA`, and PostgreSQL init arguments have fixed image
+  defaults. Do not make users enter them unless the application contract
+  changes.
 - `docker-compose-example.yaml` must remain a complete standalone Compose
   document. Do not replace it with `include`, `extends`, or a wrapper that
   requires another Compose file to run.

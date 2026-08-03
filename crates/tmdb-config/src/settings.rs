@@ -4,7 +4,7 @@ use std::str::FromStr;
 use http::Uri;
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::secret::{load_secret_for_environment, load_secret_with_origin};
+use crate::secret::load_secret_with_origin;
 use crate::{ConfigError, ConfigSource, StorageRoots};
 
 /// Deployment environment controlling secret policy.
@@ -69,12 +69,11 @@ pub struct AppConfig {
 impl AppConfig {
     /// Loads and validates all application configuration from one source.
     ///
-    /// The environment keys are `TMDB_ENVIRONMENT`, `TMDB_API_BIND`,
-    /// `TMDB_ADMIN_BIND`, `POSTGRES_DB`, `POSTGRES_USER`, and
-    /// `POSTGRES_PASSWORD`. The four-container deployment fixes the database
-    /// host and port to `postgres:5432`; alternate database aliases are
-    /// rejected. Filesystem roots are fixed to `/media` and `/config` and are
-    /// selected only by deployment volume mappings.
+    /// The required keys are `TMDB_ENVIRONMENT`, `POSTGRES_DB`,
+    /// `POSTGRES_USER`, and `POSTGRES_PASSWORD`. Listener overrides are
+    /// optional; the four-container deployment defaults them to the fixed
+    /// internal ports. The database host and port are fixed to
+    /// `postgres:5432`; filesystem roots are fixed to `/media` and `/config`.
     ///
     /// # Errors
     ///
@@ -83,8 +82,16 @@ impl AppConfig {
     /// roots overlap. Errors never include configured values.
     pub fn load(source: &impl ConfigSource) -> Result<Self, ConfigError> {
         let environment = parse_required(source, "TMDB_ENVIRONMENT")?;
-        let api_bind = parse_required(source, "TMDB_API_BIND")?;
-        let admin_bind = parse_required(source, "TMDB_ADMIN_BIND")?;
+        let api_bind = parse_or(
+            source,
+            "TMDB_API_BIND",
+            SocketAddr::from(([0, 0, 0, 0], 8080)),
+        )?;
+        let admin_bind = parse_or(
+            source,
+            "TMDB_ADMIN_BIND",
+            SocketAddr::from(([0, 0, 0, 0], 8081)),
+        )?;
         let database = load_shared_database(source, environment)?;
         let storage_roots = StorageRoots::fixed();
         let trawl_base_url = optional_uri(source, "TMDB_TRAWL_BASE_URL")?;
@@ -161,43 +168,29 @@ pub fn load_shared_database(
     })
 }
 
-/// Loads one least-privilege database identity for an application role.
+/// Loads one fixed least-privilege database identity for an application role.
 ///
-/// Role usernames are required. A role-specific password may be supplied by
-/// `password_name` or its `_FILE` companion; when it is omitted, the base
-/// `POSTGRES_PASSWORD` is retained for backwards-compatible deployments.
-/// The database host, name, and port remain fixed to the internal Compose
-/// service, just like [`load_shared_database`].
+/// Role names are defined by the `PostgreSQL` bootstrap. All internal roles use
+/// the shared `POSTGRES_PASSWORD`; the database host, name, and port remain
+/// fixed to the internal Compose service.
 ///
 /// # Errors
 ///
-/// Returns [`ConfigError`] when the shared database settings or selected role
-/// identity is missing, invalid, or uses a forbidden example secret.
+/// Returns [`ConfigError`] when the shared database settings are missing,
+/// invalid, or use a forbidden example secret.
 pub fn load_database_for_role(
     source: &impl ConfigSource,
     environment: Environment,
-    username_name: &str,
-    password_name: &str,
+    role_name: &str,
 ) -> Result<DatabaseConfig, ConfigError> {
     let shared = load_shared_database(source, environment)?;
-    let username = required_string(source, username_name)?;
-    let password = if has_secret_source(source, password_name) {
-        load_secret_for_environment(source, password_name, environment)?
-    } else {
-        shared.password.clone()
-    };
-    if environment != Environment::Production && is_known_example(&password) {
-        return Err(ConfigError::ExampleSecretForbidden(
-            password_name.to_owned(),
-        ));
-    }
 
     Ok(DatabaseConfig {
         host: shared.host,
         port: shared.port,
         database: shared.database,
-        username,
-        password,
+        username: role_name.to_owned(),
+        password: shared.password,
     })
 }
 
@@ -266,6 +259,17 @@ where
     required_string(source, name)?
         .parse()
         .map_err(|_| ConfigError::InvalidValue(name.to_owned()))
+}
+
+fn parse_or<T>(source: &impl ConfigSource, name: &str, default: T) -> Result<T, ConfigError>
+where
+    T: FromStr,
+{
+    if source.get(name).is_some() {
+        parse_required(source, name)
+    } else {
+        Ok(default)
+    }
 }
 
 fn optional_uri(source: &impl ConfigSource, name: &str) -> Result<Option<Uri>, ConfigError> {

@@ -49,40 +49,17 @@ fn shared_database_entries(environment: &str) -> MapSource {
 }
 
 #[test]
-fn role_database_uses_the_selected_identity_and_supports_shared_password_fallback()
--> Result<(), Box<dyn std::error::Error>> {
-    let role_source = MapSource::from([
+fn role_database_uses_fixed_identity_and_shared_password() -> Result<(), Box<dyn std::error::Error>>
+{
+    let source = MapSource::from([
         ("TMDB_ENVIRONMENT", "test"),
         ("POSTGRES_DB", "example_catalog"),
         ("POSTGRES_USER", "database_owner"),
         ("POSTGRES_PASSWORD", "owner-password"),
-        ("ROLE_USER", "api_reader"),
-        ("ROLE_PASSWORD", "reader-password"),
     ]);
-    let role = load_database_for_role(
-        &role_source,
-        Environment::Test,
-        "ROLE_USER",
-        "ROLE_PASSWORD",
-    )?;
+    let role = load_database_for_role(&source, Environment::Test, "api_reader")?;
     assert_eq!(role.username, "api_reader");
-    assert_eq!(role.password.expose_secret(), "reader-password");
-
-    let fallback_source = MapSource::from([
-        ("TMDB_ENVIRONMENT", "test"),
-        ("POSTGRES_DB", "example_catalog"),
-        ("POSTGRES_USER", "database_owner"),
-        ("POSTGRES_PASSWORD", "owner-password"),
-        ("ROLE_USER", "image_writer"),
-    ]);
-    let fallback = load_database_for_role(
-        &fallback_source,
-        Environment::Test,
-        "ROLE_USER",
-        "ROLE_PASSWORD",
-    )?;
-    assert_eq!(fallback.username, "image_writer");
-    assert_eq!(fallback.password.expose_secret(), "owner-password");
+    assert_eq!(role.password.expose_secret(), "owner-password");
     Ok(())
 }
 
@@ -275,6 +252,18 @@ fn app_config_parses_typed_settings_and_redacts_secrets() -> Result<(), Box<dyn 
     let rendered = format!("{config:?}");
     assert!(rendered.contains("[REDACTED]"));
     assert!(!rendered.contains(DATABASE_PASSWORD));
+    Ok(())
+}
+
+#[test]
+fn app_config_uses_fixed_listener_defaults_when_omitted() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut entries = valid_entries("test");
+    entries.retain(|(key, _)| key != "TMDB_API_BIND" && key != "TMDB_ADMIN_BIND");
+
+    let config = AppConfig::load(&source_from_entries(entries))?;
+    assert_eq!(config.api_bind.to_string(), "0.0.0.0:8080");
+    assert_eq!(config.admin_bind.to_string(), "0.0.0.0:8081");
     Ok(())
 }
 

@@ -80,8 +80,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Migrate => {
             let config = database_for_role(
                 cli.environment,
-                "TMDB_MIGRATOR_USER",
-                "TMDB_MIGRATOR_PASSWORD",
+                "migrator",
             )?;
             let pool = connect_direct(&config, PoolPolicy::Migrator).await?;
             let report = migrate(&pool, &config.username).await?;
@@ -90,8 +89,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Doctor { json: true } => {
             let config = database_for_role(
                 cli.environment,
-                "TMDB_API_READER_USER",
-                "TMDB_API_READER_PASSWORD",
+                "api_reader",
             )?;
             let pool = connect_direct(&config, PoolPolicy::ReadOnly).await?;
             let report = doctor(&pool, &config.username).await?;
@@ -103,8 +101,7 @@ async fn main() -> anyhow::Result<()> {
         Command::SubmitNoop { dedup_key } => {
             let config = database_for_role(
                 cli.environment,
-                "TMDB_API_JOB_SUBMITTER_USER",
-                "TMDB_API_JOB_SUBMITTER_PASSWORD",
+                "api_job_submitter",
             )?;
             let pool = connect_direct(&config, PoolPolicy::ReadWrite).await?;
             let outcome = JobRepository::new(pool)
@@ -125,8 +122,7 @@ async fn main() -> anyhow::Result<()> {
             let (job_type, payload) = refresh_job(&media_type, tmdb_id)?;
             let config = database_for_role(
                 cli.environment,
-                "TMDB_API_JOB_SUBMITTER_USER",
-                "TMDB_API_JOB_SUBMITTER_PASSWORD",
+                "api_job_submitter",
             )?;
             let pool = connect_direct(&config, PoolPolicy::ReadWrite).await?;
             let outcome = JobRepository::new(pool)
@@ -154,8 +150,7 @@ async fn main() -> anyhow::Result<()> {
             let dedup_key = format!("{job_type}:{media_type}:{url}");
             let config = database_for_role(
                 cli.environment,
-                "TMDB_API_JOB_SUBMITTER_USER",
-                "TMDB_API_JOB_SUBMITTER_PASSWORD",
+                "api_job_submitter",
             )?;
             let pool = connect_direct(&config, PoolPolicy::ReadWrite).await?;
             let outcome = JobRepository::new(pool)
@@ -190,8 +185,7 @@ async fn main() -> anyhow::Result<()> {
                 parser.scan_file_limited(&path, queue_limit, |record| records.push(record))?;
                 let config = database_for_role(
                     cli.environment,
-                    "TMDB_API_JOB_SUBMITTER_USER",
-                    "TMDB_API_JOB_SUBMITTER_PASSWORD",
+                    "api_job_submitter",
                 )?;
                 let pool = connect_direct(&config, PoolPolicy::ReadWrite).await?;
                 let repository = JobRepository::new(pool);
@@ -230,8 +224,7 @@ async fn main() -> anyhow::Result<()> {
                 Uuid::parse_str(&job_id).map_err(|_| anyhow::anyhow!("invalid job UUID"))?;
             let config = database_for_role(
                 cli.environment,
-                "TMDB_API_JOB_SUBMITTER_USER",
-                "TMDB_API_JOB_SUBMITTER_PASSWORD",
+                "api_job_submitter",
             )?;
             let pool = connect_direct(&config, PoolPolicy::ReadOnly).await?;
             let job = JobRepository::new(pool).get(JobId::from(job_id)).await?;
@@ -258,10 +251,9 @@ async fn main() -> anyhow::Result<()> {
 
 fn database_for_role(
     environment: Environment,
-    username_name: &str,
-    password_name: &str,
+    role_name: &str,
 ) -> Result<DatabaseConfig, tmdb_config::ConfigError> {
-    load_database_for_role(&EnvSource, environment, username_name, password_name)
+    load_database_for_role(&EnvSource, environment, role_name)
 }
 
 #[derive(Debug, Serialize)]

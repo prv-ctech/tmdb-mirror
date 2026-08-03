@@ -4,6 +4,8 @@
 .git/
 .gitignore
 .gitattributes
+.agents/
+skills-lock.json
 secrets.txt
 .secrets.txt
 *.pem

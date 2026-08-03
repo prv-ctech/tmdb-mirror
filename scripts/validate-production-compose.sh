@@ -42,13 +42,7 @@ done <"$env_file"
 
 required_keys=(
     TMDB_ENVIRONMENT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD
-    TMDB_MIGRATOR_USER TMDB_MIGRATOR_PASSWORD
-    TMDB_API_READER_USER TMDB_API_READER_PASSWORD
-    TMDB_API_JOB_SUBMITTER_USER TMDB_API_JOB_SUBMITTER_PASSWORD
-    TMDB_INGEST_WRITER_USER TMDB_INGEST_WRITER_PASSWORD
-    TMDB_IMAGE_WRITER_USER TMDB_IMAGE_WRITER_PASSWORD
-    TMDB_MONITOR_USER TMDB_MONITOR_PASSWORD
-    TMDB_READ_ACCESS_TOKEN TMDB_ADMIN_API_KEY ALLOW_LOCAL_MEDIA
+    TMDB_API_BASE_URL TMDB_READ_ACCESS_TOKEN TMDB_ADMIN_API_KEY ALLOW_LOCAL_MEDIA
     TMDB_MEDIA_BASE_URL TZ
 )
 for key in "${required_keys[@]}"; do
@@ -64,6 +58,18 @@ unsupported_database_keys=(
 for key in "${unsupported_database_keys[@]}"; do
     [[ -z "${entries[$key]+present}" && -z "${entries[${key}_FILE]+present}" ]] \
         || die "unsupported database setting: $key"
+done
+unsupported_role_keys=(
+    TMDB_MIGRATOR_USER TMDB_MIGRATOR_PASSWORD
+    TMDB_API_READER_USER TMDB_API_READER_PASSWORD
+    TMDB_API_JOB_SUBMITTER_USER TMDB_API_JOB_SUBMITTER_PASSWORD
+    TMDB_INGEST_WRITER_USER TMDB_INGEST_WRITER_PASSWORD
+    TMDB_IMAGE_WRITER_USER TMDB_IMAGE_WRITER_PASSWORD
+    TMDB_MONITOR_USER TMDB_MONITOR_PASSWORD
+)
+for key in "${unsupported_role_keys[@]}"; do
+    [[ -z "${entries[$key]+present}" && -z "${entries[${key}_FILE]+present}" ]] \
+        || die "unsupported role setting: $key"
 done
 unsupported_storage_keys=(TMDB_MEDIA_HOST_ROOT TMDB_WORK_HOST_ROOT TMDB_MEDIA_ROOT TMDB_WORK_ROOT)
 for key in "${unsupported_storage_keys[@]}"; do

@@ -16,10 +16,10 @@ tmdb-media     -> /media
 ```
 
 Keep the runtime environment in a mode-600 file outside the release directory.
-It must contain the PostgreSQL owner credentials, all least-privilege role
-credentials, TMDB read token, and admin API key from `.env.example`. Do not put
-real credentials in a repository `.env`, the release artifact, or shell
-history. Point the release Compose file at that runtime file:
+It must contain the PostgreSQL owner credentials, TMDB read token, admin API
+key, and local media settings from `.env.example`. Do not put real credentials
+in a repository `.env`, the release artifact, or shell history. Point the
+release Compose file at that runtime file:
 
 ```bash
 runtime_env=/secure/path/tmdb-mirror-release.env

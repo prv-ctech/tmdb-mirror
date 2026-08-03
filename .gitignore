@@ -41,6 +41,8 @@ __pycache__/
 .idea/
 .worktrees/
 .superpowers/
+.agents/
+skills-lock.json
 
 # Local Compose overrides
 docker-compose.yaml

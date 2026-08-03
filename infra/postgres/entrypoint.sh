@@ -140,6 +140,7 @@ forward_signal() {
 }
 
 main() {
+    export POSTGRES_INITDB_ARGS="${POSTGRES_INITDB_ARGS:---data-checksums --encoding=UTF8 --auth-local=scram-sha-256 --auth-host=scram-sha-256}"
     if [[ "${1:-}" == -* ]]; then
         set -- postgres "$@"
     fi

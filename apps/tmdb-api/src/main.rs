@@ -115,27 +115,12 @@ struct ApiDatabasePools {
 }
 
 async fn connect_api_database_pools(environment: Environment) -> anyhow::Result<ApiDatabasePools> {
-    let reader_database = load_database_for_role(
-        &EnvSource,
-        environment,
-        "TMDB_API_READER_USER",
-        "TMDB_API_READER_PASSWORD",
-    )
-    .context("load API reader database configuration")?;
-    let submitter_database = load_database_for_role(
-        &EnvSource,
-        environment,
-        "TMDB_API_JOB_SUBMITTER_USER",
-        "TMDB_API_JOB_SUBMITTER_PASSWORD",
-    )
-    .context("load API submitter database configuration")?;
-    let monitor_database = load_database_for_role(
-        &EnvSource,
-        environment,
-        "TMDB_MONITOR_USER",
-        "TMDB_MONITOR_PASSWORD",
-    )
-    .context("load API monitor database configuration")?;
+    let reader_database = load_database_for_role(&EnvSource, environment, "api_reader")
+        .context("load API reader database configuration")?;
+    let submitter_database = load_database_for_role(&EnvSource, environment, "api_job_submitter")
+        .context("load API submitter database configuration")?;
+    let monitor_database = load_database_for_role(&EnvSource, environment, "monitor")
+        .context("load API monitor database configuration")?;
     let read_pool = connect_direct(&reader_database, PoolPolicy::ReadOnly)
         .await
         .map_err(|error| anyhow::anyhow!(error))

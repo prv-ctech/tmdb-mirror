@@ -6,8 +6,6 @@ shared_password="${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
 
 ensure_internal_login_role() {
     local role_name="$1"
-    local password_name="$2"
-    local role_password="${!password_name:-$shared_password}"
 
     # A deployment may deliberately select one of the historical internal role
     # names as its PostgreSQL owner. That owner is the role that bootstraps the
@@ -20,7 +18,7 @@ ensure_internal_login_role() {
     psql -X -v ON_ERROR_STOP=1 \
         --username "$POSTGRES_USER" \
         --dbname "$POSTGRES_DB" \
-        --set=shared_password="$role_password" \
+        --set=shared_password="$shared_password" \
         --set=role_name="$role_name" <<'SQL'
 SET password_encryption = 'scram-sha-256';
 
@@ -33,12 +31,12 @@ CREATE ROLE :"role_name" LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOR
 SQL
 }
 
-ensure_internal_login_role migrator TMDB_MIGRATOR_PASSWORD
-ensure_internal_login_role api_reader TMDB_API_READER_PASSWORD
-ensure_internal_login_role api_job_submitter TMDB_API_JOB_SUBMITTER_PASSWORD
-ensure_internal_login_role ingest_writer TMDB_INGEST_WRITER_PASSWORD
-ensure_internal_login_role image_writer TMDB_IMAGE_WRITER_PASSWORD
-ensure_internal_login_role monitor TMDB_MONITOR_PASSWORD
+ensure_internal_login_role migrator
+ensure_internal_login_role api_reader
+ensure_internal_login_role api_job_submitter
+ensure_internal_login_role ingest_writer
+ensure_internal_login_role image_writer
+ensure_internal_login_role monitor
 
 if [[ "$POSTGRES_USER" != "api_reader" ]]; then
     psql -X -v ON_ERROR_STOP=1 \

@@ -76,27 +76,24 @@ application.
 
 Copy the root environment template to a mode-600 runtime file outside the
 checkout and replace every angle-bracket value. It contains the PostgreSQL
-owner credentials, least-privilege role credentials, TMDB read token, and admin
-API key used by the stack. Keep that file out of the repository; do not place a
-real token in `.env`, Compose YAML, or a generated artifact. The same runtime
-file is passed to all four containers through `env_file`. No repository
-checkout or local Docker build is needed after GitHub Actions has published the
-images.
+owner credentials, TMDB read token, admin API key, and local media settings.
+Keep that file out of the repository; do not place a real token in `.env`,
+Compose YAML, or a generated artifact. The same runtime file is passed to all
+four containers through `env_file`. No repository checkout or local Docker
+build is needed after GitHub Actions has published the images.
 
-Each key has an inline description in `.env.example`. The public, admin, and
-media routes are listed in [api.md](api.md).
+The public, admin, and media routes are listed in [api.md](api.md).
 
 `TZ=America/New_York` controls schedule interpretation and human-readable
 terminal timestamps. PostgreSQL and API timestamps remain UTC.
 
 The PostgreSQL service uses `POSTGRES_DB`, `POSTGRES_USER`, and
 `POSTGRES_PASSWORD` for the database owner and health check. Application
-processes use the explicit `TMDB_MIGRATOR_*`, `TMDB_API_READER_*`,
-`TMDB_API_JOB_SUBMITTER_*`, `TMDB_INGEST_WRITER_*`, and
-`TMDB_IMAGE_WRITER_*` role settings so a public read path cannot write catalog
-or job tables. Its database connection is fixed to the internal Compose
-service `postgres:5432`; do not add `DATABASE_*`, `TMDB_DB_*`, or ad-hoc
-per-process database aliases.
+processes use the fixed `migrator`, `api_reader`, `api_job_submitter`,
+`ingest_writer`, `image_writer`, and `monitor` roles with that shared password.
+Their database permissions remain separate. The connection is fixed to the
+internal Compose service `postgres:5432`; do not add `DATABASE_*`, `TMDB_DB_*`,
+role identity, or per-process database settings.
 
 Keep `TMDB_RATE_LIMIT` at `40` or lower. The worker rejects a higher value
 before it starts upstream requests.
