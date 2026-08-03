@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
-use tmdb_config::{EnvSource, Environment, load_shared_database};
+use tmdb_config::{DatabaseConfig, EnvSource, Environment, load_database_for_role};
 use tmdb_db::{PoolPolicy, ReadinessReport, connect_direct, migrate, readiness};
 use tmdb_jobs::{JobId, JobRepository, NewJob};
 use tmdb_upstream::DailyExportParser;
@@ -75,15 +75,24 @@ enum Command {
 #[allow(clippy::too_many_lines)] // Keep the small CLI command dispatcher in one audit surface.
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let config = load_shared_database(&EnvSource, cli.environment)?;
 
     match cli.command {
         Command::Migrate => {
+            let config = database_for_role(
+                cli.environment,
+                "TMDB_MIGRATOR_USER",
+                "TMDB_MIGRATOR_PASSWORD",
+            )?;
             let pool = connect_direct(&config, PoolPolicy::Migrator).await?;
             let report = migrate(&pool, &config.username).await?;
             println!("{}", serde_json::to_string(&report)?);
         }
         Command::Doctor { json: true } => {
+            let config = database_for_role(
+                cli.environment,
+                "TMDB_API_READER_USER",
+                "TMDB_API_READER_PASSWORD",
+            )?;
             let pool = connect_direct(&config, PoolPolicy::ReadOnly).await?;
             let report = doctor(&pool, &config.username).await?;
             println!("{}", serde_json::to_string(&report)?);
@@ -92,6 +101,11 @@ async fn main() -> anyhow::Result<()> {
             anyhow::bail!("doctor requires --json");
         }
         Command::SubmitNoop { dedup_key } => {
+            let config = database_for_role(
+                cli.environment,
+                "TMDB_API_JOB_SUBMITTER_USER",
+                "TMDB_API_JOB_SUBMITTER_PASSWORD",
+            )?;
             let pool = connect_direct(&config, PoolPolicy::ReadWrite).await?;
             let outcome = JobRepository::new(pool)
                 .submit(NewJob::noop(&dedup_key)?)
@@ -109,6 +123,11 @@ async fn main() -> anyhow::Result<()> {
             tmdb_id,
         } => {
             let (job_type, payload) = refresh_job(&media_type, tmdb_id)?;
+            let config = database_for_role(
+                cli.environment,
+                "TMDB_API_JOB_SUBMITTER_USER",
+                "TMDB_API_JOB_SUBMITTER_PASSWORD",
+            )?;
             let pool = connect_direct(&config, PoolPolicy::ReadWrite).await?;
             let outcome = JobRepository::new(pool)
                 .submit(NewJob::new(
@@ -133,6 +152,11 @@ async fn main() -> anyhow::Result<()> {
             let job_type = "ingest.daily_export";
             let payload = serde_json::json!({"media_type": media_type, "url": url});
             let dedup_key = format!("{job_type}:{media_type}:{url}");
+            let config = database_for_role(
+                cli.environment,
+                "TMDB_API_JOB_SUBMITTER_USER",
+                "TMDB_API_JOB_SUBMITTER_PASSWORD",
+            )?;
             let pool = connect_direct(&config, PoolPolicy::ReadWrite).await?;
             let outcome = JobRepository::new(pool)
                 .submit(NewJob::new(job_type, 1, payload, &dedup_key)?)
@@ -164,6 +188,11 @@ async fn main() -> anyhow::Result<()> {
                 }
                 let mut records = Vec::with_capacity(queue_limit.min(100_000));
                 parser.scan_file_limited(&path, queue_limit, |record| records.push(record))?;
+                let config = database_for_role(
+                    cli.environment,
+                    "TMDB_API_JOB_SUBMITTER_USER",
+                    "TMDB_API_JOB_SUBMITTER_PASSWORD",
+                )?;
                 let pool = connect_direct(&config, PoolPolicy::ReadWrite).await?;
                 let repository = JobRepository::new(pool);
                 for record in records {
@@ -199,6 +228,11 @@ async fn main() -> anyhow::Result<()> {
         Command::JobStatus { job_id } => {
             let job_id =
                 Uuid::parse_str(&job_id).map_err(|_| anyhow::anyhow!("invalid job UUID"))?;
+            let config = database_for_role(
+                cli.environment,
+                "TMDB_API_JOB_SUBMITTER_USER",
+                "TMDB_API_JOB_SUBMITTER_PASSWORD",
+            )?;
             let pool = connect_direct(&config, PoolPolicy::ReadOnly).await?;
             let job = JobRepository::new(pool).get(JobId::from(job_id)).await?;
             println!(
@@ -220,6 +254,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn database_for_role(
+    environment: Environment,
+    username_name: &str,
+    password_name: &str,
+) -> Result<DatabaseConfig, tmdb_config::ConfigError> {
+    load_database_for_role(&EnvSource, environment, username_name, password_name)
 }
 
 #[derive(Debug, Serialize)]

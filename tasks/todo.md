@@ -30,4 +30,4 @@
 - [x] Test worker restart and dependency recovery.
 - [x] Fix discovered defects and add regression tests.
 - [x] Run full verification matrix and collect final artifacts.
-- [x] Commit/push verified changes and document exact measured results.
+- [x] Document exact measured results and remaining limits; commit or push only after explicit user authorization.

@@ -211,7 +211,7 @@ pub struct TmdbAlternateTitle {
 pub struct TmdbExternalIds {
     #[serde(default)]
     pub imdb_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_numeric_identifier")]
     pub tvdb_id: Option<String>,
     #[serde(default)]
     pub wikidata_id: Option<String>,
@@ -221,6 +221,29 @@ pub struct TmdbExternalIds {
     pub instagram_id: Option<String>,
     #[serde(default)]
     pub twitter_id: Option<String>,
+}
+
+/// TMDB's TV endpoint returns `tvdb_id` as either a string, an integer, or
+/// `null`, depending on the source record. Preserve one stable string shape
+/// for the catalog while rejecting every other JSON type.
+fn deserialize_optional_numeric_identifier<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value)),
+        Some(serde_json::Value::Number(value)) => value
+            .as_u64()
+            .map(|identifier| Some(identifier.to_string()))
+            .ok_or_else(|| serde::de::Error::custom("identifier must be a non-negative integer")),
+        Some(_) => Err(serde::de::Error::custom(
+            "identifier must be a string, non-negative integer, or null",
+        )),
+    }
 }
 
 /// Wrapper returned by TMDB's `videos` append.

@@ -141,7 +141,7 @@ impl ReadinessProbe for ReadyProbe {
     async fn check(&self) -> Result<tmdb_db::ReadinessReport, tmdb_api::ProbeError> {
         Ok(tmdb_db::ReadinessReport {
             postgres_major: 18,
-            schema_revision: "0026".to_owned(),
+            schema_revision: "0027".to_owned(),
             extensions: vec![
                 "pg_stat_statements".to_owned(),
                 "pg_trgm".to_owned(),
@@ -406,6 +406,25 @@ async fn invalid_limits_and_media_route_anime_flags_are_problem_details()
             Some("application/problem+json")
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_method_errors_are_problem_details() -> Result<(), Box<dyn std::error::Error>> {
+    let store = FakeStore::default();
+    let response = app(&store)
+        .oneshot(Request::post("/movies").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/problem+json")
+    );
+    assert!(response.headers().contains_key("allow"));
     Ok(())
 }
 

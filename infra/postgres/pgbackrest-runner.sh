@@ -13,7 +13,7 @@ readonly POLL_SECONDS=15
 last_failure_step=""
 queue_unavailable_logged=false
 
-if [[ "$(id -u)" == 0 ]]; then
+if [[ "${BASH_SOURCE[0]}" == "$0" && "$(id -u)" == 0 ]]; then
     exec gosu postgres "$0" "$@"
 fi
 
@@ -113,6 +113,15 @@ ensure_pgbackrest() {
     pgbackrest --stanza="$PGBACKREST_STANZA" --log-level-console=info check
 }
 
+has_full_backup() {
+    local backup_info
+
+    if ! backup_info="$(pgbackrest --stanza="$PGBACKREST_STANZA" --output=json info 2>/dev/null)"; then
+        return 1
+    fi
+    grep -Fq '"type":"full"' <<<"$backup_info"
+}
+
 queue_support_available() {
     local available
     if ! available="$(psql_tmdb -qAtc "
@@ -132,10 +141,19 @@ queue_support_available() {
 record_backup_heartbeat() {
     local state="$1"
 
+    case "$state" in
+        ready|degraded|failed)
+            ;;
+        *)
+            log "event=component_heartbeat_rejected component=backup reason=invalid_state"
+            return 64
+            ;;
+    esac
     psql_tmdb -qAt \
         --set=state="$state" \
-        -c "SELECT ops.record_component_heartbeat('backup', :'state')" \
-        >/dev/null
+        >/dev/null <<'SQL'
+SELECT ops.record_component_heartbeat('backup', :'state');
+SQL
 }
 
 claim_backup_job() {
@@ -171,16 +189,23 @@ RETURNING request.backup_type, request.request_source;
 SQL
 }
 
+refresh_job_heartbeat() {
+    local job_id="$1"
+
+    psql_tmdb -qAt \
+        --set=job_id="$job_id" \
+        --set=worker_id="$BACKUP_WORKER_ID" \
+        --set=lease_microseconds="$JOB_LEASE_MICROSECONDS" \
+        >/dev/null <<'SQL'
+SELECT ops.heartbeat_job(:'job_id'::uuid, :'worker_id', :'lease_microseconds'::bigint);
+SQL
+}
+
 heartbeat_loop() {
     local job_id="$1"
 
     while sleep 30; do
-        if ! psql_tmdb -qAt \
-            --set=job_id="$job_id" \
-            --set=worker_id="$BACKUP_WORKER_ID" \
-            --set=lease_microseconds="$JOB_LEASE_MICROSECONDS" \
-            -c "SELECT ops.heartbeat_job(:'job_id'::uuid, :'worker_id', :'lease_microseconds'::bigint)" \
-            >/dev/null 2>&1; then
+        if ! refresh_job_heartbeat "$job_id" 2>/dev/null; then
             log "event=job_heartbeat_failed job_id=$job_id"
         fi
     done
@@ -193,8 +218,15 @@ fail_unpaired_job() {
         --set=job_id="$job_id" \
         --set=worker_id="$BACKUP_WORKER_ID" \
         --set=retry_microseconds="$JOB_RETRY_MICROSECONDS" \
-        -c "SELECT disposition FROM ops.fail_job(:'job_id'::uuid, :'worker_id', 'invalid_payload', :'retry_microseconds'::bigint)" \
-        >/dev/null 2>&1 || true
+        >/dev/null 2>&1 <<'SQL' || true
+SELECT disposition
+FROM ops.fail_job(
+    :'job_id'::uuid,
+    :'worker_id',
+    'invalid_payload',
+    :'retry_microseconds'::bigint
+);
+SQL
 }
 
 complete_backup_request_and_job() {
@@ -237,12 +269,14 @@ fail_backup_request_and_job() {
         --set=worker_id="$BACKUP_WORKER_ID" \
         --set=retry_microseconds="$JOB_RETRY_MICROSECONDS" \
         --set=failure_step="$failure_step" \
-        -c "SELECT ops.fail_backup_request_and_job(
-        :'job_id'::uuid,
-        :'worker_id',
-        :'failure_step',
-        :'retry_microseconds'::bigint
-    )"
+        <<'SQL'
+SELECT ops.fail_backup_request_and_job(
+    :'job_id'::uuid,
+    :'worker_id',
+    :'failure_step',
+    :'retry_microseconds'::bigint
+);
+SQL
 }
 
 reconcile_terminal_backup_requests() {
@@ -366,7 +400,9 @@ submit_scheduled_backup() {
     psql_tmdb -qAt \
         --set=backup_type="$backup_type" \
         --set=scheduled_for="$local_date" \
-        -c "SELECT ops.submit_scheduled_backup(:'backup_type', :'scheduled_for'::date)::text"
+        <<'SQL'
+SELECT ops.submit_scheduled_backup(:'backup_type', :'scheduled_for'::date)::text;
+SQL
 }
 
 run_scheduled_backup() {
@@ -374,6 +410,10 @@ run_scheduled_backup() {
     local backup_type="$2"
     local job_id
 
+    if [[ "$backup_type" == diff ]] && ! has_full_backup; then
+        backup_type=full
+        log "event=scheduled_backup_upgraded reason=missing_full_backup date=$local_date"
+    fi
     if schedule_state_matches "$local_date" "$backup_type"; then
         return 0
     fi
@@ -423,32 +463,34 @@ scheduler() {
     done
 }
 
-case "${1:-}" in
-    ensure)
-        ensure_pgbackrest
-        ;;
-    backup)
-        [[ $# == 2 ]] || { usage; exit 64; }
-        run_backup "$2"
-        ;;
-    check)
-        pgbackrest --stanza="$PGBACKREST_STANZA" --log-level-console=info check
-        ;;
-    verify)
-        pgbackrest --stanza="$PGBACKREST_STANZA" --log-level-console=info verify
-        ;;
-    info)
-        pgbackrest --stanza="$PGBACKREST_STANZA" info
-        ;;
-    scheduler)
-        scheduler
-        ;;
-    schedule-type)
-        [[ $# == 2 ]] || { usage; exit 64; }
-        schedule_type_for_date "$2"
-        ;;
-    *)
-        usage
-        exit 64
-        ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "${1:-}" in
+        ensure)
+            ensure_pgbackrest
+            ;;
+        backup)
+            [[ $# == 2 ]] || { usage; exit 64; }
+            run_backup "$2"
+            ;;
+        check)
+            pgbackrest --stanza="$PGBACKREST_STANZA" --log-level-console=info check
+            ;;
+        verify)
+            pgbackrest --stanza="$PGBACKREST_STANZA" --log-level-console=info verify
+            ;;
+        info)
+            pgbackrest --stanza="$PGBACKREST_STANZA" info
+            ;;
+        scheduler)
+            scheduler
+            ;;
+        schedule-type)
+            [[ $# == 2 ]] || { usage; exit 64; }
+            schedule_type_for_date "$2"
+            ;;
+        *)
+            usage
+            exit 64
+            ;;
+    esac
+fi

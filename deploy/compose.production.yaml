@@ -108,7 +108,6 @@ services:
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SETPCAP]
-    init: true
     networks: [tmdb-private]
 
   media:
@@ -139,7 +138,6 @@ services:
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SETPCAP]
-    init: true
     healthcheck:
       test: [CMD, curl, --fail, --silent, http://127.0.0.1:8090/health/live]
       interval: 10s

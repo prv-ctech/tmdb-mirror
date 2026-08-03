@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, PgPool};
-use tmdb_config::{ConfigSource, EnvSource, Environment, load_shared_database};
+use tmdb_config::{ConfigSource, EnvSource, Environment, load_database_for_role};
 use tmdb_db::{PoolPolicy, connect_direct};
 use tmdb_jobs::{
     ClaimedJob, JobExecutionError, JobExecutor, JobRepository, NewJob, Worker, WorkerConfig,
@@ -77,10 +77,20 @@ pub async fn run() -> anyhow::Result<()> {
     prepare_media_storage()?;
     let source = EnvSource;
     let environment = load_environment(source)?;
-    let database = load_shared_database(&source, environment)?;
+    let database = load_database_for_role(
+        &source,
+        environment,
+        "TMDB_IMAGE_WRITER_USER",
+        "TMDB_IMAGE_WRITER_PASSWORD",
+    )?;
     let worker_config = load_worker_config(source, "tmdb-images")?;
     let worker_concurrency = load_image_worker_concurrency(source)?;
     let store = load_image_store()?;
+    store
+        .harden_private_masters()
+        .await
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("harden private image masters")?;
     let downloader = load_downloader(source)?;
     let allow_local_media = parse_or(source, "ALLOW_LOCAL_MEDIA", false)?;
     let trawl_fallback_configured =
@@ -119,7 +129,6 @@ pub async fn run() -> anyhow::Result<()> {
         }
         signal_cancellation.cancel();
     });
-    let heartbeat = spawn_component_heartbeat(pool.clone(), cancellation.clone());
     let media_cancellation = cancellation.clone();
     tracing::info!(event = "media_server_starting");
     let media_server = tokio::spawn(async move {
@@ -132,13 +141,13 @@ pub async fn run() -> anyhow::Result<()> {
     });
     if !wait_for_image_job_queue(&pool, &cancellation).await {
         cancellation.cancel();
-        let _ = heartbeat.await;
         if let Ok(Err(error)) = media_server.await {
             tracing::error!(event = "media_server_stopped", error = %error);
         }
         pool.close().await;
         return Ok(());
     }
+    let heartbeat = spawn_component_heartbeat(pool.clone(), cancellation.clone());
     let result = run_workers(workers, cancellation.clone()).await;
     cancellation.cancel();
     let _ = heartbeat.await;
@@ -222,12 +231,16 @@ async fn wait_for_image_job_queue(pool: &PgPool, cancellation: &CancellationToke
 }
 
 async fn image_job_queue_ready(pool: &PgPool) -> sqlx::Result<bool> {
-    sqlx::query_scalar(
-        "SELECT pg_catalog.to_regprocedure('ops.claim_job_for_types(text,bigint,text[])') IS NOT NULL",
-    )
-    .fetch_one(pool)
-    .await
+    sqlx::query_scalar(IMAGE_JOB_QUEUE_READY_SQL)
+        .fetch_one(pool)
+        .await
 }
+
+const IMAGE_JOB_QUEUE_READY_SQL: &str = concat!(
+    "SELECT pg_catalog.to_regprocedure('ops.claim_job_for_types(text,bigint,text[])') IS NOT NULL ",
+    "AND pg_catalog.to_regprocedure('ops.record_component_heartbeat(text,text)') IS NOT NULL ",
+    "AND pg_catalog.to_regclass('assets.image_variants') IS NOT NULL",
+);
 
 async fn run_workers<E>(
     workers: Vec<Worker<E>>,
@@ -1063,6 +1076,12 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn image_queue_readiness_sql_keeps_boolean_terms_separated() {
+        assert!(!IMAGE_JOB_QUEUE_READY_SQL.contains("NULLAND"));
+        assert_eq!(IMAGE_JOB_QUEUE_READY_SQL.matches(" AND ").count(), 2);
+    }
+
+    #[test]
     fn image_job_dispatch_validates_version_and_payload() -> Result<(), Box<dyn std::error::Error>>
     {
         let payload = ImageJobPayload::new(
@@ -1236,6 +1255,31 @@ mod tests {
         pool: PgPool,
     ) -> sqlx::Result<()> {
         assert!(!image_job_queue_ready(&pool).await?);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn image_worker_waits_for_the_current_media_schema(pool: PgPool) -> sqlx::Result<()> {
+        sqlx::query("CREATE SCHEMA ops").execute(&pool).await?;
+        sqlx::query(
+            "CREATE FUNCTION ops.claim_job_for_types(text, bigint, text[]) RETURNS boolean LANGUAGE sql AS $$ SELECT true $$",
+        )
+        .execute(&pool)
+        .await?;
+
+        assert!(!image_job_queue_ready(&pool).await?);
+
+        sqlx::query("CREATE SCHEMA assets").execute(&pool).await?;
+        sqlx::query("CREATE TABLE assets.image_variants (id bigint PRIMARY KEY)")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "CREATE FUNCTION ops.record_component_heartbeat(text, text) RETURNS void LANGUAGE plpgsql AS $$ BEGIN END $$",
+        )
+        .execute(&pool)
+        .await?;
+
+        assert!(image_job_queue_ready(&pool).await?);
         Ok(())
     }
 

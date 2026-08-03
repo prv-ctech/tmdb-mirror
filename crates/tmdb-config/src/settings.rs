@@ -4,7 +4,7 @@ use std::str::FromStr;
 use http::Uri;
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::secret::load_secret_with_origin;
+use crate::secret::{load_secret_for_environment, load_secret_with_origin};
 use crate::{ConfigError, ConfigSource, StorageRoots};
 
 /// Deployment environment controlling secret policy.
@@ -55,7 +55,7 @@ pub struct AppConfig {
     pub api_bind: SocketAddr,
     /// Administrative listener.
     pub admin_bind: SocketAddr,
-    /// One shared `PostgreSQL` identity used by all four containers.
+    /// Base `PostgreSQL` identity used for initialization and compatibility.
     pub database: DatabaseConfig,
     /// Pairwise-disjoint storage trees.
     pub storage_roots: StorageRoots,
@@ -128,11 +128,10 @@ fn optional_secret(
     Ok(Some(secret))
 }
 
-/// Loads one shared database identity for the API and both workers.
+/// Loads the base database identity used for initialization and compatibility.
 ///
 /// The four-container deployment always connects to the Compose service at
-/// `postgres:5432`. The standard `POSTGRES_*` values initialize `PostgreSQL`
-/// and are the only database settings consumed by the application.
+/// `postgres:5432`. The standard `POSTGRES_*` values initialize `PostgreSQL`.
 ///
 /// # Errors
 ///
@@ -157,6 +156,46 @@ pub fn load_shared_database(
         host: "postgres".to_owned(),
         port: 5432,
         database,
+        username,
+        password,
+    })
+}
+
+/// Loads one least-privilege database identity for an application role.
+///
+/// Role usernames are required. A role-specific password may be supplied by
+/// `password_name` or its `_FILE` companion; when it is omitted, the base
+/// `POSTGRES_PASSWORD` is retained for backwards-compatible deployments.
+/// The database host, name, and port remain fixed to the internal Compose
+/// service, just like [`load_shared_database`].
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] when the shared database settings or selected role
+/// identity is missing, invalid, or uses a forbidden example secret.
+pub fn load_database_for_role(
+    source: &impl ConfigSource,
+    environment: Environment,
+    username_name: &str,
+    password_name: &str,
+) -> Result<DatabaseConfig, ConfigError> {
+    let shared = load_shared_database(source, environment)?;
+    let username = required_string(source, username_name)?;
+    let password = if has_secret_source(source, password_name) {
+        load_secret_for_environment(source, password_name, environment)?
+    } else {
+        shared.password.clone()
+    };
+    if environment != Environment::Production && is_known_example(&password) {
+        return Err(ConfigError::ExampleSecretForbidden(
+            password_name.to_owned(),
+        ));
+    }
+
+    Ok(DatabaseConfig {
+        host: shared.host,
+        port: shared.port,
+        database: shared.database,
         username,
         password,
     })

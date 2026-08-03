@@ -1,10 +1,30 @@
+# Never send credentials, local state, or repository metadata to the Docker
+# daemon. Git ignores are not a substitute for this file because Docker sends
+# its own build context.
+.git/
+.gitignore
+.gitattributes
+secrets.txt
+.secrets.txt
+*.pem
+*.key
+
 # folders
 .venv/
 .vscode/
+.worktrees/
+data/
+.stress-runtime/
+.runtime/
+artifacts/
+coverage/
+exports/
+results/
 logs/
 
 # files
 .env
+.env.*
 gitignore
 docker-*.yml
 Dockerfile
@@ -12,4 +32,3 @@ log_rotator.conf
 uv.lock
 README.md
 target/
-.stress-runtime/

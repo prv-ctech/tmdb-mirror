@@ -16,6 +16,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io::Cursor;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1066,6 +1067,8 @@ pub enum StorageOperation {
     SyncDestinationFile,
     /// Atomically rename the temporary file into its final destination.
     PublishDestination,
+    /// Restrict a private original master to the media worker owner.
+    SetPrivatePermissions,
 }
 
 impl StorageOperation {
@@ -1084,6 +1087,7 @@ impl StorageOperation {
             Self::CopyToDestination => "copy_to_destination",
             Self::SyncDestinationFile => "sync_destination_file",
             Self::PublishDestination => "publish_destination",
+            Self::SetPrivatePermissions => "set_private_permissions",
         }
     }
 }
@@ -1219,7 +1223,7 @@ impl ImageStore {
                 let scratch =
                     scratch_dir.join(format!(".{}.{}.part", digest.as_hex(), Uuid::now_v7()));
                 let result = self
-                    .publish_inner(&scratch, &destination, &image.body, digest)
+                    .publish_inner(&scratch, &destination, &image.body, digest, false)
                     .await;
                 let _ = tokio::fs::remove_file(&scratch).await;
                 PublicPublication {
@@ -1251,10 +1255,16 @@ impl ImageStore {
                     digest.as_hex(),
                     Uuid::now_v7()
                 ));
-                let _ = self
-                    .publish_inner(&master_scratch, &master_destination, &image.body, digest)
-                    .await?;
+                self.publish_inner(
+                    &master_scratch,
+                    &master_destination,
+                    &image.body,
+                    digest,
+                    false,
+                )
+                .await?;
                 let _ = tokio::fs::remove_file(&master_scratch).await;
+                self.set_private_permissions(&master_destination).await?;
                 let mut primary = None;
                 let mut variants = Vec::with_capacity(derivatives.len());
                 for derivative in derivatives {
@@ -1273,7 +1283,13 @@ impl ImageStore {
                         Uuid::now_v7()
                     ));
                     let outcome = self
-                        .publish_inner(&scratch, &destination, &derivative.bytes, derivative_digest)
+                        .publish_inner(
+                            &scratch,
+                            &destination,
+                            &derivative.bytes,
+                            derivative_digest,
+                            true,
+                        )
                         .await;
                     let _ = tokio::fs::remove_file(&scratch).await;
                     let outcome = outcome?;
@@ -1333,6 +1349,7 @@ impl ImageStore {
         destination: &Path,
         body: &[u8],
         digest: ImageDigest,
+        replace_existing: bool,
     ) -> Result<PublishOutcome, StorageError> {
         let mut scratch_file = tokio::fs::OpenOptions::new()
             .write(true)
@@ -1350,21 +1367,22 @@ impl ImageStore {
             .map_err(|error| StorageError::io(StorageOperation::SyncScratchFile, error))?;
         drop(scratch_file);
 
-        if tokio::fs::try_exists(destination)
-            .await
-            .map_err(|error| StorageError::io(StorageOperation::CheckDestination, error))?
-        {
-            let metadata = tokio::fs::metadata(destination).await.map_err(|error| {
-                StorageError::io(StorageOperation::ReadDestinationMetadata, error)
-            })?;
-            if !metadata.is_file() {
-                return Err(StorageError::DestinationConflict);
+        match tokio::fs::symlink_metadata(destination).await {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    return Err(StorageError::DestinationConflict);
+                }
+                if file_matches_digest(destination, digest).await? {
+                    return Ok(PublishOutcome::AlreadyPresent);
+                }
+                if !replace_existing {
+                    return Err(StorageError::DestinationConflict);
+                }
             }
-            return if file_matches_digest(destination, digest).await? {
-                Ok(PublishOutcome::AlreadyPresent)
-            } else {
-                Err(StorageError::DestinationConflict)
-            };
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(StorageError::io(StorageOperation::CheckDestination, error));
+            }
         }
 
         let parent = destination.parent().ok_or(StorageError::InvalidRoot)?;
@@ -1389,30 +1407,37 @@ impl ImageStore {
                 .await
                 .map_err(|error| StorageError::io(StorageOperation::SyncDestinationFile, error))?;
             drop(temporary_file);
-            match tokio::fs::rename(&temporary, destination).await {
-                Ok(()) => Ok(PublishOutcome::Published),
-                Err(_error)
-                    if tokio::fs::try_exists(destination).await.map_err(|error| {
-                        StorageError::io(StorageOperation::CheckDestination, error)
-                    })? =>
-                {
-                    let metadata = tokio::fs::metadata(destination).await.map_err(|error| {
-                        StorageError::io(StorageOperation::ReadDestinationMetadata, error)
-                    })?;
-                    if metadata.is_file() {
+            if replace_existing {
+                tokio::fs::rename(&temporary, destination)
+                    .await
+                    .map(|()| PublishOutcome::Published)
+                    .map_err(|error| StorageError::io(StorageOperation::PublishDestination, error))
+            } else {
+                match tokio::fs::hard_link(&temporary, destination).await {
+                    Ok(()) => Ok(PublishOutcome::Published),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let metadata = tokio::fs::symlink_metadata(destination).await.map_err(
+                            |metadata_error| {
+                                StorageError::io(
+                                    StorageOperation::ReadDestinationMetadata,
+                                    metadata_error,
+                                )
+                            },
+                        )?;
+                        if !metadata.file_type().is_file() {
+                            return Err(StorageError::DestinationConflict);
+                        }
                         if file_matches_digest(destination, digest).await? {
                             Ok(PublishOutcome::AlreadyPresent)
                         } else {
                             Err(StorageError::DestinationConflict)
                         }
-                    } else {
-                        Err(StorageError::DestinationConflict)
                     }
+                    Err(error) => Err(StorageError::io(
+                        StorageOperation::PublishDestination,
+                        error,
+                    )),
                 }
-                Err(error) => Err(StorageError::io(
-                    StorageOperation::PublishDestination,
-                    error,
-                )),
             }
         }
         .await;
@@ -1420,6 +1445,49 @@ impl ImageStore {
             let _ = tokio::fs::remove_file(&temporary).await;
         }
         outcome
+    }
+    pub(crate) async fn harden_private_masters(&self) -> Result<(), StorageError> {
+        if self.layout != StorageLayout::Semantic {
+            return Ok(());
+        }
+        let mut directories = vec![self.image_root.join(".masters")];
+        while let Some(directory) = directories.pop() {
+            let mut entries = tokio::fs::read_dir(&directory).await.map_err(|error| {
+                StorageError::io(StorageOperation::SetPrivatePermissions, error)
+            })?;
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(|error| StorageError::io(StorageOperation::SetPrivatePermissions, error))?
+            {
+                let path = entry.path();
+                let metadata = tokio::fs::symlink_metadata(&path).await.map_err(|error| {
+                    StorageError::io(StorageOperation::SetPrivatePermissions, error)
+                })?;
+                if metadata.file_type().is_dir() {
+                    directories.push(path);
+                } else if metadata.file_type().is_file() {
+                    self.set_private_permissions(&path).await?;
+                } else {
+                    return Err(StorageError::DestinationConflict);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn set_private_permissions(&self, path: &Path) -> Result<(), StorageError> {
+        let metadata = tokio::fs::symlink_metadata(path)
+            .await
+            .map_err(|error| StorageError::io(StorageOperation::SetPrivatePermissions, error))?;
+        if !metadata.file_type().is_file() {
+            return Err(StorageError::DestinationConflict);
+        }
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o600);
+        tokio::fs::set_permissions(path, permissions)
+            .await
+            .map_err(|error| StorageError::io(StorageOperation::SetPrivatePermissions, error))
     }
 }
 
@@ -2519,10 +2587,72 @@ mod tests {
         assert_eq!(stored.metadata.storage_path, "anime/movie/123/cover.jpg");
         assert_eq!(stored.metadata.mime_type, "image/jpeg");
         assert!(images.path().join(&stored.metadata.storage_path).is_file());
+        let master_relative = master_path(&ImageDigest::of(PNG).as_hex())?;
+        let master = images.path().join(master_relative);
+        assert_eq!(
+            std::fs::metadata(&master)?.permissions().mode() & 0o777,
+            0o600
+        );
+        let mut public_permissions = std::fs::metadata(&master)?.permissions();
+        public_permissions.set_mode(0o644);
+        std::fs::set_permissions(&master, public_permissions)?;
+        store.harden_private_masters().await?;
+        assert_eq!(
+            std::fs::metadata(&master)?.permissions().mode() & 0o777,
+            0o600
+        );
         assert!(
             images.path().join(".masters/sha256/89/72").exists()
                 || images.path().join(".masters").exists()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn semantic_store_replaces_changed_public_derivatives_atomically()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let work = tempfile::tempdir()?;
+        let images = tempfile::tempdir()?;
+        let store = ImageStore::with_semantic_layout(work.path().join("work"), images.path())?;
+        let job = payload()?;
+        let first = DownloadedImage {
+            body: PNG.to_vec(),
+            mime_type: "image/png".to_owned(),
+            final_url: job.source_url()?,
+            source: ImageSource::Direct,
+            digest: ImageDigest::of(PNG),
+            width: 1,
+            height: 1,
+        };
+        let first_stored = store.publish(&job, &first).await?;
+
+        let mut second_body = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 1).write_to(&mut second_body, RasterFormat::Png)?;
+        let second_body = second_body.into_inner();
+        let second = DownloadedImage {
+            body: second_body.clone(),
+            mime_type: "image/png".to_owned(),
+            final_url: job.source_url()?,
+            source: ImageSource::Direct,
+            digest: ImageDigest::of(&second_body),
+            width: 2,
+            height: 1,
+        };
+        let second_stored = store.publish(&job, &second).await?;
+
+        assert!(!second_stored.deduplicated);
+        assert_eq!(
+            second_stored.metadata.storage_path,
+            first_stored.metadata.storage_path
+        );
+        assert_ne!(second_stored.metadata.sha256, first_stored.metadata.sha256);
+        let public_path = images.path().join(&second_stored.metadata.storage_path);
+        let public_bytes = tokio::fs::read(public_path).await?;
+        assert_eq!(
+            ImageDigest::of(&public_bytes).as_hex(),
+            second_stored.metadata.sha256
+        );
+        assert!(images.path().join(".masters").is_dir());
         Ok(())
     }
 

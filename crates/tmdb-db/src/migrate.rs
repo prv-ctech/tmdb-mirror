@@ -72,9 +72,56 @@ async fn migrate_while_locked(connection: &mut PgConnection) -> Result<Migration
         .run(&mut *connection)
         .await
         .map_err(|_| DbError::Migration)?;
+    repair_application_role_grants(connection).await?;
     let after = applied_count(connection).await?;
     let applied = after.checked_sub(before).ok_or(DbError::Migration)?;
     Ok(MigrationReport { applied })
+}
+
+/// Re-applies the role grants that are intentionally expressed as default
+/// privileges in the foundation migration. A few older databases were
+/// migrated by the configured owner instead of `migrator`; explicit repair
+/// keeps those databases least-privilege compatible while the next migration
+/// still runs under the correct role.
+async fn repair_application_role_grants(connection: &mut PgConnection) -> Result<(), DbError> {
+    const STATEMENTS: [&str; 15] = [
+        "GRANT USAGE ON SCHEMA catalog, search, assets, ops TO api_reader",
+        "GRANT SELECT ON ALL TABLES IN SCHEMA catalog, search, assets TO api_reader",
+        "GRANT USAGE ON SCHEMA catalog, source, search, ops TO ingest_writer",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA catalog, source TO ingest_writer",
+        "GRANT SELECT ON ALL TABLES IN SCHEMA search TO ingest_writer",
+        "REVOKE INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA search FROM ingest_writer",
+        "GRANT USAGE ON SCHEMA assets, ops TO image_writer",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA assets TO image_writer",
+        "GRANT EXECUTE ON FUNCTION ops.submit_job(uuid, text, integer, text, smallint, integer, timestamptz, text) TO image_writer",
+        "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA catalog, source, search TO ingest_writer",
+        "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA assets TO image_writer",
+        "ALTER DEFAULT PRIVILEGES FOR ROLE migrator IN SCHEMA catalog, search, assets GRANT SELECT ON TABLES TO api_reader",
+        "ALTER DEFAULT PRIVILEGES FOR ROLE migrator IN SCHEMA catalog, source, search GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ingest_writer",
+        "GRANT USAGE ON SCHEMA catalog, ops TO monitor",
+        "GRANT SELECT ON TABLE catalog.titles, ops.jobs, ops.job_events, ops.backup_requests, ops.component_heartbeats, ops.readiness TO monitor",
+    ];
+    for statement in STATEMENTS {
+        sqlx::query(statement)
+            .execute(&mut *connection)
+            .await
+            .map_err(|_| DbError::Migration)?;
+    }
+    sqlx::query(
+        "ALTER DEFAULT PRIVILEGES FOR ROLE migrator IN SCHEMA search
+         REVOKE INSERT, UPDATE, DELETE ON TABLES FROM ingest_writer",
+    )
+    .execute(&mut *connection)
+    .await
+    .map_err(|_| DbError::Migration)?;
+    sqlx::query(
+        "ALTER DEFAULT PRIVILEGES FOR ROLE migrator IN SCHEMA assets
+         GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO image_writer",
+    )
+    .execute(&mut *connection)
+    .await
+    .map_err(|_| DbError::Migration)?;
+    Ok(())
 }
 
 /// Repairs only the checksum of the published round-one 0003 migration.

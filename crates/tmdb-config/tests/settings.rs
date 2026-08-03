@@ -5,7 +5,8 @@ use std::path::Path;
 use secrecy::ExposeSecret;
 use tempfile::NamedTempFile;
 use tmdb_config::{
-    AppConfig, ConfigError, Environment, MapSource, StorageRoots, load_secret, load_shared_database,
+    AppConfig, ConfigError, Environment, MapSource, StorageRoots, load_database_for_role,
+    load_secret, load_shared_database,
 };
 
 const DATABASE_PASSWORD: &str = "unit-test-database-credential";
@@ -45,6 +46,44 @@ fn shared_database_entries(environment: &str) -> MapSource {
         ("POSTGRES_USER", "example_owner"),
         ("POSTGRES_PASSWORD", "shared-database-password"),
     ])
+}
+
+#[test]
+fn role_database_uses_the_selected_identity_and_supports_shared_password_fallback()
+-> Result<(), Box<dyn std::error::Error>> {
+    let role_source = MapSource::from([
+        ("TMDB_ENVIRONMENT", "test"),
+        ("POSTGRES_DB", "example_catalog"),
+        ("POSTGRES_USER", "database_owner"),
+        ("POSTGRES_PASSWORD", "owner-password"),
+        ("ROLE_USER", "api_reader"),
+        ("ROLE_PASSWORD", "reader-password"),
+    ]);
+    let role = load_database_for_role(
+        &role_source,
+        Environment::Test,
+        "ROLE_USER",
+        "ROLE_PASSWORD",
+    )?;
+    assert_eq!(role.username, "api_reader");
+    assert_eq!(role.password.expose_secret(), "reader-password");
+
+    let fallback_source = MapSource::from([
+        ("TMDB_ENVIRONMENT", "test"),
+        ("POSTGRES_DB", "example_catalog"),
+        ("POSTGRES_USER", "database_owner"),
+        ("POSTGRES_PASSWORD", "owner-password"),
+        ("ROLE_USER", "image_writer"),
+    ]);
+    let fallback = load_database_for_role(
+        &fallback_source,
+        Environment::Test,
+        "ROLE_USER",
+        "ROLE_PASSWORD",
+    )?;
+    assert_eq!(fallback.username, "image_writer");
+    assert_eq!(fallback.password.expose_secret(), "owner-password");
+    Ok(())
 }
 
 fn postgres_database_entries(environment: &str) -> Vec<(OsString, OsString)> {

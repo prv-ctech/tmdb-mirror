@@ -15,7 +15,10 @@ const ENDPOINTS = Object.freeze({
   }),
   search: Object.freeze({
     key: 'search',
-    path: '/search?q=Caf%C3%A9&limit=20',
+    // The broad accented-search case is covered by stress-http.sh. Keep the
+    // endpoint profile selective so its latency SLO measures normal ranking,
+    // rather than sorting every synthetic fixture row.
+    path: '/search?q=Caf%C3%A9%20One%20Piece&limit=20',
     sloMs: 150,
   }),
   filter: Object.freeze({

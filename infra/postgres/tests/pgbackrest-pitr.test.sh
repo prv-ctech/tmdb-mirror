@@ -7,6 +7,26 @@ set -Eeuo pipefail
 # Docker resources and always removes them.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+if [[ -n "${TMDB_DOCKER_BIN:-}" ]]; then
+    docker_bin="$TMDB_DOCKER_BIN"
+elif command -v docker.exe >/dev/null 2>&1; then
+    docker_bin="$(command -v docker.exe)"
+else
+    docker_bin="$(command -v docker)"
+fi
+
+docker() {
+    "$docker_bin" "$@"
+}
+
+docker_path() {
+    if [[ "$docker_bin" == *.exe ]] && command -v wslpath >/dev/null 2>&1; then
+        wslpath -w "$1" | tr '\\' '/'
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
 image_tag="tmdb-mirror-postgres-pitr-test:${RANDOM}${RANDOM}"
 container_name="tmdb-mirror-pitr-test-${RANDOM}${RANDOM}"
 restore_container_name="${container_name}-restore"
@@ -29,9 +49,9 @@ fail_with_container_logs() {
 trap cleanup EXIT
 
 docker build \
-    --file "$repo_root/infra/postgres/Dockerfile" \
+    --file "$(docker_path "$repo_root/infra/postgres/Dockerfile")" \
     --tag "$image_tag" \
-    "$repo_root/infra/postgres"
+    "$(docker_path "$repo_root/infra/postgres")"
 
 docker volume create "$data_volume" >/dev/null
 docker volume create "$restore_data_volume" >/dev/null

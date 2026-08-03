@@ -1,8 +1,8 @@
 # Disposable four-container stress environment. Runtime settings are written
-# once to the ignored compose.env file by stress-bootstrap.ps1.
+# once to the ignored compose.env file by scripts/stress-bootstrap.sh.
 services:
   postgres:
-    image: postgres:18-bookworm@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296
+    image: ${TMDB_STRESS_POSTGRES_IMAGE:-tmdb-stress-postgres:local}
     restart: unless-stopped
     env_file: ["${TMDB_STRESS_ENV_FILE:?TMDB_STRESS_ENV_FILE must be set}"]
     shm_size: 1gb
@@ -14,6 +14,14 @@ services:
       - track_io_timing=on
       - -c
       - timezone=UTC
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=pgbackrest --stanza=tmdb archive-push %p
+      - -c
+      - archive_timeout=300s
       - -c
       - max_connections=${TMDB_STRESS_PG_MAX_CONNECTIONS:-120}
       - -c
@@ -38,7 +46,8 @@ services:
       - 127.0.0.1:${TMDB_STRESS_PG_PORT:-55433}:5432
     volumes:
       - tmdb_stress_pg18_data:/var/lib/postgresql
-      - ../infra/postgres/initdb:/docker-entrypoint-initdb.d:ro
+      - tmdb_stress_config:/config
+      - ../infra/postgres/initdb/10-bootstrap.sh:/docker-entrypoint-initdb.d/10-bootstrap.sh:ro
     healthcheck:
       test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -h 127.0.0.1 -t 1']
       interval: 2s
@@ -86,7 +95,6 @@ services:
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SETPCAP]
-    init: true
     networks: [tmdb-private]
 
   media:
@@ -112,7 +120,6 @@ services:
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SETPCAP]
-    init: true
     healthcheck:
       test: [CMD, curl, --fail, --silent, http://127.0.0.1:8090/health/live]
       interval: 3s

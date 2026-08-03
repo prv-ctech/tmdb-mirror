@@ -8,7 +8,7 @@ x-app-common: &app-common
   image: __TMDB_MIRROR_APP_IMAGE__
   restart: unless-stopped
   env_file:
-    - ./.env
+    - ${TMDB_ENV_FILE:-./.env}
   read_only: true
   tmpfs:
     - /tmp
@@ -23,7 +23,7 @@ services:
     image: __TMDB_MIRROR_POSTGRES_IMAGE__
     restart: unless-stopped
     env_file:
-      - ./.env
+      - ${TMDB_ENV_FILE:-./.env}
     shm_size: 2gb
     command:
       - postgres
@@ -90,6 +90,7 @@ services:
 
   worker:
     <<: *app-common
+    init: false
     entrypoint: [/usr/local/bin/tmdb-runtime, worker]
     user: "0:0"
     depends_on:
@@ -109,6 +110,7 @@ services:
 
   media:
     <<: *app-common
+    init: false
     entrypoint: [/usr/local/bin/tmdb-runtime, media]
     user: "0:0"
     depends_on:

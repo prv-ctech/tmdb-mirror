@@ -51,4 +51,4 @@ Build and run a reproducible, isolated stress-testing environment for the Rust T
 ### Phase 6 — final verification and handoff
 
 - Repeat formatting, unit/integration tests, strict clippy, image builds, Compose config validation, and the stress smoke/load suite.
-- Commit intentional changes on `main`, push only verified commits, and report the measured results and any work that remains outside the tested scope.
+- Hand off intentional changes and report the measured results and any work that remains outside the tested scope. Commit or push only after explicit user authorization.

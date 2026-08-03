@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 /secrets.txt
+/.secrets.txt
 
 # Runtime data, exports, logs, and local databases
 .stress-runtime/

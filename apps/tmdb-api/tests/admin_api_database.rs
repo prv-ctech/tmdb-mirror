@@ -33,7 +33,7 @@ async fn database_backed_admin_routes_are_durable_and_idempotent(
     assert_eq!(response.status(), StatusCode::OK);
     let status: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 32 * 1024).await?)?;
-    assert_eq!(status["data"]["build"]["schemaRevision"], "0026");
+    assert_eq!(status["data"]["build"]["schemaRevision"], "0027");
     assert_eq!(status["data"]["database"]["reachable"], true);
 
     let scan_request = || {

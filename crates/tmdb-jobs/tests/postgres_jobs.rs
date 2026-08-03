@@ -58,13 +58,13 @@ async fn jobs_migration_has_exact_readiness_indexes_and_hardened_functions(
         versions,
         [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26
+            25, 26, 27
         ]
     );
     let revision: String = sqlx::query_scalar("SELECT schema_revision FROM ops.readiness")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(revision, "0026");
+    assert_eq!(revision, "0027");
 
     let indexes: Vec<(String, String)> = sqlx::query_as(
         "SELECT indexname, indexdef
@@ -197,6 +197,7 @@ async fn jobs_migration_has_exact_readiness_indexes_and_hardened_functions(
             ("image_writer".to_owned(), "dead_letter_job".to_owned()),
             ("image_writer".to_owned(), "fail_job".to_owned()),
             ("image_writer".to_owned(), "heartbeat_job".to_owned()),
+            ("image_writer".to_owned(), "submit_job".to_owned()),
             ("ingest_writer".to_owned(), "claim_job".to_owned()),
             ("ingest_writer".to_owned(), "complete_job".to_owned()),
             ("ingest_writer".to_owned(), "dead_letter_job".to_owned()),

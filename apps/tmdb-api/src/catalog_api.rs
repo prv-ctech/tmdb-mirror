@@ -693,6 +693,7 @@ fn build_catalog_routes(state: CatalogApiState) -> Router {
             get(tv_episode),
         )
         .layer(Extension(state))
+        .method_not_allowed_fallback(problem::method_not_allowed)
 }
 
 #[allow(

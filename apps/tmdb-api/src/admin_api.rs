@@ -353,9 +353,9 @@ pub trait AdminApiStore: Send + Sync + 'static {
 
 /// PostgreSQL-backed implementation of the private administrative boundary.
 ///
-/// It has one bounded read pool for summaries and one bounded write pool for
-/// durable operations. The pool identities come from the same configurable
-/// `POSTGRES_*` values as every other application process.
+/// It has one bounded monitor pool for summaries and one bounded submitter
+/// pool for durable operations. Public catalog reads use a separate API-reader
+/// pool owned by the parent application.
 #[derive(Clone, Debug)]
 pub struct DatabaseAdminStore {
     read_pool: PgPool,
@@ -381,9 +381,8 @@ impl AdminApiStore for DatabaseAdminStore {
     async fn status(&self) -> Result<AdminStatus, AdminApiError> {
         let status: StatusRow = sqlx::query_as(
             "SELECT
-                (SELECT value ->> 'revision'
-                   FROM ops.service_metadata
-                  WHERE key = 'schema') AS schema_revision,
+                (SELECT schema_revision
+                   FROM ops.readiness) AS schema_revision,
                 pg_catalog.pg_database_size(pg_catalog.current_database())::bigint AS size_bytes,
                 (SELECT pg_catalog.count(*)
                    FROM pg_catalog.pg_stat_activity
@@ -1339,7 +1338,7 @@ fn parse_job_list(raw_query: Option<&str>) -> Result<AdminJobListRequest, AdminA
                 seen_status = true;
                 request.status = Some(parse_status(&value)?);
             }
-            "type" if !seen_type => {
+            "jobType" if !seen_type => {
                 seen_type = true;
                 if value.is_empty()
                     || value.len() > MAX_JOB_TYPE_CHARS
@@ -1425,5 +1424,18 @@ mod tests {
         ] {
             assert!(parse_status(status).is_ok(), "{status}");
         }
+    }
+
+    #[test]
+    fn job_list_parser_accepts_the_documented_job_type_parameter() {
+        assert!(matches!(
+            parse_job_list(Some("limit=10&status=succeeded&jobType=admin.analyze")),
+            Ok(AdminJobListRequest {
+                limit: 10,
+                cursor: None,
+                status: Some(JobStatus::Succeeded),
+                job_type: Some(job_type),
+            }) if job_type == "admin.analyze"
+        ));
     }
 }

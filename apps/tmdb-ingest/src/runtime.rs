@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use chrono::{DateTime, Days, NaiveDate, Utc};
 use tmdb_config::{
-    ConfigSource, EnvSource, Environment, load_secret_for_environment, load_shared_database,
+    ConfigSource, EnvSource, Environment, load_database_for_role, load_secret_for_environment,
 };
 use tmdb_db::{PoolPolicy, connect_direct, migrate};
 use tmdb_jobs::{JobRepository, NewJob, Worker, WorkerConfig, WorkerId};
@@ -34,7 +34,12 @@ pub async fn run() -> anyhow::Result<()> {
     prepare_worker_storage()?;
     let source = EnvSource;
     let environment = load_environment(source)?;
-    let database = load_shared_database(&source, environment)?;
+    let database = load_database_for_role(
+        &source,
+        environment,
+        "TMDB_INGEST_WRITER_USER",
+        "TMDB_INGEST_WRITER_PASSWORD",
+    )?;
     let tmdb_client = load_tmdb_client(source, environment)?;
     let export_root = std::path::PathBuf::from(RAW_ROOT);
     let export_max_bytes = parse_or(
@@ -89,7 +94,12 @@ pub async fn run_worker() -> anyhow::Result<()> {
     prepare_worker_storage()?;
     let source = EnvSource;
     let environment = load_environment(source)?;
-    let migrator = load_shared_database(&source, environment)?;
+    let migrator = load_database_for_role(
+        &source,
+        environment,
+        "TMDB_MIGRATOR_USER",
+        "TMDB_MIGRATOR_PASSWORD",
+    )?;
     let migration_pool = connect_direct(&migrator, PoolPolicy::Migrator)
         .await
         .map_err(|error| anyhow::anyhow!(error))
@@ -102,7 +112,12 @@ pub async fn run_worker() -> anyhow::Result<()> {
     tracing::info!(event = "database_migration_complete");
     migration_pool.close().await;
 
-    let database = load_shared_database(&source, environment)?;
+    let database = load_database_for_role(
+        &source,
+        environment,
+        "TMDB_INGEST_WRITER_USER",
+        "TMDB_INGEST_WRITER_PASSWORD",
+    )?;
     let tmdb_client = load_tmdb_client(source, environment)?;
     let export_max_bytes = parse_or(
         source,

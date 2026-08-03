@@ -139,6 +139,19 @@ async fn television_keyword_results_are_unwrapped() {
 }
 
 #[tokio::test]
+async fn television_numeric_tvdb_id_is_normalized() {
+    let (base_url, _state, task) = mock_server(vec![MockResponse {
+        status: StatusCode::OK,
+        body: r#"{"id":42,"name":"One Piece","external_ids":{"tvdb_id":309164}}"#,
+        retry_after: None,
+    }])
+    .await;
+    let tv = client(&base_url).fetch_tv(42).await.expect("tv JSON");
+    assert_eq!(tv.external_ids.tvdb_id.as_deref(), Some("309164"));
+    task.abort();
+}
+
+#[tokio::test]
 async fn retry_after_is_honored_before_success() {
     let (base_url, state, task) = mock_server(vec![
         MockResponse {
