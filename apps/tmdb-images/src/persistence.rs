@@ -293,8 +293,10 @@ fn safe_storage_path(value: &str) -> bool {
             .components()
             .all(|component| match component {
                 Component::Normal(value) => !value.to_string_lossy().starts_with('.'),
-                Component::CurDir | Component::ParentDir => false,
-                Component::RootDir | Component::Prefix(_) => false,
+                Component::CurDir
+                | Component::ParentDir
+                | Component::RootDir
+                | Component::Prefix(_) => false,
             })
 }
 

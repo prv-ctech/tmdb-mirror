@@ -199,8 +199,8 @@ The first detail image is gallery index 1. Additional posters are
 `poster-02`, `poster-03`, and so on; backdrops start at `backdrop-01`; season
 zero uses `season-specials-poster`. Episode stills are optimized-only
 thumbnails. Originals are stored outside `optimized/`; optimized files use
-JPEG quality 85 with maximum widths 640 for posters/seasons/thumbnails, 1280
-for backdrops, 320 for profiles, and transparent PNG width 500 for logos.
+JPEG quality 85 with maximum widths 640 for posters/seasons/thumbnails/profiles,
+1280 for backdrops, and transparent PNG width 500 for logos.
 No WebP derivative, `full` variant, video file, or `.masters` directory exists.
 
 With `ALLOW_LOCAL_MEDIA=true`, `url` uses `TMDB_MEDIA_BASE_URL` and points to a
@@ -246,6 +246,10 @@ changing the payload returns `409 Conflict`.
 | `GET` | `/admin/v1/jobs?limit=50&cursor=...&status=...&jobType=...` | Bounded durable job list; status is `queued`, `running`, `retry_wait`, `succeeded`, `dead_letter`, or `cancelled` |
 | `GET` | `/admin/v1/jobs/{job_id}` | One job and immutable audit events |
 | `POST` | `/admin/v1/scans` | Queue `full`, `missing`, or `changes` scan for one or both media types |
+| `POST` | `/admin/v1/media/scans` | Queue a durable `full`, `missing`, or `audit` media scan |
+| `GET` | `/admin/v1/media/scans/{run_id}` | Read media-scan phase, counters, and linked jobs |
+| `GET` | `/admin/v1/media/worker` | Read persistent media-worker state |
+| `POST` | `/admin/v1/media/worker` | `start`, `pause`, `resume`, or `cancel` media claims |
 | `POST` | `/admin/v1/jobs/{job_id}/cancel` | Request cancellation of an eligible job |
 | `POST` | `/admin/v1/jobs/{job_id}/retry` | Queue an auditable retry without rewriting history |
 | `POST` | `/admin/v1/media/audits` | Verify media metadata/files; `repair` only queues replacements |
@@ -285,6 +289,18 @@ curl -sS -X POST "$admin_base/admin/v1/media/audits" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: media-audit-20260803' \
   -d '{"repair":true}'
+
+curl -sS -X POST "$admin_base/admin/v1/media/scans" \
+  -H "X-API-Key: $admin_key" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: media-scan-audit-20260803' \
+  -d '{"mode":"audit","repair":true}'
+
+curl -sS -X POST "$admin_base/admin/v1/media/worker" \
+  -H "X-API-Key: $admin_key" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: media-worker-pause-20260803' \
+  -d '{"action":"pause"}'
 
 curl -sS -X POST "$admin_base/admin/v1/backups" \
   -H "X-API-Key: $admin_key" \

@@ -33,7 +33,7 @@ async fn database_backed_admin_routes_are_durable_and_idempotent(
     assert_eq!(response.status(), StatusCode::OK);
     let status: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 32 * 1024).await?)?;
-    assert_eq!(status["data"]["build"]["schemaRevision"], "0028");
+    assert_eq!(status["data"]["build"]["schemaRevision"], "0029");
     assert_eq!(status["data"]["database"]["reachable"], true);
 
     let scan_request = || {
@@ -134,6 +134,95 @@ async fn database_backed_admin_routes_are_durable_and_idempotent(
         assert_eq!(response.status(), StatusCode::ACCEPTED, "{path}");
     }
 
+    let media_scan_request = || {
+        Request::post("/admin/v1/media/scans")
+            .header("x-api-key", ADMIN_KEY)
+            .header("idempotency-key", "database-media-scan-1")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"mode":"audit","repair":true}"#))
+    };
+    let response = app.clone().oneshot(media_scan_request()?).await?;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let media_scan: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 4 * 1024).await?)?;
+    let run_id = media_scan["data"]["runId"]
+        .as_str()
+        .ok_or("missing durable media scan run ID")?
+        .to_owned();
+    assert_eq!(media_scan["data"]["duplicate"], false);
+
+    let response = app.clone().oneshot(media_scan_request()?).await?;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let duplicate: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 4 * 1024).await?)?;
+    assert_eq!(duplicate["data"]["runId"], run_id);
+    assert_eq!(duplicate["data"]["duplicate"], true);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/admin/v1/media/scans")
+                .header("x-api-key", ADMIN_KEY)
+                .header("idempotency-key", "database-media-scan-invalid")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"mode":"full","repair":true}"#))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/admin/v1/media/scans/{run_id}"))
+                .header("x-api-key", ADMIN_KEY)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let media_status: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 16 * 1024).await?)?;
+    assert_eq!(media_status["data"]["mode"], "audit");
+    assert_eq!(media_status["data"]["status"], "queued");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/admin/v1/media/worker")
+                .header("x-api-key", ADMIN_KEY)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let worker: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 4 * 1024).await?)?;
+    assert_eq!(worker["data"]["state"], "running");
+
+    let worker_request = |action: &'static str, key: &'static str| {
+        Request::post("/admin/v1/media/worker")
+            .header("x-api-key", ADMIN_KEY)
+            .header("idempotency-key", key)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(r#"{{"action":"{action}"}}"#)))
+    };
+    let response = app
+        .clone()
+        .oneshot(worker_request("pause", "database-media-pause-1")?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(worker_request("resume", "database-media-resume-1")?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(worker_request("cancel", "database-media-cancel-1")?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let stopped: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 4 * 1024).await?)?;
+    assert_eq!(stopped["data"]["state"], "stopped");
+
     let response = app
         .clone()
         .oneshot(
@@ -163,6 +252,6 @@ async fn database_backed_admin_routes_are_durable_and_idempotent(
     )
     .fetch_one(&pool)
     .await?;
-    assert_eq!(durable_counts, (6, 1));
+    assert_eq!(durable_counts, (7, 1));
     Ok(())
 }

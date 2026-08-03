@@ -1597,6 +1597,11 @@ impl CatalogRepository {
     }
 
     /// Lists image metadata owned by one TV season.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::InvalidInput`] for an invalid TV or season key,
+    /// or [`CatalogError::Query`] when `PostgreSQL` rejects the read.
     pub async fn list_season_images(
         &self,
         key: TitleKey,
@@ -1625,6 +1630,11 @@ impl CatalogRepository {
     }
 
     /// Lists image metadata owned by one TV episode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::InvalidInput`] for an invalid TV, season, or episode key,
+    /// or [`CatalogError::Query`] when `PostgreSQL` rejects the read.
     pub async fn list_episode_images(
         &self,
         key: TitleKey,

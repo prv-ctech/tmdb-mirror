@@ -2147,7 +2147,7 @@ async fn list_dimension(
                     .into_iter()
                     .map(|item| {
                         collection_response(
-                            item,
+                            &item,
                             state.allow_local_media,
                             state.media_base_url.as_deref(),
                         )
@@ -2546,6 +2546,10 @@ async fn scoped_season_images(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Axum supplies the route, query, scope, and request extensions separately"
+)]
 async fn scoped_episode_images(
     state: CatalogApiState,
     raw_id: String,
@@ -3511,7 +3515,7 @@ fn network_response(
 }
 
 fn collection_response(
-    collection: tmdb_db::CatalogCollection,
+    collection: &tmdb_db::CatalogCollection,
     allow_local_media: bool,
     media_base_url: Option<&str>,
 ) -> Value {

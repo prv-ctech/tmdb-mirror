@@ -320,6 +320,78 @@ pub struct AdminSubmission {
     pub duplicate: bool,
 }
 
+/// Durable media-scan mode.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminMediaScanMode {
+    Full,
+    Missing,
+    Audit,
+}
+
+/// Media-worker control action.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminMediaWorkerAction {
+    Start,
+    Pause,
+    Resume,
+    Cancel,
+}
+
+/// Durable media-scan submission result.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminMediaScanSubmission {
+    pub run_id: Uuid,
+    pub job_id: JobId,
+    pub duplicate: bool,
+}
+
+/// One linked-job status group for a media scan.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminMediaScanJobSummary {
+    pub phase: String,
+    pub queued: i64,
+    pub running: i64,
+    pub retry_wait: i64,
+    pub succeeded: i64,
+    pub failed: i64,
+    pub cancelled: i64,
+}
+
+/// Durable media-scan status.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminMediaScanStatus {
+    pub run_id: Uuid,
+    pub job_id: JobId,
+    pub mode: AdminMediaScanMode,
+    pub repair: bool,
+    pub phase: String,
+    pub status: String,
+    pub requested_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub queued_count: i64,
+    pub completed_count: i64,
+    pub failed_count: i64,
+    pub audited_count: i64,
+    pub invalid_count: i64,
+    pub repair_queued_count: i64,
+    pub error_code: Option<String>,
+    pub linked_jobs: Vec<AdminMediaScanJobSummary>,
+}
+
+/// Persistent media-worker control state.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminMediaWorkerStatus {
+    pub state: String,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Object-safe private administrative storage boundary.
 #[async_trait]
 pub trait AdminApiStore: Send + Sync + 'static {
@@ -335,6 +407,28 @@ pub trait AdminApiStore: Send + Sync + 'static {
         idempotency_key: &str,
         request_id: &str,
     ) -> Result<AdminSubmission, AdminApiError>;
+
+    async fn start_media_scan(
+        &self,
+        mode: AdminMediaScanMode,
+        repair: bool,
+        idempotency_key: &str,
+        request_id: &str,
+    ) -> Result<AdminMediaScanSubmission, AdminApiError>;
+
+    async fn get_media_scan(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Option<AdminMediaScanStatus>, AdminApiError>;
+
+    async fn set_media_worker(
+        &self,
+        action: AdminMediaWorkerAction,
+        idempotency_key: &str,
+        request_id: &str,
+    ) -> Result<AdminMediaWorkerStatus, AdminApiError>;
+
+    async fn media_worker(&self) -> Result<AdminMediaWorkerStatus, AdminApiError>;
 
     async fn cancel(
         &self,
@@ -612,6 +706,111 @@ impl AdminApiStore for DatabaseAdminStore {
         Ok(submission.into_model())
     }
 
+    async fn start_media_scan(
+        &self,
+        mode: AdminMediaScanMode,
+        repair: bool,
+        idempotency_key: &str,
+        request_id: &str,
+    ) -> Result<AdminMediaScanSubmission, AdminApiError> {
+        let request_id = parse_request_id(request_id)?;
+        let payload = serde_json::to_string(&json!({
+            "mode": mode,
+            "repair": repair,
+        }))
+        .map_err(|_| AdminApiError::Unavailable)?;
+        let submission: MediaScanSubmissionRow = sqlx::query_as(
+            "SELECT job_id, run_id, was_duplicate
+               FROM ops.submit_media_scan($1, $2, $3, $4)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(payload)
+        .bind(idempotency_key)
+        .bind(request_id)
+        .fetch_one(&self.write_pool)
+        .await
+        .map_err(|error| map_database_error(&error))?;
+        Ok(submission.into_model())
+    }
+
+    async fn get_media_scan(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Option<AdminMediaScanStatus>, AdminApiError> {
+        let Some(run) = sqlx::query_as::<_, MediaScanRunRow>(
+            "SELECT id, job_id, mode, repair, phase, status, requested_at, started_at,
+                    finished_at, queued_count, completed_count, failed_count, audited_count,
+                    invalid_count, repair_queued_count, error_code
+               FROM ops.media_scan_runs
+              WHERE id = $1",
+        )
+        .bind(run_id)
+        .fetch_optional(&self.read_pool)
+        .await
+        .map_err(|error| map_database_error(&error))?
+        else {
+            return Ok(None);
+        };
+        let linked_jobs = sqlx::query_as::<_, MediaScanJobSummaryRow>(
+            "SELECT link.phase,
+                    count(*) FILTER (WHERE job.status = 'queued')::bigint AS queued,
+                    count(*) FILTER (WHERE job.status = 'running')::bigint AS running,
+                    count(*) FILTER (WHERE job.status = 'retry_wait')::bigint AS retry_wait,
+                    count(*) FILTER (WHERE job.status = 'succeeded')::bigint AS succeeded,
+                    count(*) FILTER (WHERE job.status = 'dead_letter')::bigint AS failed,
+                    count(*) FILTER (WHERE job.status = 'cancelled')::bigint AS cancelled
+               FROM ops.media_scan_job_links AS link
+               JOIN ops.jobs AS job ON job.id = link.job_id
+              WHERE link.run_id = $1
+              GROUP BY link.phase
+              ORDER BY link.phase",
+        )
+        .bind(run_id)
+        .fetch_all(&self.read_pool)
+        .await
+        .map_err(|error| map_database_error(&error))?
+        .into_iter()
+        .map(MediaScanJobSummaryRow::into_model)
+        .collect();
+        Ok(Some(run.into_model(linked_jobs)?))
+    }
+
+    async fn set_media_worker(
+        &self,
+        action: AdminMediaWorkerAction,
+        idempotency_key: &str,
+        request_id: &str,
+    ) -> Result<AdminMediaWorkerStatus, AdminApiError> {
+        let request_id = parse_request_id(request_id)?;
+        let row: MediaWorkerStateRow = sqlx::query_as(
+            "SELECT state
+               FROM ops.set_media_worker_state($1, $2, $3)",
+        )
+        .bind(media_worker_action_name(action))
+        .bind(idempotency_key)
+        .bind(request_id)
+        .fetch_one(&self.write_pool)
+        .await
+        .map_err(|error| map_database_error(&error))?;
+        self.media_worker().await.map(|mut status| {
+            status.state = row.state;
+            status
+        })
+    }
+
+    async fn media_worker(&self) -> Result<AdminMediaWorkerStatus, AdminApiError> {
+        sqlx::query_as::<_, MediaWorkerStatusRow>(
+            "SELECT state, updated_at
+               FROM ops.media_worker_control
+              WHERE singleton",
+        )
+        .fetch_optional(&self.read_pool)
+        .await
+        .map_err(|error| map_database_error(&error))?
+        .map(MediaWorkerStatusRow::into_model)
+        .ok_or(AdminApiError::Unavailable)
+    }
+
     async fn cancel(
         &self,
         job_id: JobId,
@@ -772,6 +971,115 @@ impl SubmissionRow {
     }
 }
 
+#[derive(FromRow)]
+struct MediaScanSubmissionRow {
+    job_id: Uuid,
+    run_id: Uuid,
+    was_duplicate: bool,
+}
+
+impl MediaScanSubmissionRow {
+    fn into_model(self) -> AdminMediaScanSubmission {
+        AdminMediaScanSubmission {
+            run_id: self.run_id,
+            job_id: JobId::from(self.job_id),
+            duplicate: self.was_duplicate,
+        }
+    }
+}
+
+#[derive(FromRow)]
+struct MediaScanRunRow {
+    id: Uuid,
+    job_id: Uuid,
+    mode: String,
+    repair: bool,
+    phase: String,
+    status: String,
+    requested_at: DateTime<Utc>,
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+    queued_count: i64,
+    completed_count: i64,
+    failed_count: i64,
+    audited_count: i64,
+    invalid_count: i64,
+    repair_queued_count: i64,
+    error_code: Option<String>,
+}
+
+impl MediaScanRunRow {
+    fn into_model(
+        self,
+        linked_jobs: Vec<AdminMediaScanJobSummary>,
+    ) -> Result<AdminMediaScanStatus, AdminApiError> {
+        Ok(AdminMediaScanStatus {
+            run_id: self.id,
+            job_id: JobId::from(self.job_id),
+            mode: parse_media_scan_mode(&self.mode)?,
+            repair: self.repair,
+            phase: self.phase,
+            status: self.status,
+            requested_at: self.requested_at,
+            started_at: self.started_at,
+            finished_at: self.finished_at,
+            queued_count: self.queued_count,
+            completed_count: self.completed_count,
+            failed_count: self.failed_count,
+            audited_count: self.audited_count,
+            invalid_count: self.invalid_count,
+            repair_queued_count: self.repair_queued_count,
+            error_code: self.error_code,
+            linked_jobs,
+        })
+    }
+}
+
+#[derive(FromRow)]
+struct MediaScanJobSummaryRow {
+    phase: String,
+    queued: i64,
+    running: i64,
+    retry_wait: i64,
+    succeeded: i64,
+    failed: i64,
+    cancelled: i64,
+}
+
+impl MediaScanJobSummaryRow {
+    fn into_model(self) -> AdminMediaScanJobSummary {
+        AdminMediaScanJobSummary {
+            phase: self.phase,
+            queued: self.queued,
+            running: self.running,
+            retry_wait: self.retry_wait,
+            succeeded: self.succeeded,
+            failed: self.failed,
+            cancelled: self.cancelled,
+        }
+    }
+}
+
+#[derive(FromRow)]
+struct MediaWorkerStateRow {
+    state: String,
+}
+
+#[derive(FromRow)]
+struct MediaWorkerStatusRow {
+    state: String,
+    updated_at: DateTime<Utc>,
+}
+
+impl MediaWorkerStatusRow {
+    fn into_model(self) -> AdminMediaWorkerStatus {
+        AdminMediaWorkerStatus {
+            state: self.state,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
 fn operation_payload(operation: AdminOperation) -> (&'static str, serde_json::Value) {
     match operation {
         AdminOperation::Scan { mode, media_types } => (
@@ -791,6 +1099,24 @@ fn operation_payload(operation: AdminOperation) -> (&'static str, serde_json::Va
 
 fn parse_request_id(request_id: &str) -> Result<Uuid, AdminApiError> {
     Uuid::parse_str(request_id).map_err(|_| AdminApiError::Unavailable)
+}
+
+fn parse_media_scan_mode(value: &str) -> Result<AdminMediaScanMode, AdminApiError> {
+    match value {
+        "full" => Ok(AdminMediaScanMode::Full),
+        "missing" => Ok(AdminMediaScanMode::Missing),
+        "audit" => Ok(AdminMediaScanMode::Audit),
+        _ => Err(AdminApiError::Unavailable),
+    }
+}
+
+const fn media_worker_action_name(action: AdminMediaWorkerAction) -> &'static str {
+    match action {
+        AdminMediaWorkerAction::Start => "start",
+        AdminMediaWorkerAction::Pause => "pause",
+        AdminMediaWorkerAction::Resume => "resume",
+        AdminMediaWorkerAction::Cancel => "cancel",
+    }
 }
 
 fn parse_job_status(value: &str) -> Result<JobStatus, AdminApiError> {
@@ -838,6 +1164,12 @@ pub(crate) fn register_routes(router: Router<AdminState>) -> Router<AdminState> 
         .route("/admin/v1/jobs", get(list_jobs))
         .route("/admin/v1/jobs/{job_id}", get(get_job))
         .route("/admin/v1/scans", post(start_scan))
+        .route("/admin/v1/media/scans", post(start_media_scan))
+        .route("/admin/v1/media/scans/{run_id}", get(get_media_scan))
+        .route(
+            "/admin/v1/media/worker",
+            get(get_media_worker).post(set_media_worker),
+        )
         .route("/admin/v1/jobs/{job_id}/cancel", post(cancel_job))
         .route("/admin/v1/jobs/{job_id}/retry", post(retry_job))
         .route("/admin/v1/media/audits", post(start_media_audit))
@@ -892,6 +1224,33 @@ async fn openapi() -> Json<serde_json::Value> {
                     "responses": {"202": {"$ref": "#/components/responses/Accepted"}, "400": {"$ref": "#/components/responses/BadRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "409": {"$ref": "#/components/responses/IdempotencyConflict"}, "422": {"$ref": "#/components/responses/Rejected"}, "503": {"$ref": "#/components/responses/Unavailable"}}
                 }
             },
+            "/admin/v1/media/scans": {
+                "post": {
+                    "summary": "Queue a durable full, missing, or audit media scan",
+                    "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}],
+                    "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MediaScanRequest"}}}},
+                    "responses": {"202": {"$ref": "#/components/responses/Accepted"}, "400": {"$ref": "#/components/responses/BadRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "409": {"$ref": "#/components/responses/IdempotencyConflict"}, "422": {"$ref": "#/components/responses/Rejected"}, "503": {"$ref": "#/components/responses/Unavailable"}}
+                }
+            },
+            "/admin/v1/media/scans/{run_id}": {
+                "get": {
+                    "summary": "Read one durable media-scan run",
+                    "parameters": [{"$ref": "#/components/parameters/RunId"}],
+                    "responses": {"200": {"description": "Media-scan phase, counters, and linked jobs"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/NotFound"}, "503": {"$ref": "#/components/responses/Unavailable"}}
+                }
+            },
+            "/admin/v1/media/worker": {
+                "get": {
+                    "summary": "Read persistent media-worker control state",
+                    "responses": {"200": {"description": "Running, paused, or stopped"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "503": {"$ref": "#/components/responses/Unavailable"}}
+                },
+                "post": {
+                    "summary": "Start, pause, resume, or cancel media work",
+                    "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}],
+                    "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MediaWorkerRequest"}}}},
+                    "responses": {"200": {"description": "Updated persistent worker state"}, "400": {"$ref": "#/components/responses/BadRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "409": {"$ref": "#/components/responses/IdempotencyConflict"}, "422": {"$ref": "#/components/responses/Rejected"}, "503": {"$ref": "#/components/responses/Unavailable"}}
+                }
+            },
             "/admin/v1/jobs/{job_id}/cancel": {
                 "post": {
                     "summary": "Request cancellation of an eligible durable job",
@@ -941,10 +1300,13 @@ async fn openapi() -> Json<serde_json::Value> {
             },
             "parameters": {
                 "IdempotencyKey": {"name": "Idempotency-Key", "in": "header", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 128}},
-                "JobId": {"name": "job_id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
+                "JobId": {"name": "job_id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}},
+                "RunId": {"name": "run_id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
             },
             "schemas": {
                 "ScanRequest": {"type": "object", "additionalProperties": false, "required": ["mode", "mediaTypes"], "properties": {"mode": {"type": "string", "enum": ["full", "missing", "changes"]}, "mediaTypes": {"type": "array", "minItems": 1, "maxItems": 2, "uniqueItems": true, "items": {"type": "string", "enum": ["movie", "tv"]}}}},
+                "MediaScanRequest": {"type": "object", "additionalProperties": false, "required": ["mode"], "properties": {"mode": {"type": "string", "enum": ["full", "missing", "audit"]}, "repair": {"type": "boolean", "default": false}}},
+                "MediaWorkerRequest": {"type": "object", "additionalProperties": false, "required": ["action"], "properties": {"action": {"type": "string", "enum": ["start", "pause", "resume", "cancel"]}}},
                 "MediaAuditRequest": {"type": "object", "additionalProperties": false, "properties": {"repair": {"type": "boolean", "default": false}}},
                 "BackupRequest": {"type": "object", "additionalProperties": false, "required": ["type"], "properties": {"type": {"type": "string", "enum": ["full", "differential"]}}}
             },
@@ -1041,6 +1403,92 @@ async fn start_scan(
         &request_id.0,
     )
     .await
+}
+
+async fn start_media_scan(
+    State(state): State<AdminState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+    payload: Result<Json<MediaScanRequest>, JsonRejection>,
+) -> Response {
+    let idempotency_key = match idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(error) => return failure(error, &request_id.0),
+    };
+    let payload = match bounded_json(payload) {
+        Ok(payload) => payload,
+        Err(error) => return failure(error, &request_id.0),
+    };
+    if payload.repair && payload.mode != AdminMediaScanMode::Audit {
+        return failure(AdminApiError::Rejected, &request_id.0);
+    }
+    let Some(store) = state.operations.as_deref() else {
+        return failure(AdminApiError::Unavailable, &request_id.0);
+    };
+    match store
+        .start_media_scan(payload.mode, payload.repair, idempotency_key, &request_id.0)
+        .await
+    {
+        Ok(submission) => accepted_media_scan(submission),
+        Err(error) => failure(error, &request_id.0),
+    }
+}
+
+async fn get_media_scan(
+    State(state): State<AdminState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(run_id): Path<String>,
+) -> Response {
+    let Ok(run_id) = Uuid::parse_str(&run_id) else {
+        return failure(AdminApiError::InvalidInput, &request_id.0);
+    };
+    let Some(store) = state.operations.as_deref() else {
+        return failure(AdminApiError::Unavailable, &request_id.0);
+    };
+    match store.get_media_scan(run_id).await {
+        Ok(Some(status)) => Json(Data { data: status }).into_response(),
+        Ok(None) => failure(AdminApiError::NotFound, &request_id.0),
+        Err(error) => failure(error, &request_id.0),
+    }
+}
+
+async fn set_media_worker(
+    State(state): State<AdminState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+    payload: Result<Json<MediaWorkerRequest>, JsonRejection>,
+) -> Response {
+    let idempotency_key = match idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(error) => return failure(error, &request_id.0),
+    };
+    let payload = match bounded_json(payload) {
+        Ok(payload) => payload,
+        Err(error) => return failure(error, &request_id.0),
+    };
+    let Some(store) = state.operations.as_deref() else {
+        return failure(AdminApiError::Unavailable, &request_id.0);
+    };
+    match store
+        .set_media_worker(payload.action, idempotency_key, &request_id.0)
+        .await
+    {
+        Ok(status) => Json(Data { data: status }).into_response(),
+        Err(error) => failure(error, &request_id.0),
+    }
+}
+
+async fn get_media_worker(
+    State(state): State<AdminState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Response {
+    let Some(store) = state.operations.as_deref() else {
+        return failure(AdminApiError::Unavailable, &request_id.0);
+    };
+    match store.media_worker().await {
+        Ok(status) => Json(Data { data: status }).into_response(),
+        Err(error) => failure(error, &request_id.0),
+    }
 }
 
 async fn start_media_audit(
@@ -1192,6 +1640,10 @@ fn accepted(submission: AdminSubmission) -> Response {
     (StatusCode::ACCEPTED, Json(Data { data: submission })).into_response()
 }
 
+fn accepted_media_scan(submission: AdminMediaScanSubmission) -> Response {
+    (StatusCode::ACCEPTED, Json(Data { data: submission })).into_response()
+}
+
 fn failure(error: AdminApiError, request_id: &str) -> Response {
     match error {
         AdminApiError::InvalidInput => problem::response(
@@ -1264,6 +1716,20 @@ struct ScanRequest {
 struct MediaAuditRequest {
     #[serde(default)]
     repair: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MediaScanRequest {
+    mode: AdminMediaScanMode,
+    #[serde(default)]
+    repair: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MediaWorkerRequest {
+    action: AdminMediaWorkerAction,
 }
 
 #[derive(Deserialize)]

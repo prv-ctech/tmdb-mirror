@@ -9,8 +9,10 @@ pub mod problem;
 pub use admin_api::{
     AdminApiError, AdminApiStore, AdminBackupKind, AdminBackupStatus, AdminBuildStatus,
     AdminCatalogCounts, AdminComponentHealth, AdminDatabaseStatus, AdminJob, AdminJobDetail,
-    AdminJobEvent, AdminJobListRequest, AdminJobPage, AdminOperation, AdminPoolStatus,
-    AdminQueueSummary, AdminStatus, AdminSubmission, DatabaseAdminStore,
+    AdminJobEvent, AdminJobListRequest, AdminJobPage, AdminMediaScanJobSummary, AdminMediaScanMode,
+    AdminMediaScanStatus, AdminMediaScanSubmission, AdminMediaWorkerAction, AdminMediaWorkerStatus,
+    AdminOperation, AdminPoolStatus, AdminQueueSummary, AdminStatus, AdminSubmission,
+    DatabaseAdminStore,
 };
 pub use app::{
     ApiState, DatabaseReadinessProbe, ProbeError, REQUEST_TIMEOUT, ReadinessProbe, RequestId,

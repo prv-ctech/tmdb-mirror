@@ -58,7 +58,7 @@ only these app-owned paths:
 ```text
 /config/work  /config/raw  /config/logs  /config/media
 /media/movies  /media/tv  /media/anime/{movie,tv}
-/media/casting  /media/networks  /media/companies  /media/collections
+/media/people  /media/networks  /media/companies  /media/collections
 ```
 
 PostgreSQL alone creates `/config/backups/pgbackrest`. The worker and media
@@ -139,8 +139,10 @@ docker compose --env-file "$TMDB_ENV_FILE" \
 The main worker applies migrations under the existing PostgreSQL advisory lock;
 restarts are safe and do not start an implicit full catalog scan. The scheduler
 queues only the configured changes, trending, and daily-export jobs. Operators
-request bounded `full`, `missing`, or `changes` scans through the private admin
-API. The worker runs up to eight ingestion loops, bounded by
+request catalog scans and the media `full`, `missing`, or `audit` scans through
+the private admin API. The same API can start, pause, resume, or cancel the
+durable media queue; pausing blocks new media claims and does not stop the
+container. The worker runs up to eight ingestion loops, bounded by
 `TMDB_MAX_CONNECTIONS` and `TMDB_RATE_LIMIT`. The media worker waits for the
 durable queue schema before claiming image jobs, so first-boot migrations do
 not cause an image-worker crash.
@@ -161,7 +163,7 @@ Public paths are deterministic and use TMDB IDs:
 /media/tv/{tmdb_id}/logos/logo.png
 /media/tv/{tmdb_id}/optimized/posters/poster-w640.jpg
 /media/tv/{tmdb_id}/optimized/thumbnails/season01-episode01-thumbnails-w640.jpg
-/media/casting/{tmdb_person_id}/profile.jpg
+/media/people/{tmdb_person_id}/profile.jpg
 /media/companies/{tmdb_company_id}/logos/logo.png
 /media/networks/{tmdb_network_id}/logos/logo.png
 /media/collections/{tmdb_collection_id}/posters/poster.jpg

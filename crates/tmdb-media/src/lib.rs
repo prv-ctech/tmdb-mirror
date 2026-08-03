@@ -77,8 +77,8 @@ pub enum RuntimeStoragePath {
     MediaAnimeMovie,
     /// `/media/anime/tv`
     MediaAnimeTv,
-    /// `/media/casting`
-    MediaCasting,
+    /// `/media/people`
+    MediaPeople,
     /// `/media/networks`
     MediaNetworks,
     /// `/media/companies`
@@ -102,7 +102,7 @@ impl RuntimeStoragePath {
             Self::MediaAnime => "/media/anime",
             Self::MediaAnimeMovie => "/media/anime/movie",
             Self::MediaAnimeTv => "/media/anime/tv",
-            Self::MediaCasting => "/media/casting",
+            Self::MediaPeople => "/media/people",
             Self::MediaNetworks => "/media/networks",
             Self::MediaCompanies => "/media/companies",
             Self::MediaCollections => "/media/collections",
@@ -121,7 +121,7 @@ impl RuntimeStoragePath {
             Self::MediaAnime => media_root.join("anime"),
             Self::MediaAnimeMovie => media_root.join("anime").join("movie"),
             Self::MediaAnimeTv => media_root.join("anime").join("tv"),
-            Self::MediaCasting => media_root.join("casting"),
+            Self::MediaPeople => media_root.join("people"),
             Self::MediaNetworks => media_root.join("networks"),
             Self::MediaCompanies => media_root.join("companies"),
             Self::MediaCollections => media_root.join("collections"),
@@ -223,7 +223,7 @@ const MEDIA_RUNTIME_PATHS: &[RuntimeStoragePath] = &[
     RuntimeStoragePath::MediaAnime,
     RuntimeStoragePath::MediaAnimeMovie,
     RuntimeStoragePath::MediaAnimeTv,
-    RuntimeStoragePath::MediaCasting,
+    RuntimeStoragePath::MediaPeople,
     RuntimeStoragePath::MediaNetworks,
     RuntimeStoragePath::MediaCompanies,
     RuntimeStoragePath::MediaCollections,
@@ -340,7 +340,7 @@ pub enum TitleScope {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReusableEntity {
     /// A cast/crew person.
-    Cast,
+    Person,
     /// A production or broadcast network.
     Network,
     /// A production company.
@@ -447,6 +447,10 @@ pub fn title_asset(
 }
 
 /// Returns an optimized title path below `optimized/`.
+///
+/// # Errors
+///
+/// Returns [`MediaPathError`] when the identifier, variant number, or width is invalid.
 pub fn optimized_title_asset(
     scope: TitleScope,
     tmdb_id: i64,
@@ -461,20 +465,20 @@ pub fn optimized_title_asset(
     Ok(path)
 }
 
-/// Returns a stable path for a reusable cast, network, company, or collection asset.
+/// Returns a stable path for a reusable person, network, company, or collection asset.
 ///
 /// # Errors
 ///
-/// Returns [`MediaPathError`] when the local identifier or variant number is invalid.
+/// Returns [`MediaPathError`] when the TMDB identifier or variant number is invalid.
 pub fn reusable_asset(
     entity: ReusableEntity,
-    local_id: i64,
+    tmdb_id: i64,
     variant: AssetVariant,
     format: ImageFormat,
 ) -> Result<PathBuf, MediaPathError> {
-    let id = positive_id(local_id)?;
+    let id = positive_id(tmdb_id)?;
     let directory = match entity {
-        ReusableEntity::Cast => "casting",
+        ReusableEntity::Person => "people",
         ReusableEntity::Network => "networks",
         ReusableEntity::Company => "companies",
         ReusableEntity::Collection => "collections",
@@ -489,16 +493,20 @@ pub fn reusable_asset(
 }
 
 /// Returns an optimized path for a reusable entity.
+///
+/// # Errors
+///
+/// Returns [`MediaPathError`] when the TMDB identifier, variant number, or width is invalid.
 pub fn optimized_reusable_asset(
     entity: ReusableEntity,
-    local_id: i64,
+    tmdb_id: i64,
     variant: AssetVariant,
     format: ImageFormat,
     width: u32,
 ) -> Result<PathBuf, MediaPathError> {
-    let id = positive_id(local_id)?;
+    let id = positive_id(tmdb_id)?;
     let directory = match entity {
-        ReusableEntity::Cast => "casting",
+        ReusableEntity::Person => "people",
         ReusableEntity::Network => "networks",
         ReusableEntity::Company => "companies",
         ReusableEntity::Collection => "collections",
@@ -507,7 +515,7 @@ pub fn optimized_reusable_asset(
         .join(id.to_string())
         .join("optimized");
     let subdirectory = match (entity, variant) {
-        (ReusableEntity::Cast, AssetVariant::Profile { .. }) => "",
+        (ReusableEntity::Person, AssetVariant::Profile { .. }) => "",
         _ => optimized_subdirectory(variant),
     };
     if !subdirectory.is_empty() {
@@ -625,7 +633,7 @@ fn reusable_filename(
     format: ImageFormat,
 ) -> Result<String, MediaPathError> {
     match (entity, variant) {
-        (ReusableEntity::Cast, AssetVariant::Profile { index }) => {
+        (ReusableEntity::Person, AssetVariant::Profile { index }) => {
             numbered_name("profile", index, format.extension())
         }
         _ => variant_filename(variant, format),
@@ -704,7 +712,7 @@ mod tests {
             "tv",
             "anime/movie",
             "anime/tv",
-            "casting",
+            "people",
             "networks",
             "companies",
             "collections",
@@ -800,13 +808,13 @@ mod tests {
     fn reusable_paths_are_stable_and_numbered() {
         assert_eq!(
             reusable_asset(
-                ReusableEntity::Cast,
+                ReusableEntity::Person,
                 44,
                 AssetVariant::Profile { index: 1 },
                 ImageFormat::Jpeg
             )
             .ok(),
-            Some(PathBuf::from("casting/44/profile.jpg"))
+            Some(PathBuf::from("people/44/profile.jpg"))
         );
         assert_eq!(
             reusable_asset(
@@ -820,14 +828,14 @@ mod tests {
         );
         assert_eq!(
             optimized_reusable_asset(
-                ReusableEntity::Cast,
+                ReusableEntity::Person,
                 44,
                 AssetVariant::Profile { index: 1 },
                 ImageFormat::Jpeg,
-                320
+                640
             )
             .ok(),
-            Some(PathBuf::from("casting/44/optimized/profile-w320.jpg"))
+            Some(PathBuf::from("people/44/optimized/profile-w640.jpg"))
         );
     }
 

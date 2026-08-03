@@ -147,6 +147,9 @@ redact() {
     if [[ -n "${STRESS_API_KEY:-}" ]]; then
         text="${text//"$STRESS_API_KEY"/<redacted>}"
     fi
+    if [[ -n "${STRESS_ADMIN_KEY:-}" ]]; then
+        text="${text//"$STRESS_ADMIN_KEY"/<redacted>}"
+    fi
     printf '%s' "$text"
 }
 
@@ -246,7 +249,7 @@ wait_for_migrations() {
             continue
         fi
         version="$(psql_at "$password" "SELECT COALESCE(max(version), 0) FROM ops._sqlx_migrations WHERE success" 2>/dev/null || true)"
-        if [[ "$version" =~ ^[0-9]+$ ]] && (( version >= 28 )); then
+        if [[ "$version" =~ ^[0-9]+$ ]] && (( version >= 29 )); then
             return 0
         fi
         sleep 2

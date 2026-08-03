@@ -219,6 +219,153 @@ async fn transient_backup_failure_returns_the_paired_request_to_the_claimable_qu
     Ok(())
 }
 
+#[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+async fn media_scan_submission_and_worker_control_are_idempotent_and_bound_claims(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let request_id = Uuid::now_v7();
+    let first: (Uuid, Uuid, bool) = sqlx::query_as(
+        "SELECT job_id, run_id, was_duplicate
+           FROM ops.submit_media_scan($1, $2, 'media-scan-1', $3)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(r#"{"mode":"audit","repair":true}"#)
+    .bind(request_id)
+    .fetch_one(&pool)
+    .await?;
+    assert!(!first.2);
+
+    let duplicate: (Uuid, Uuid, bool) = sqlx::query_as(
+        "SELECT job_id, run_id, was_duplicate
+           FROM ops.submit_media_scan($1, $2, 'media-scan-1', $3)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(r#"{"mode":"audit","repair":true}"#)
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(duplicate, (first.0, first.1, true));
+
+    let Err(conflict) = sqlx::query(
+        "SELECT job_id, run_id, was_duplicate
+           FROM ops.submit_media_scan($1, $2, 'media-scan-1', $3)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(r#"{"mode":"full","repair":false}"#)
+    .bind(Uuid::now_v7())
+    .execute(&pool)
+    .await
+    else {
+        return Err(sqlx::Error::Protocol(
+            "a reused media-scan key must reject a different payload".to_owned(),
+        ));
+    };
+    assert_eq!(sqlstate(&conflict).as_deref(), Some("P0003"));
+
+    let scan_row: (String, bool, String, String, serde_json::Value) = sqlx::query_as(
+        "SELECT scan.mode, scan.repair, scan.phase, job.status, job.payload
+           FROM ops.media_scan_runs AS scan
+           JOIN ops.jobs AS job ON job.id = scan.job_id
+          WHERE scan.id = $1",
+    )
+    .bind(first.1)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(scan_row.0, "audit");
+    assert!(scan_row.1);
+    assert_eq!(scan_row.2, "queued");
+    assert_eq!(scan_row.3, "queued");
+    assert_eq!(scan_row.4["runId"], first.1.to_string());
+
+    let media_scan_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name
+           FROM information_schema.columns
+          WHERE table_schema = 'ops' AND table_name = 'media_scan_job_status'
+          ORDER BY ordinal_position",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        media_scan_columns,
+        ["id", "job_type", "status", "result_summary", "created_at"]
+    );
+    let media_scan_privileges: (bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT has_table_privilege('ingest_writer', 'ops.media_scan_job_status', 'SELECT'),
+                has_table_privilege('image_writer', 'ops.media_scan_job_status', 'SELECT'),
+                has_table_privilege('api_job_submitter', 'ops.media_scan_job_status', 'SELECT'),
+                has_table_privilege('monitor', 'ops.media_scan_job_status', 'SELECT')",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(media_scan_privileges, (true, false, false, false));
+
+    let initial_state: (String, bool) = sqlx::query_as(
+        "SELECT state, was_duplicate
+           FROM ops.set_media_worker_state('pause', 'media-worker-pause', $1)",
+    )
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(initial_state, ("paused".to_owned(), false));
+    let duplicate_state: (String, bool) = sqlx::query_as(
+        "SELECT state, was_duplicate
+           FROM ops.set_media_worker_state('pause', 'media-worker-pause', $1)",
+    )
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(duplicate_state, ("paused".to_owned(), true));
+
+    let media_job: Uuid = sqlx::query_scalar(
+        "SELECT job_id
+           FROM ops.submit_job(
+               $1, 'image.download', 1, '{}', 0::smallint, 3,
+               clock_timestamp(), 'media-worker-queued')",
+    )
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await?;
+    let paused_claim: Option<Uuid> = sqlx::query_scalar(
+        "SELECT job_id
+           FROM ops.claim_job_for_types('media-worker-test', 1000000, ARRAY['image.download']::text[])",
+    )
+    .fetch_optional(&pool)
+    .await?;
+    assert!(paused_claim.is_none());
+
+    let resume: (String, bool) = sqlx::query_as(
+        "SELECT state, was_duplicate
+           FROM ops.set_media_worker_state('resume', 'media-worker-resume', $1)",
+    )
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(resume, ("running".to_owned(), false));
+    let claimed: Uuid = sqlx::query_scalar(
+        "SELECT job_id
+           FROM ops.claim_job_for_types('media-worker-test', 1000000, ARRAY['image.download']::text[])",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(claimed, media_job);
+
+    let stopped: (String, bool) = sqlx::query_as(
+        "SELECT state, was_duplicate
+           FROM ops.set_media_worker_state('cancel', 'media-worker-cancel', $1)",
+    )
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(stopped, ("stopped".to_owned(), false));
+    let cancellation_requested: bool =
+        sqlx::query_scalar("SELECT cancellation_requested FROM ops.jobs WHERE id = $1")
+            .bind(media_job)
+            .fetch_one(&pool)
+            .await?;
+    assert!(cancellation_requested);
+    Ok(())
+}
+
 fn sqlstate(error: &sqlx::Error) -> Option<String> {
     error
         .as_database_error()

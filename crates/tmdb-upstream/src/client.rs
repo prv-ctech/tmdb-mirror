@@ -198,18 +198,30 @@ impl TmdbClient {
     }
 
     /// Fetches the complete English and untagged movie image gallery.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized TMDB client error when the ID is invalid or the request fails.
     pub async fn fetch_movie_images(&self, tmdb_id: u32) -> Result<TmdbImages, TmdbClientError> {
         self.fetch_images(&format!("movie/{tmdb_id}/images"), tmdb_id != 0)
             .await
     }
 
     /// Fetches the complete English and untagged TV image gallery.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized TMDB client error when the ID is invalid or the request fails.
     pub async fn fetch_tv_images(&self, tmdb_id: u32) -> Result<TmdbImages, TmdbClientError> {
         self.fetch_images(&format!("tv/{tmdb_id}/images"), tmdb_id != 0)
             .await
     }
 
     /// Fetches a season image gallery, including season zero specials.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized TMDB client error when the TV ID is invalid or the request fails.
     pub async fn fetch_season_images(
         &self,
         tv_id: u32,
@@ -223,6 +235,10 @@ impl TmdbClient {
     }
 
     /// Fetches an episode image gallery.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized TMDB client error when the TV or episode ID is invalid or the request fails.
     pub async fn fetch_episode_images(
         &self,
         tv_id: u32,
@@ -240,24 +256,40 @@ impl TmdbClient {
     }
 
     /// Fetches a person's profile image gallery.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized TMDB client error when the ID is invalid or the request fails.
     pub async fn fetch_person_images(&self, tmdb_id: u32) -> Result<TmdbImages, TmdbClientError> {
         self.fetch_images(&format!("person/{tmdb_id}/images"), tmdb_id != 0)
             .await
     }
 
     /// Fetches a production-company logo gallery.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized TMDB client error when the ID is invalid or the request fails.
     pub async fn fetch_company_images(&self, tmdb_id: u32) -> Result<TmdbImages, TmdbClientError> {
         self.fetch_images(&format!("company/{tmdb_id}/images"), tmdb_id != 0)
             .await
     }
 
     /// Fetches a broadcast-network logo gallery.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized TMDB client error when the ID is invalid or the request fails.
     pub async fn fetch_network_images(&self, tmdb_id: u32) -> Result<TmdbImages, TmdbClientError> {
         self.fetch_images(&format!("network/{tmdb_id}/images"), tmdb_id != 0)
             .await
     }
 
     /// Fetches a collection poster/backdrop gallery.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized TMDB client error when the ID is invalid or the request fails.
     pub async fn fetch_collection_images(
         &self,
         tmdb_id: u32,
@@ -267,12 +299,20 @@ impl TmdbClient {
     }
 
     /// Fetches all title-level movie video records.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized TMDB client error when the ID is invalid or the request fails.
     pub async fn fetch_movie_videos(&self, tmdb_id: u32) -> Result<TmdbVideos, TmdbClientError> {
         self.fetch_videos(&format!("movie/{tmdb_id}/videos"), tmdb_id != 0)
             .await
     }
 
     /// Fetches all title-level TV video records.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized TMDB client error when the ID is invalid or the request fails.
     pub async fn fetch_tv_videos(&self, tmdb_id: u32) -> Result<TmdbVideos, TmdbClientError> {
         self.fetch_videos(&format!("tv/{tmdb_id}/videos"), tmdb_id != 0)
             .await

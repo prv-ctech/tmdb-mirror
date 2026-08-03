@@ -280,8 +280,13 @@ where
         } else {
             let heartbeat_stop = CancellationToken::new();
             let lease_lost = CancellationToken::new();
-            let heartbeat =
-                self.spawn_heartbeat(job.job_id(), heartbeat_stop.clone(), lease_lost.clone());
+            let job_cancelled = CancellationToken::new();
+            let heartbeat = self.spawn_heartbeat(
+                job.job_id(),
+                heartbeat_stop.clone(),
+                lease_lost.clone(),
+                job_cancelled.clone(),
+            );
             let executor = Arc::clone(&self.executor);
             let job_for_execution = job.clone();
             let mut execution =
@@ -309,6 +314,26 @@ where
                     );
                     Ok(())
                 },
+                () = job_cancelled.cancelled() => {
+                    execution.abort();
+                    let _ = execution.await;
+                    let outcome = self
+                        .repository
+                        .complete(job.job_id(), &self.config.worker_id, json!({}))
+                        .await
+                        .map(|_| ())
+                        .or_else(ignore_lost_lease);
+                    if outcome.is_ok() {
+                        tracing::info!(
+                            event = "job_cancelled",
+                            worker_id = self.config.worker_id.as_str(),
+                            job_id = %job.job_id().as_uuid(),
+                            job_type = job.job_type(),
+                            reason = "cancellation_requested",
+                        );
+                    }
+                    outcome
+                },
                 result = &mut execution => {
                     let result = result.unwrap_or_else(|_| {
                         tracing::error!(
@@ -335,6 +360,7 @@ where
         job_id: crate::JobId,
         stop: CancellationToken,
         lease_lost: CancellationToken,
+        job_cancelled: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
         let repository = self.repository.clone();
         let worker_id = self.config.worker_id.clone();
@@ -357,6 +383,26 @@ where
                             );
                             lease_lost.cancel();
                             break;
+                        }
+                        match repository.cancellation_requested(job_id).await {
+                            Ok(true) => {
+                                job_cancelled.cancel();
+                                break;
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::warn!(
+                                    event = "job_cancellation_poll_failed",
+                                    worker_id = worker_id.as_str(),
+                                    job_id = %job_id.as_uuid(),
+                                    error_code = match error {
+                                        JobError::NotFound => "job_not_found",
+                                        _ => "database_unavailable",
+                                    },
+                                );
+                                lease_lost.cancel();
+                                break;
+                            }
                         }
                     }
                 }

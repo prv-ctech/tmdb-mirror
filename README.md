@@ -73,7 +73,8 @@ Movie and TV routes never return anime. Anime routes remain isolated and can
 search both anime media types unless `type=movie` or `type=tv` is supplied.
 The private admin API supports status, durable job history, explicit scans,
 cancellation/retry, non-destructive media audits, allowlisted analyze jobs,
-and full/differential backup requests. Admin writes require
+durable media full/missing/audit scans, persistent media-worker controls, and
+full/differential backup requests. Admin writes require
 `Idempotency-Key` and return `202 Accepted` durable jobs.
 
 See the complete [API reference](docs/api.md), or query the public and private

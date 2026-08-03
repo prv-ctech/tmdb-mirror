@@ -2,17 +2,18 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use chrono::{Days, NaiveDate, Utc};
+use chrono::{DateTime, Days, Duration as ChronoDuration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{FromRow, PgPool};
 use tmdb_domain::MediaType;
 use tmdb_jobs::{ClaimedJob, JobError, JobExecutionError, JobExecutor, JobRepository, NewJob};
 use tmdb_upstream::{
     DailyExportParser, MAX_DAILY_EXPORT_BYTES, TmdbClient, TmdbClientError, TmdbImages,
     TmdbTrendingItem,
 };
+use uuid::Uuid;
 
 #[path = "catalog_locks.rs"]
 mod catalog_locks;
@@ -31,8 +32,12 @@ pub const CHANGES_SYNC_JOB: &str = "ingest.changes_sync";
 pub const DAILY_EXPORT_JOB: &str = "ingest.daily_export";
 /// Refresh a typed TMDB trending window into the durable ranking table.
 pub const TRENDING_REFRESH_JOB: &str = "ingest.trending";
+/// Refresh one reusable people, company, network, or collection gallery.
+pub const REFRESH_REUSABLE_GALLERY_JOB: &str = "ingest.refresh_reusable_gallery";
 /// Explicit administrative catalog scan coordinator. It is never enqueued by restart.
 pub const ADMIN_SCAN_JOB: &str = "admin.scan";
+/// Durable media scan coordinator.
+pub const ADMIN_MEDIA_SCAN_JOB: &str = "admin.media_scan";
 /// Fixed allowlisted catalog statistics maintenance.
 pub const ADMIN_ANALYZE_JOB: &str = "admin.analyze";
 /// Current payload version for all ingestion jobs.
@@ -44,7 +49,9 @@ const INGEST_JOB_TYPES: &[&str] = &[
     CHANGES_SYNC_JOB,
     DAILY_EXPORT_JOB,
     TRENDING_REFRESH_JOB,
+    REFRESH_REUSABLE_GALLERY_JOB,
     ADMIN_SCAN_JOB,
+    ADMIN_MEDIA_SCAN_JOB,
     ADMIN_ANALYZE_JOB,
 ];
 const DAILY_EXPORT_REFRESH_PRIORITY: i16 = -100;
@@ -85,6 +92,52 @@ struct TrendingPayload {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ReusableGalleryEntity {
+    Person,
+    Company,
+    Network,
+    Collection,
+}
+
+impl ReusableGalleryEntity {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Person => "person",
+            Self::Company => "company",
+            Self::Network => "network",
+            Self::Collection => "collection",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReusableGalleryPayload {
+    entity_type: ReusableGalleryEntity,
+    tmdb_id: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaScanMode {
+    Full,
+    Missing,
+    Audit,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MediaScanPayload {
+    run_id: uuid::Uuid,
+    mode: MediaScanMode,
+    #[serde(default)]
+    repair: bool,
+    #[serde(default)]
+    step: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AdminScanMode {
     Full,
     Missing,
@@ -115,6 +168,18 @@ pub enum IngestJob {
     Trending {
         media_type: MediaType,
         trend_window: String,
+    },
+    /// Refresh one reusable entity's dedicated TMDB gallery.
+    RefreshReusableGallery {
+        entity_type: ReusableGalleryEntity,
+        tmdb_id: u32,
+    },
+    /// Coordinate a durable full, missing, or audit media scan.
+    MediaScan {
+        run_id: uuid::Uuid,
+        mode: MediaScanMode,
+        repair: bool,
+        step: u32,
     },
     /// Expand one explicit operational scan into safely bounded ingest jobs.
     AdminScan {
@@ -149,6 +214,16 @@ impl IngestJob {
                 media_type,
                 trend_window,
             } => format!("{TRENDING_REFRESH_JOB}:{media_type}:{trend_window}"),
+            Self::RefreshReusableGallery {
+                entity_type,
+                tmdb_id,
+            } => format!(
+                "{REFRESH_REUSABLE_GALLERY_JOB}:{}:{tmdb_id}",
+                entity_type.as_str()
+            ),
+            Self::MediaScan { run_id, step, .. } => {
+                format!("{ADMIN_MEDIA_SCAN_JOB}:{run_id}:{step}")
+            }
             Self::AdminScan { mode, media_types } => {
                 format!("{ADMIN_SCAN_JOB}:{mode:?}:{media_types:?}")
             }
@@ -220,6 +295,26 @@ pub fn parse_job(
             Ok(IngestJob::Trending {
                 media_type: payload.media_type,
                 trend_window: payload.trend_window,
+            })
+        }
+        REFRESH_REUSABLE_GALLERY_JOB => {
+            let payload: ReusableGalleryPayload = parse_payload(payload)?;
+            validate_tmdb_id(payload.tmdb_id)?;
+            Ok(IngestJob::RefreshReusableGallery {
+                entity_type: payload.entity_type,
+                tmdb_id: payload.tmdb_id,
+            })
+        }
+        ADMIN_MEDIA_SCAN_JOB => {
+            let payload: MediaScanPayload = parse_payload(payload)?;
+            if payload.run_id.is_nil() || payload.step > 100_000 {
+                return Err(JobPayloadError::InvalidValue);
+            }
+            Ok(IngestJob::MediaScan {
+                run_id: payload.run_id,
+                mode: payload.mode,
+                repair: payload.repair,
+                step: payload.step,
             })
         }
         ADMIN_SCAN_JOB => {
@@ -369,6 +464,32 @@ impl IngestExecutor {
 
 const MAX_SHARED_GALLERY_ENTITIES: usize = 256;
 
+fn optional_gallery(
+    result: Result<TmdbImages, TmdbClientError>,
+) -> Result<TmdbImages, TmdbClientError> {
+    match result {
+        Err(TmdbClientError::NotFound) => Ok(TmdbImages::default()),
+        other => other,
+    }
+}
+
+fn upstream_id(raw: u64) -> Result<u32, TmdbClientError> {
+    u32::try_from(raw).map_err(|_| TmdbClientError::InvalidPath)
+}
+
+async fn fetch_reusable_gallery(
+    client: &TmdbClient,
+    entity_type: ReusableGalleryEntity,
+    tmdb_id: u32,
+) -> Result<TmdbImages, TmdbClientError> {
+    optional_gallery(match entity_type {
+        ReusableGalleryEntity::Person => client.fetch_person_images(tmdb_id).await,
+        ReusableGalleryEntity::Company => client.fetch_company_images(tmdb_id).await,
+        ReusableGalleryEntity::Network => client.fetch_network_images(tmdb_id).await,
+        ReusableGalleryEntity::Collection => client.fetch_collection_images(tmdb_id).await,
+    })
+}
+
 async fn hydrate_movie_galleries(
     client: &TmdbClient,
     movie: &mut tmdb_upstream::TmdbMovie,
@@ -377,18 +498,21 @@ async fn hydrate_movie_galleries(
     if !allow_local_media {
         return Ok(());
     }
-    movie.images = client.fetch_movie_images(movie.id as u32).await?;
-    movie.videos = client.fetch_movie_videos(movie.id as u32).await?;
+    let movie_id = upstream_id(movie.id)?;
+    movie.images = optional_gallery(client.fetch_movie_images(movie_id).await)?;
+    movie.videos = client.fetch_movie_videos(movie_id).await?;
     hydrate_credit_galleries(client, &mut movie.credits).await?;
     for company in movie
         .production_companies
         .iter_mut()
         .take(MAX_SHARED_GALLERY_ENTITIES)
     {
-        company.images = client.fetch_company_images(company.id as u32).await?;
+        let company_id = upstream_id(company.id)?;
+        company.images = optional_gallery(client.fetch_company_images(company_id).await)?;
     }
     if let Some(collection) = movie.belongs_to_collection.as_mut() {
-        collection.images = client.fetch_collection_images(collection.id as u32).await?;
+        let collection_id = upstream_id(collection.id)?;
+        collection.images = optional_gallery(client.fetch_collection_images(collection_id).await)?;
     }
     Ok(())
 }
@@ -401,18 +525,21 @@ async fn hydrate_tv_galleries(
     if !allow_local_media {
         return Ok(());
     }
-    series.images = client.fetch_tv_images(series.id as u32).await?;
-    series.videos = client.fetch_tv_videos(series.id as u32).await?;
+    let series_id = upstream_id(series.id)?;
+    series.images = optional_gallery(client.fetch_tv_images(series_id).await)?;
+    series.videos = client.fetch_tv_videos(series_id).await?;
     hydrate_credit_galleries(client, &mut series.credits).await?;
     for company in series
         .production_companies
         .iter_mut()
         .take(MAX_SHARED_GALLERY_ENTITIES)
     {
-        company.images = client.fetch_company_images(company.id as u32).await?;
+        let company_id = upstream_id(company.id)?;
+        company.images = optional_gallery(client.fetch_company_images(company_id).await)?;
     }
     for network in series.networks.iter_mut().take(MAX_SHARED_GALLERY_ENTITIES) {
-        network.images = client.fetch_network_images(network.id as u32).await?;
+        let network_id = upstream_id(network.id)?;
+        network.images = optional_gallery(client.fetch_network_images(network_id).await)?;
     }
     Ok(())
 }
@@ -439,8 +566,10 @@ async fn hydrate_credit_galleries_with_cache(
         if cache.len() >= MAX_SHARED_GALLERY_ENTITIES && !cache.contains_key(&credit.id) {
             continue;
         }
+        let person_id = upstream_id(credit.id)?;
         if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(credit.id) {
-            entry.insert(client.fetch_person_images(credit.id as u32).await?);
+            let images = optional_gallery(client.fetch_person_images(person_id).await)?;
+            entry.insert(images);
         }
     }
     for credit in credits.cast.iter_mut().chain(credits.crew.iter_mut()) {
@@ -460,14 +589,18 @@ async fn hydrate_season_galleries(
     if !allow_local_media {
         return Ok(());
     }
-    season.images = client
-        .fetch_season_images(tv_id, season.season_number)
-        .await?;
+    season.images = optional_gallery(
+        client
+            .fetch_season_images(tv_id, season.season_number)
+            .await,
+    )?;
     let mut person_cache = HashMap::<u64, TmdbImages>::new();
     for episode in &mut season.episodes {
-        episode.images = client
-            .fetch_episode_images(tv_id, season.season_number, episode.episode_number)
-            .await?;
+        episode.images = optional_gallery(
+            client
+                .fetch_episode_images(tv_id, season.season_number, episode.episode_number)
+                .await,
+        )?;
         hydrate_credit_galleries_with_cache(client, &mut episode.credits, &mut person_cache)
             .await?;
     }
@@ -823,6 +956,71 @@ impl JobExecutor for IngestExecutor {
                     "dedup_key": dedup_key,
                 }))
             }
+            IngestJob::RefreshReusableGallery {
+                entity_type,
+                tmdb_id,
+            } => {
+                if !self.allow_local_media {
+                    return Ok(serde_json::json!({
+                        "entity_type": entity_type,
+                        "tmdb_id": tmdb_id,
+                        "skipped": "local_media_disabled",
+                        "dedup_key": dedup_key
+                    }));
+                }
+                let images = match fetch_reusable_gallery(&self.client, entity_type, tmdb_id).await
+                {
+                    Ok(images) => {
+                        self.record_upstream_state("ready").await;
+                        images
+                    }
+                    Err(error) => {
+                        self.record_upstream_state("degraded").await;
+                        log_upstream_failure(
+                            "reusable_gallery",
+                            entity_type.as_str(),
+                            tmdb_id,
+                            None,
+                            &error,
+                        );
+                        return Err(map_upstream_error(&error));
+                    }
+                };
+                if let Some(database) = &self.database {
+                    catalog_write::enqueue_reusable_gallery(
+                        database,
+                        entity_type.as_str(),
+                        i64::from(tmdb_id),
+                        &images,
+                        self.allow_local_media,
+                    )
+                    .await?;
+                }
+                Ok(serde_json::json!({
+                    "entity_type": entity_type,
+                    "tmdb_id": tmdb_id,
+                    "poster_count": images.posters.len(),
+                    "backdrop_count": images.backdrops.len(),
+                    "logo_count": images.logos.len(),
+                    "profile_count": images.profiles.len(),
+                    "dedup_key": dedup_key
+                }))
+            }
+            IngestJob::MediaScan {
+                run_id,
+                mode,
+                repair,
+                step,
+            } => {
+                let Some(database) = &self.database else {
+                    return Err(JobExecutionError::retry(
+                        "database_unavailable",
+                        Duration::from_secs(5),
+                    ));
+                };
+                execute_media_scan(database, run_id, mode, repair, step, self.allow_local_media)
+                    .await
+            }
             IngestJob::AdminScan { mode, media_types } => {
                 let Some(database) = &self.database else {
                     return Err(JobExecutionError::retry(
@@ -934,6 +1132,675 @@ fn full_export_job(
         &format!("{DAILY_EXPORT_JOB}:{media_type_name}:{date_text}"),
     )
     .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))
+}
+
+const MEDIA_SCAN_POLL_SECONDS: i64 = 5;
+
+#[derive(Debug, FromRow)]
+struct MediaScanState {
+    mode: String,
+    repair: bool,
+    phase: String,
+    status: String,
+    requested_at: DateTime<Utc>,
+}
+
+async fn execute_media_scan(
+    database: &PgPool,
+    run_id: Uuid,
+    mode: MediaScanMode,
+    repair: bool,
+    step: u32,
+    allow_local_media: bool,
+) -> Result<Value, JobExecutionError> {
+    let Some(run) = sqlx::query_as::<_, MediaScanState>(
+        "SELECT mode, repair, phase, status, requested_at
+           FROM ops.media_scan_runs
+          WHERE id = $1",
+    )
+    .bind(run_id)
+    .fetch_optional(database)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?
+    else {
+        return Err(JobExecutionError::dead_letter("invalid_payload"));
+    };
+    if run.mode != media_scan_mode_name(mode) || run.repair != repair {
+        return Err(JobExecutionError::dead_letter("invalid_payload"));
+    }
+    if matches!(run.status.as_str(), "succeeded" | "failed" | "cancelled") {
+        return Ok(serde_json::json!({
+            "runId": run_id,
+            "status": run.status,
+            "phase": run.phase,
+            "step": step
+        }));
+    }
+    if !allow_local_media {
+        finish_media_scan(database, run_id, true, Some("local_media_disabled")).await?;
+        return Ok(serde_json::json!({
+            "runId": run_id,
+            "status": "succeeded",
+            "skipped": "local_media_disabled",
+            "step": step
+        }));
+    }
+
+    match (mode, run.phase.as_str()) {
+        (MediaScanMode::Full | MediaScanMode::Missing, "queued") => {
+            let catalog_mode = match mode {
+                MediaScanMode::Full => "full",
+                MediaScanMode::Missing => "missing",
+                MediaScanMode::Audit => unreachable!(),
+            };
+            let queued = enqueue_catalog_scan(database, run_id, catalog_mode).await?;
+            add_scan_queued_count(database, run_id, queued).await?;
+            set_media_scan_phase(database, run_id, "catalog").await?;
+            queue_media_scan_followup(database, run_id, mode, repair, step).await?;
+        }
+        (MediaScanMode::Audit, "queued") => {
+            let queued = enqueue_media_audit(database, run_id, repair).await?;
+            add_scan_queued_count(database, run_id, queued).await?;
+            set_media_scan_phase(database, run_id, "audit").await?;
+            queue_media_scan_followup(database, run_id, mode, repair, step).await?;
+        }
+        (MediaScanMode::Full | MediaScanMode::Missing, "catalog") => {
+            if catalog_scan_pending(database, run_id, run.requested_at).await? {
+                queue_media_scan_followup(database, run_id, mode, repair, step).await?;
+            } else {
+                let queued = match mode {
+                    MediaScanMode::Full => enqueue_full_media_jobs(database, run_id).await?,
+                    MediaScanMode::Missing => enqueue_missing_media_jobs(database, run_id).await?,
+                    MediaScanMode::Audit => unreachable!(),
+                };
+                add_scan_queued_count(database, run_id, queued).await?;
+                set_media_scan_phase(database, run_id, "media").await?;
+                queue_media_scan_followup(database, run_id, mode, repair, step).await?;
+            }
+        }
+        (MediaScanMode::Full | MediaScanMode::Missing, "media") => {
+            if media_scan_pending(database, run_id, run.requested_at).await? {
+                queue_media_scan_followup(database, run_id, mode, repair, step).await?;
+            } else {
+                finish_media_scan(database, run_id, true, None).await?;
+            }
+        }
+        (MediaScanMode::Audit, "audit") => {
+            if audit_scan_pending(database, run_id).await? {
+                queue_media_scan_followup(database, run_id, mode, repair, step).await?;
+            } else {
+                finish_media_scan(database, run_id, true, None).await?;
+            }
+        }
+        _ => return Err(JobExecutionError::dead_letter("invalid_payload")),
+    }
+    Ok(serde_json::json!({
+        "runId": run_id,
+        "mode": mode,
+        "phase": "durable",
+        "step": step
+    }))
+}
+
+fn media_scan_mode_name(mode: MediaScanMode) -> &'static str {
+    match mode {
+        MediaScanMode::Full => "full",
+        MediaScanMode::Missing => "missing",
+        MediaScanMode::Audit => "audit",
+    }
+}
+
+async fn enqueue_catalog_scan(
+    database: &PgPool,
+    run_id: Uuid,
+    mode: &str,
+) -> Result<usize, JobExecutionError> {
+    let job = NewJob::new(
+        ADMIN_SCAN_JOB,
+        INGEST_PAYLOAD_VERSION,
+        serde_json::json!({"mode": mode, "mediaTypes": ["movie", "tv"]}),
+        &format!("{ADMIN_SCAN_JOB}:{run_id}:catalog"),
+    )
+    .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+    let linked = submit_and_link_scan_job(database, run_id, "catalog", job).await?;
+    Ok(usize::from(linked))
+}
+
+async fn enqueue_media_audit(
+    database: &PgPool,
+    run_id: Uuid,
+    repair: bool,
+) -> Result<usize, JobExecutionError> {
+    let job = NewJob::new(
+        "admin.media_audit",
+        1,
+        serde_json::json!({"repair": repair}),
+        &format!("admin.media_audit:{run_id}"),
+    )
+    .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+    let linked = submit_and_link_scan_job(database, run_id, "audit", job).await?;
+    Ok(usize::from(linked))
+}
+
+async fn queue_media_scan_followup(
+    database: &PgPool,
+    run_id: Uuid,
+    mode: MediaScanMode,
+    repair: bool,
+    step: u32,
+) -> Result<(), JobExecutionError> {
+    let next_step = step
+        .checked_add(1)
+        .ok_or_else(|| JobExecutionError::dead_letter("invalid_payload"))?;
+    let job = NewJob::new(
+        ADMIN_MEDIA_SCAN_JOB,
+        INGEST_PAYLOAD_VERSION,
+        serde_json::json!({
+            "runId": run_id,
+            "mode": mode,
+            "repair": repair,
+            "step": next_step
+        }),
+        &format!("{ADMIN_MEDIA_SCAN_JOB}:{run_id}:{next_step}"),
+    )
+    .and_then(|job| {
+        job.with_available_at(Utc::now() + ChronoDuration::seconds(MEDIA_SCAN_POLL_SECONDS))
+    })
+    .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+    JobRepository::new(database.clone())
+        .submit(job)
+        .await
+        .map_err(map_submission_error)?;
+    Ok(())
+}
+
+async fn submit_and_link_scan_job(
+    database: &PgPool,
+    run_id: Uuid,
+    phase: &str,
+    job: NewJob,
+) -> Result<bool, JobExecutionError> {
+    let outcome = JobRepository::new(database.clone())
+        .submit(job)
+        .await
+        .map_err(map_submission_error)?;
+    sqlx::query(
+        "INSERT INTO ops.media_scan_job_links (run_id, job_id, phase)
+         VALUES ($1, $2, $3)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(run_id)
+    .bind(outcome.job_id().as_uuid())
+    .bind(phase)
+    .execute(database)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    Ok(!outcome.was_duplicate())
+}
+
+async fn add_scan_queued_count(
+    database: &PgPool,
+    run_id: Uuid,
+    count: usize,
+) -> Result<(), JobExecutionError> {
+    let count =
+        i64::try_from(count).map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+    sqlx::query(
+        "UPDATE ops.media_scan_runs
+            SET queued_count = queued_count + $2
+          WHERE id = $1",
+    )
+    .bind(run_id)
+    .bind(count)
+    .execute(database)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    Ok(())
+}
+
+async fn set_media_scan_phase(
+    database: &PgPool,
+    run_id: Uuid,
+    phase: &str,
+) -> Result<(), JobExecutionError> {
+    sqlx::query(
+        "UPDATE ops.media_scan_runs
+            SET status = 'running', phase = $2,
+                started_at = COALESCE(started_at, pg_catalog.clock_timestamp()),
+                error_code = NULL
+          WHERE id = $1",
+    )
+    .bind(run_id)
+    .bind(phase)
+    .execute(database)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    Ok(())
+}
+
+async fn catalog_scan_pending(
+    database: &PgPool,
+    run_id: Uuid,
+    requested_at: DateTime<Utc>,
+) -> Result<bool, JobExecutionError> {
+    let linked_pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM ops.media_scan_job_links AS link
+               JOIN ops.job_status AS job ON job.id = link.job_id
+              WHERE link.run_id = $1
+                AND link.phase = 'catalog'
+                AND job.status IN ('queued', 'running', 'retry_wait')
+         )",
+    )
+    .bind(run_id)
+    .fetch_one(database)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    if linked_pending {
+        return Ok(true);
+    }
+    let generated_pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM ops.media_scan_job_status AS job
+              WHERE job.created_at >= $1
+                AND job.job_type IN (
+                    'ingest.daily_export', 'ingest.refresh_movie',
+                    'ingest.refresh_tv', 'ingest.refresh_season'
+                )
+                AND job.status IN ('queued', 'running', 'retry_wait')
+         )",
+    )
+    .bind(requested_at)
+    .fetch_one(database)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    Ok(generated_pending)
+}
+
+async fn media_scan_pending(
+    database: &PgPool,
+    run_id: Uuid,
+    requested_at: DateTime<Utc>,
+) -> Result<bool, JobExecutionError> {
+    let linked_pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM ops.media_scan_job_links AS link
+               JOIN ops.job_status AS job ON job.id = link.job_id
+              WHERE link.run_id = $1
+                AND link.phase = 'media'
+                AND job.status IN ('queued', 'running', 'retry_wait')
+         )",
+    )
+    .bind(run_id)
+    .fetch_one(database)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    if linked_pending {
+        return Ok(true);
+    }
+    let generated_pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM ops.media_scan_job_status AS job
+              WHERE job.created_at >= $1
+                AND job.job_type IN (
+                    'image.download', 'ingest.refresh_movie',
+                    'ingest.refresh_tv', 'ingest.refresh_season',
+                    'ingest.refresh_reusable_gallery', 'admin.media_audit'
+                )
+                AND job.status IN ('queued', 'running', 'retry_wait')
+         )",
+    )
+    .bind(requested_at)
+    .fetch_one(database)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    Ok(generated_pending)
+}
+
+async fn audit_scan_pending(database: &PgPool, run_id: Uuid) -> Result<bool, JobExecutionError> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM ops.media_scan_job_links AS link
+               JOIN ops.job_status AS job ON job.id = link.job_id
+              WHERE link.run_id = $1
+                AND link.phase = 'audit'
+                AND job.status IN ('queued', 'running', 'retry_wait')
+         )",
+    )
+    .bind(run_id)
+    .fetch_one(database)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))
+}
+
+async fn finish_media_scan(
+    database: &PgPool,
+    run_id: Uuid,
+    success: bool,
+    error_code: Option<&str>,
+) -> Result<(), JobExecutionError> {
+    let counts: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT
+             count(*) FILTER (WHERE job.status = 'succeeded')::bigint,
+             count(*) FILTER (WHERE job.status = 'dead_letter')::bigint,
+             count(*) FILTER (WHERE job.status = 'cancelled')::bigint,
+             count(*) FILTER (WHERE job.status IN ('queued', 'running', 'retry_wait'))::bigint
+           FROM ops.media_scan_job_links AS link
+           JOIN ops.media_scan_job_status AS job ON job.id = link.job_id
+          WHERE link.run_id = $1",
+    )
+    .bind(run_id)
+    .fetch_one(database)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    let audit_counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+             COALESCE(SUM(CASE
+                 WHEN jsonb_typeof(job.result_summary -> 'audited') = 'number'
+                 THEN (job.result_summary ->> 'audited')::bigint
+                 ELSE 0
+             END), 0)::bigint,
+             COALESCE(SUM(CASE
+                 WHEN jsonb_typeof(job.result_summary -> 'invalid') = 'number'
+                 THEN (job.result_summary ->> 'invalid')::bigint
+                 ELSE 0
+             END), 0)::bigint,
+             COALESCE(SUM(CASE
+                 WHEN jsonb_typeof(job.result_summary -> 'repairQueued') = 'number'
+                 THEN (job.result_summary ->> 'repairQueued')::bigint
+                 ELSE 0
+             END), 0)::bigint
+           FROM ops.media_scan_job_links AS link
+           JOIN ops.media_scan_job_status AS job ON job.id = link.job_id
+          WHERE link.run_id = $1
+            AND link.phase = 'audit'
+            AND job.status = 'succeeded'",
+    )
+    .bind(run_id)
+    .fetch_one(database)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    let status = if !success || counts.1 > 0 {
+        "failed"
+    } else if counts.2 > 0 {
+        "cancelled"
+    } else {
+        "succeeded"
+    };
+    sqlx::query(
+        "UPDATE ops.media_scan_runs
+            SET status = $2,
+                phase = 'completed',
+                completed_count = $3,
+                failed_count = $4,
+                audited_count = $5,
+                invalid_count = $6,
+                repair_queued_count = $7,
+                finished_at = pg_catalog.clock_timestamp(),
+                error_code = $8
+          WHERE id = $1",
+    )
+    .bind(run_id)
+    .bind(status)
+    .bind(counts.0)
+    .bind(counts.1)
+    .bind(audit_counts.0)
+    .bind(audit_counts.1)
+    .bind(audit_counts.2)
+    .bind(error_code.or_else(|| (counts.1 > 0).then_some("linked_job_failed")))
+    .execute(database)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    Ok(())
+}
+
+async fn enqueue_full_media_jobs(
+    database: &PgPool,
+    run_id: Uuid,
+) -> Result<usize, JobExecutionError> {
+    let mut queued = 0_usize;
+    let titles: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT media_type, tmdb_id
+           FROM catalog.titles
+          WHERE active
+          ORDER BY id",
+    )
+    .fetch_all(database)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    for (media_type, tmdb_id) in titles {
+        let (job_type, payload_type) = match media_type.as_str() {
+            "movie" => (REFRESH_MOVIE_JOB, "movie"),
+            "tv" => (REFRESH_TV_JOB, "tv"),
+            _ => return Err(JobExecutionError::dead_letter("invalid_payload")),
+        };
+        let job = NewJob::new(
+            job_type,
+            INGEST_PAYLOAD_VERSION,
+            serde_json::json!({"tmdb_id": tmdb_id}),
+            &format!("media-scan:{run_id}:{payload_type}:{tmdb_id}"),
+        )
+        .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+        if submit_and_link_scan_job(database, run_id, "media", job).await? {
+            queued = queued.saturating_add(1);
+        }
+    }
+
+    let seasons: Vec<(i64, i32)> = sqlx::query_as(
+        "SELECT title.tmdb_id, season.season_number
+           FROM catalog.seasons AS season
+           JOIN catalog.titles AS title ON title.id = season.title_id
+          WHERE title.active
+          ORDER BY season.id",
+    )
+    .fetch_all(database)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    for (tv_id, season_number) in seasons {
+        let season_number = u16::try_from(season_number)
+            .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+        let job = NewJob::new(
+            REFRESH_SEASON_JOB,
+            INGEST_PAYLOAD_VERSION,
+            serde_json::json!({"tv_id": tv_id, "season_number": season_number}),
+            &format!("media-scan:{run_id}:season:{tv_id}:{season_number}"),
+        )
+        .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+        if submit_and_link_scan_job(database, run_id, "media", job).await? {
+            queued = queued.saturating_add(1);
+        }
+    }
+    for (entity_type, query) in [
+        ("person", "SELECT id FROM catalog.people ORDER BY id"),
+        ("company", "SELECT id FROM catalog.companies ORDER BY id"),
+        ("network", "SELECT id FROM catalog.networks ORDER BY id"),
+        (
+            "collection",
+            "SELECT id FROM catalog.collections ORDER BY id",
+        ),
+    ] {
+        queued = queued
+            .saturating_add(enqueue_reusable_jobs(database, run_id, entity_type, query).await?);
+    }
+    Ok(queued)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "missing-media discovery keeps the title, season, episode, and reusable-entity queries together"
+)]
+async fn enqueue_missing_media_jobs(
+    database: &PgPool,
+    run_id: Uuid,
+) -> Result<usize, JobExecutionError> {
+    let mut queued = enqueue_media_audit(database, run_id, true).await?;
+    let titles: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT title.media_type, title.tmdb_id
+           FROM catalog.titles AS title
+          WHERE title.active
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM assets.image_assets AS asset
+                 WHERE asset.title_id = title.id
+                   AND asset.image_kind = 'poster'
+                   AND asset.status = 'ready'
+            )
+          ORDER BY title.id",
+    )
+    .fetch_all(database)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    for (media_type, tmdb_id) in titles {
+        let (job_type, payload_type) = match media_type.as_str() {
+            "movie" => (REFRESH_MOVIE_JOB, "movie"),
+            "tv" => (REFRESH_TV_JOB, "tv"),
+            _ => return Err(JobExecutionError::dead_letter("invalid_payload")),
+        };
+        let job = NewJob::new(
+            job_type,
+            INGEST_PAYLOAD_VERSION,
+            serde_json::json!({"tmdb_id": tmdb_id}),
+            &format!("media-scan:{run_id}:missing:{payload_type}:{tmdb_id}"),
+        )
+        .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+        if submit_and_link_scan_job(database, run_id, "media", job).await? {
+            queued = queued.saturating_add(1);
+        }
+    }
+
+    let seasons: Vec<(i64, i32)> = sqlx::query_as(
+        "SELECT title.tmdb_id, season.season_number
+           FROM catalog.seasons AS season
+           JOIN catalog.titles AS title ON title.id = season.title_id
+          WHERE title.active
+            AND (
+                NOT EXISTS (
+                    SELECT 1
+                      FROM assets.image_assets AS asset
+                     WHERE asset.season_id = season.id
+                       AND asset.image_kind = 'poster'
+                       AND asset.status = 'ready'
+                )
+                OR EXISTS (
+                    SELECT 1
+                      FROM catalog.episodes AS episode
+                     WHERE episode.season_id = season.id
+                       AND NOT EXISTS (
+                           SELECT 1
+                             FROM assets.image_assets AS asset
+                            WHERE asset.episode_id = episode.id
+                              AND asset.image_kind = 'still'
+                              AND asset.status = 'ready'
+                       )
+                )
+            )
+          ORDER BY season.id",
+    )
+    .fetch_all(database)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    for (tv_id, season_number) in seasons {
+        let season_number = u16::try_from(season_number)
+            .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+        let job = NewJob::new(
+            REFRESH_SEASON_JOB,
+            INGEST_PAYLOAD_VERSION,
+            serde_json::json!({"tv_id": tv_id, "season_number": season_number}),
+            &format!("media-scan:{run_id}:missing:season:{tv_id}:{season_number}"),
+        )
+        .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+        if submit_and_link_scan_job(database, run_id, "media", job).await? {
+            queued = queued.saturating_add(1);
+        }
+    }
+    for (entity_type, query) in [
+        (
+            "person",
+            "SELECT person.id
+               FROM catalog.people AS person
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM assets.image_assets AS asset
+                   WHERE asset.person_id = person.id
+                     AND asset.image_kind = 'profile'
+                     AND asset.status = 'ready'
+              )
+              ORDER BY person.id",
+        ),
+        (
+            "company",
+            "SELECT company.id
+               FROM catalog.companies AS company
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM assets.image_assets AS asset
+                   WHERE asset.company_id = company.id
+                     AND asset.image_kind = 'logo'
+                     AND asset.status = 'ready'
+              )
+              ORDER BY company.id",
+        ),
+        (
+            "network",
+            "SELECT network.id
+               FROM catalog.networks AS network
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM assets.image_assets AS asset
+                   WHERE asset.network_id = network.id
+                     AND asset.image_kind = 'logo'
+                     AND asset.status = 'ready'
+              )
+              ORDER BY network.id",
+        ),
+        (
+            "collection",
+            "SELECT collection.id
+               FROM catalog.collections AS collection
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM assets.image_assets AS asset
+                   WHERE asset.collection_id = collection.id
+                     AND asset.image_kind IN ('poster', 'backdrop')
+                     AND asset.status = 'ready'
+              )
+              ORDER BY collection.id",
+        ),
+    ] {
+        queued = queued
+            .saturating_add(enqueue_reusable_jobs(database, run_id, entity_type, query).await?);
+    }
+    Ok(queued)
+}
+
+async fn enqueue_reusable_jobs(
+    database: &PgPool,
+    run_id: Uuid,
+    entity_type: &str,
+    query: &'static str,
+) -> Result<usize, JobExecutionError> {
+    let ids: Vec<i64> = sqlx::query_scalar(query)
+        .fetch_all(database)
+        .await
+        .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    let mut queued = 0_usize;
+    for tmdb_id in ids {
+        if tmdb_id <= 0 {
+            return Err(JobExecutionError::dead_letter("invalid_payload"));
+        }
+        let job = NewJob::new(
+            REFRESH_REUSABLE_GALLERY_JOB,
+            INGEST_PAYLOAD_VERSION,
+            serde_json::json!({"entityType": entity_type, "tmdbId": tmdb_id}),
+            &format!("media-scan:{run_id}:{entity_type}:{tmdb_id}"),
+        )
+        .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+        if submit_and_link_scan_job(database, run_id, "media", job).await? {
+            queued = queued.saturating_add(1);
+        }
+    }
+    Ok(queued)
 }
 
 async fn enqueue_missing_catalog_refresh_jobs(
@@ -1230,6 +2097,87 @@ mod tests {
         assert_eq!(upstream_http_status(&TmdbClientError::NotFound), 404);
         assert_eq!(media_type_name(MediaType::Movie), "movie");
         assert_eq!(media_type_name(MediaType::Tv), "tv");
+    }
+
+    #[test]
+    fn optional_gallery_not_found_is_empty_but_other_errors_are_preserved() {
+        assert!(matches!(
+            optional_gallery(Err(TmdbClientError::NotFound)),
+            Ok(gallery) if gallery.posters.is_empty()
+        ));
+        assert!(matches!(
+            optional_gallery(Err(TmdbClientError::Unauthorized)),
+            Err(TmdbClientError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn reusable_gallery_payloads_are_strict_and_use_tmdb_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let job = parse_job(
+            REFRESH_REUSABLE_GALLERY_JOB,
+            INGEST_PAYLOAD_VERSION,
+            &serde_json::json!({"entityType":"person","tmdbId":1_373_074}),
+        )?;
+        assert_eq!(
+            job,
+            IngestJob::RefreshReusableGallery {
+                entity_type: ReusableGalleryEntity::Person,
+                tmdb_id: 1_373_074,
+            }
+        );
+        assert_eq!(
+            job.dedup_key(),
+            "ingest.refresh_reusable_gallery:person:1373074"
+        );
+        assert!(matches!(
+            parse_job(
+                REFRESH_REUSABLE_GALLERY_JOB,
+                INGEST_PAYLOAD_VERSION,
+                &serde_json::json!({"entityType":"person","tmdbId":1_373_074,"extra":"rejected"}),
+            ),
+            Err(JobPayloadError::InvalidPayload)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn media_scan_payloads_cover_each_mode_and_reject_unknown_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let run_id = Uuid::now_v7();
+        for (mode, expected) in [
+            ("full", MediaScanMode::Full),
+            ("missing", MediaScanMode::Missing),
+            ("audit", MediaScanMode::Audit),
+        ] {
+            let job = parse_job(
+                ADMIN_MEDIA_SCAN_JOB,
+                INGEST_PAYLOAD_VERSION,
+                &serde_json::json!({
+                    "runId": run_id,
+                    "mode": mode,
+                    "repair": mode == "audit",
+                    "step": 0
+                }),
+            )?;
+            assert!(matches!(
+                job,
+                IngestJob::MediaScan {
+                    run_id: parsed,
+                    mode: parsed_mode,
+                    ..
+                } if parsed == run_id && parsed_mode == expected
+            ));
+        }
+        assert!(matches!(
+            parse_job(
+                ADMIN_MEDIA_SCAN_JOB,
+                INGEST_PAYLOAD_VERSION,
+                &serde_json::json!({"runId": run_id, "mode":"audit", "unexpected":true}),
+            ),
+            Err(JobPayloadError::InvalidPayload)
+        ));
+        Ok(())
     }
 
     #[test]

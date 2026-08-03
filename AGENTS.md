@@ -91,8 +91,8 @@ repository understandable, reproducible, and safe to publish.
   source paths deterministically. Use `backdrop`, never the old `banner` kind.
 - Store original source bytes in the title/entity root folders. Store one
   optimized derivative under the matching `optimized/` folder: JPEG quality
-  85 at max widths 640 for posters/seasons/thumbnails, 1280 for backdrops, 320
-  for profiles, and PNG width 500 for logos. Never upscale or generate WebP,
+  85 at max widths 640 for posters/seasons/thumbnails/profiles, 1280 for
+  backdrops, and PNG width 500 for logos. Never upscale or generate WebP,
   `full`, or responsive variants.
 - Episode thumbnails are optimized-only under `optimized/thumbnails/`; no
   original episode still is published. No `.masters` directory or old media

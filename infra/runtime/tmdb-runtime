@@ -87,7 +87,7 @@ case "${1:-}" in
         prepare_directory media /media/anime
         prepare_directory media /media/anime/movie
         prepare_directory media /media/anime/tv
-        prepare_directory media /media/casting
+        prepare_directory media /media/people
         prepare_directory media /media/networks
         prepare_directory media /media/companies
         prepare_directory media /media/collections

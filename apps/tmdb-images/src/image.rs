@@ -1206,7 +1206,7 @@ impl ImageStore {
                 )
             } else {
                 let source_relative = semantic_path(payload, &image.mime_type)
-                    .map_err(|_| StorageError::InvalidPayload)?;
+                    .map_err(|()| StorageError::InvalidPayload)?;
                 let source_destination = self.image_root.join(&source_relative);
                 let source_scratch = scratch_dir.join(format!(
                     ".source-{}.{}.part",
@@ -1458,7 +1458,8 @@ fn semantic_path(payload: &ImageJobPayload, mime_type: &str) -> Result<PathBuf, 
         )
         .map_err(|_| ()),
         ImageEntityType::Person => {
-            reusable_asset(ReusableEntity::Cast, payload.entity_id, variant, format).map_err(|_| ())
+            reusable_asset(ReusableEntity::Person, payload.entity_id, variant, format)
+                .map_err(|_| ())
         }
         ImageEntityType::Network => {
             reusable_asset(ReusableEntity::Network, payload.entity_id, variant, format)
@@ -1478,6 +1479,10 @@ fn semantic_path(payload: &ImageJobPayload, mime_type: &str) -> Result<PathBuf, 
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "each entity kind maps directly to the fixed public media contract"
+)]
 fn semantic_derivative_path(payload: &ImageJobPayload, width_hint: u32) -> Result<PathBuf, ()> {
     let width = width_hint;
     let format = if payload.kind == ImageKind::Logo {
@@ -1555,7 +1560,7 @@ fn semantic_derivative_path(payload: &ImageJobPayload, width_hint: u32) -> Resul
         )
         .map_err(|_| ()),
         ImageEntityType::Person => optimized_reusable_asset(
-            ReusableEntity::Cast,
+            ReusableEntity::Person,
             payload.entity_id,
             variant,
             format,
@@ -1619,10 +1624,9 @@ fn encode_derivative(
     let decoded = image::load_from_memory(body).map_err(|_| StorageError::Derivative)?;
     let (width, _height) = decoded.dimensions();
     let width_limit = match payload.kind {
-        ImageKind::Profile => 320,
         ImageKind::Backdrop => 1_280,
         ImageKind::Logo => 500,
-        ImageKind::Poster | ImageKind::Still | ImageKind::Other => 640,
+        ImageKind::Profile | ImageKind::Poster | ImageKind::Still | ImageKind::Other => 640,
     };
     let output_width = width.min(width_limit);
     let decoded = if width > output_width {
@@ -1645,15 +1649,17 @@ fn encode_derivative(
             bytes: encoded.into_inner(),
         })
     } else {
-        let mut encoded = Cursor::new(Vec::new());
-        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 85);
-        encoder
+        let mut output = Cursor::new(Vec::new());
+        let mut jpeg_encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, 85);
+        jpeg_encoder
             .encode_image(&decoded)
             .map_err(|_| StorageError::Derivative)?;
         let key = match payload.kind {
-            ImageKind::Profile => "jpeg_w320",
             ImageKind::Backdrop => "jpeg_w1280",
-            _ => "jpeg_w640",
+            ImageKind::Profile | ImageKind::Poster | ImageKind::Still | ImageKind::Other => {
+                "jpeg_w640"
+            }
+            ImageKind::Logo => unreachable!("logo derivatives use the PNG branch"),
         };
         Ok(EncodedDerivative {
             key,
@@ -1661,7 +1667,7 @@ fn encode_derivative(
             width_hint: width_limit,
             width: output_width,
             height: output_height,
-            bytes: encoded.into_inner(),
+            bytes: output.into_inner(),
         })
     }
 }

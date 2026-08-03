@@ -92,7 +92,7 @@ episode_optimized_only="$(psql_at "$password" "SELECT count(*) FROM assets.image
 invalid_variants="$(psql_at "$password" "SELECT count(*) FROM assets.image_variants WHERE mime_type NOT IN ('image/jpeg', 'image/png') OR storage_path !~ '(^|/)optimized/' OR (storage_path ~ '(^|/)optimized/thumbnails/' AND width > 640)")"
 video_counts="$(psql_at "$password" "SELECT COALESCE(json_object_agg(video_type || '/' || site, video_count ORDER BY video_type, site), '{}'::json)::text FROM (SELECT COALESCE(video_type, 'unknown') AS video_type, site, count(*) AS video_count FROM catalog.title_videos GROUP BY COALESCE(video_type, 'unknown'), site) counts")"
 media_permissions=true
-if ! compose exec -T media sh -ec 'test -d /media && test -d /media/movies && test -d /media/tv && test -d /media/anime/movie && test -d /media/anime/tv && test -d /media/casting && test -d /media/companies && test -d /media/networks && test -d /media/collections && test ! -e /media/.masters' </dev/null >/dev/null 2>&1; then
+if ! compose exec -T media sh -ec 'test -d /media && test -d /media/movies && test -d /media/tv && test -d /media/anime/movie && test -d /media/anime/tv && test -d /media/people && test -d /media/companies && test -d /media/networks && test -d /media/collections && test ! -e /media/.masters' </dev/null >/dev/null 2>&1; then
     media_permissions=false
 fi
 

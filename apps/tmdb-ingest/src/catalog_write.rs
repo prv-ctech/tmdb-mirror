@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, time::Duration};
+use std::{collections::BTreeSet, path::Path, time::Duration};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use sha2::{Digest, Sha256};
@@ -1347,6 +1347,133 @@ fn database_error(_: sqlx::Error) -> JobExecutionError {
     JobExecutionError::retry("database_unavailable", Duration::from_secs(5))
 }
 
+/// Enqueues the current gallery for an existing reusable catalog entity.
+/// The entity row supplies the detail endpoint's primary path; the dedicated
+/// gallery response supplies the remaining paths.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the four reusable entity kinds share one transaction and one gallery ordering path"
+)]
+pub(crate) async fn enqueue_reusable_gallery(
+    pool: &PgPool,
+    entity_type: &str,
+    entity_id: i64,
+    images: &TmdbImages,
+    allow_local_media: bool,
+) -> Result<(), JobExecutionError> {
+    if !allow_local_media {
+        return Ok(());
+    }
+    if entity_id <= 0 {
+        return Err(JobExecutionError::dead_letter("invalid_payload"));
+    }
+    let primary_paths: Option<(Option<String>, Option<String>)> = match entity_type {
+        "person" => sqlx::query_as(
+            "SELECT profile_path, NULL::text
+               FROM catalog.people
+              WHERE id = $1",
+        )
+        .bind(entity_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(database_error)?,
+        "company" => sqlx::query_as(
+            "SELECT logo_path, NULL::text
+               FROM catalog.companies
+              WHERE id = $1",
+        )
+        .bind(entity_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(database_error)?,
+        "network" => sqlx::query_as(
+            "SELECT logo_path, NULL::text
+               FROM catalog.networks
+              WHERE id = $1",
+        )
+        .bind(entity_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(database_error)?,
+        "collection" => sqlx::query_as(
+            "SELECT poster_path, backdrop_path
+               FROM catalog.collections
+              WHERE id = $1",
+        )
+        .bind(entity_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(database_error)?,
+        _ => return Err(JobExecutionError::dead_letter("invalid_payload")),
+    };
+    let Some((primary, secondary)) = primary_paths else {
+        return Err(JobExecutionError::retry(
+            "entity_not_ready",
+            Duration::from_secs(5),
+        ));
+    };
+
+    let mut transaction = pool.begin().await.map_err(database_error)?;
+    match entity_type {
+        "person" => {
+            enqueue_gallery_images(
+                &mut transaction,
+                entity_type,
+                entity_id,
+                "profile",
+                primary.as_deref(),
+                &images.profiles,
+                false,
+                allow_local_media,
+            )
+            .await?;
+        }
+        "company" | "network" => {
+            enqueue_gallery_images(
+                &mut transaction,
+                entity_type,
+                entity_id,
+                "logo",
+                primary.as_deref(),
+                &images.logos,
+                false,
+                allow_local_media,
+            )
+            .await?;
+        }
+        "collection" => {
+            enqueue_gallery_images(
+                &mut transaction,
+                entity_type,
+                entity_id,
+                "poster",
+                primary.as_deref(),
+                &images.posters,
+                false,
+                allow_local_media,
+            )
+            .await?;
+            enqueue_gallery_images(
+                &mut transaction,
+                entity_type,
+                entity_id,
+                "backdrop",
+                secondary.as_deref(),
+                &images.backdrops,
+                false,
+                allow_local_media,
+            )
+            .await?;
+        }
+        _ => return Err(JobExecutionError::dead_letter("invalid_payload")),
+    }
+    transaction.commit().await.map_err(database_error)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "title gallery metadata is passed explicitly to preserve the shared enqueue contract"
+)]
 async fn enqueue_title_images(
     transaction: &mut Transaction<'_, Postgres>,
     entity_type: &str,
@@ -1392,6 +1519,10 @@ async fn enqueue_title_images(
     .await
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "gallery ownership and naming inputs are explicit at the database boundary"
+)]
 async fn enqueue_gallery_images(
     transaction: &mut Transaction<'_, Postgres>,
     entity_type: &str,
@@ -1418,6 +1549,10 @@ async fn enqueue_gallery_images(
     .await
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the low-level image job payload maps one-to-one to the normalized gallery columns"
+)]
 async fn enqueue_gallery_images_with_position(
     transaction: &mut Transaction<'_, Postgres>,
     entity_type: &str,
@@ -1526,7 +1661,11 @@ async fn enqueue_image_job_with_position_and_index(
     let Some(tmdb_path) = tmdb_path.filter(|path| valid_image_path(path)) else {
         return Ok(());
     };
-    let source_path = if kind == "logo" && tmdb_path.ends_with(".svg") {
+    let source_path = if kind == "logo"
+        && Path::new(tmdb_path)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+    {
         format!("{}png", tmdb_path.trim_end_matches("svg"))
     } else {
         tmdb_path.to_owned()

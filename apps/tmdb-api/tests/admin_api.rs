@@ -10,8 +10,9 @@ use secrecy::SecretString;
 use tmdb_api::{
     AdminApiError, AdminApiStore, AdminBackupStatus, AdminBuildStatus, AdminCatalogCounts,
     AdminComponentHealth, AdminDatabaseStatus, AdminJob, AdminJobDetail, AdminJobEvent,
-    AdminJobListRequest, AdminJobPage, AdminOperation, AdminPoolStatus, AdminStatus,
-    AdminSubmission, build_admin_router_with_operations_and_auth,
+    AdminJobListRequest, AdminJobPage, AdminMediaScanMode, AdminMediaScanStatus,
+    AdminMediaScanSubmission, AdminMediaWorkerAction, AdminMediaWorkerStatus, AdminOperation,
+    AdminPoolStatus, AdminStatus, AdminSubmission, build_admin_router_with_operations_and_auth,
 };
 use tmdb_jobs::{JobId, JobStatus};
 use tmdb_observability::Metrics;
@@ -37,7 +38,7 @@ impl AdminApiStore for FakeAdminStore {
         Ok(AdminStatus {
             build: AdminBuildStatus {
                 version: "test".to_owned(),
-                schema_revision: Some("0028".to_owned()),
+                schema_revision: Some("0029".to_owned()),
             },
             database: AdminDatabaseStatus {
                 reachable: true,
@@ -98,6 +99,36 @@ impl AdminApiStore for FakeAdminStore {
             job_id: self.job_id,
             duplicate: false,
         })
+    }
+
+    async fn start_media_scan(
+        &self,
+        _mode: AdminMediaScanMode,
+        _repair: bool,
+        _idempotency_key: &str,
+        _request_id: &str,
+    ) -> Result<AdminMediaScanSubmission, AdminApiError> {
+        Err(AdminApiError::Unavailable)
+    }
+
+    async fn get_media_scan(
+        &self,
+        _run_id: Uuid,
+    ) -> Result<Option<AdminMediaScanStatus>, AdminApiError> {
+        Err(AdminApiError::Unavailable)
+    }
+
+    async fn set_media_worker(
+        &self,
+        _action: AdminMediaWorkerAction,
+        _idempotency_key: &str,
+        _request_id: &str,
+    ) -> Result<AdminMediaWorkerStatus, AdminApiError> {
+        Err(AdminApiError::Unavailable)
+    }
+
+    async fn media_worker(&self) -> Result<AdminMediaWorkerStatus, AdminApiError> {
+        Err(AdminApiError::Unavailable)
     }
 
     async fn cancel(
@@ -172,6 +203,50 @@ async fn admin_operations_require_existing_admin_authentication()
 }
 
 #[tokio::test]
+async fn media_controls_require_authentication_and_validate_scan_requests()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (app, _) = app();
+    let response = app
+        .clone()
+        .oneshot(Request::get("/admin/v1/media/worker").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/admin/v1/media/scans")
+                .header("x-api-key", "a-test-key-that-is-long-enough-to-be-valid")
+                .header("idempotency-key", "media-scan-invalid")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"mode":"full","repair":true}"#))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/admin/v1/media/worker")
+                .header("x-api-key", "a-test-key-that-is-long-enough-to-be-valid")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"action":"pause"}"#))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .oneshot(
+            Request::get("/admin/v1/media/scans/not-a-uuid")
+                .header("x-api-key", "a-test-key-that-is-long-enough-to-be-valid")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
 async fn private_openapi_documents_every_admin_operation() -> Result<(), Box<dyn std::error::Error>>
 {
     let (app, _) = app();
@@ -190,6 +265,9 @@ async fn private_openapi_documents_every_admin_operation() -> Result<(), Box<dyn
         "/admin/v1/status",
         "/admin/v1/jobs",
         "/admin/v1/scans",
+        "/admin/v1/media/scans",
+        "/admin/v1/media/scans/{run_id}",
+        "/admin/v1/media/worker",
         "/admin/v1/media/audits",
         "/admin/v1/maintenance/analyze",
         "/admin/v1/backups",
@@ -214,7 +292,7 @@ async fn status_and_bounded_job_history_are_available_to_an_admin()
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 4096).await?)?;
-    assert_eq!(body["data"]["build"]["schemaRevision"], "0028");
+    assert_eq!(body["data"]["build"]["schemaRevision"], "0029");
 
     let response = app
         .clone()

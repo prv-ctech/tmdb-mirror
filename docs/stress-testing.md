@@ -43,6 +43,7 @@ Run the bounded checks in this order:
 ./scripts/stress-seed.sh --project-name tmdb_stress_test --count 100000
 ./scripts/stress-artwork.sh --project-name tmdb_stress_test
 ./scripts/stress-media-assets.sh --project-name tmdb_stress_test
+./scripts/stress-media-scans.sh --project-name tmdb_stress_test
 ./scripts/stress-http.sh --project-name tmdb_stress_test --concurrency 100 --requests-per-worker 100
 ./scripts/stress-trawl.sh --project-name tmdb_stress_test
 ./scripts/stress-resilience.sh --project-name tmdb_stress_test
@@ -69,6 +70,15 @@ gallery counts, original and optimized rows, episode optimized-only rows,
 variant MIME/path violations, video counts by type/provider, HTTP status,
 permissions, worker IDs, and failures. Results and redacted diagnostics remain
 under the ignored runtime directory.
+
+`stress-media-scans.sh` uses the disposable admin key from the generated stress
+environment and never prints it. The real TMDB credentials are read from
+ignored `secrets.txt` for the upstream requests. It verifies authentication,
+scan idempotency, audit counters, pause/resume/start/cancel actions, and that a
+paused state survives a media-container restart. It leaves the durable media
+worker running. Full and missing scans are submitted only in bounded
+unit/database tests; do not launch an unbounded full scan against a live
+catalog during a stress run.
 
 The private backup API accepts `{"type":"full"}` or
 `{"type":"differential"}` and requires an idempotency key. It returns a durable
