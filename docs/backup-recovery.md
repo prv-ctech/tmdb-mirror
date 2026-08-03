@@ -20,8 +20,37 @@ pgBackRest's archive command. The built-in PostgreSQL runner uses
 The date-keyed durable submission prevents a duplicate on the fall DST hour.
 Manual full or differential backups are queued through `POST /admin/v1/backups`
 with an `Idempotency-Key`; they remain jobs rather than blocking an API call.
-Transient failures return both the job and its paired backup request to the
-retry queue; terminal failures retain the durable failure record.
+The external API uses `type: "full"` or `type: "differential"` exactly (the
+internal durable job type for the latter is `database.backup_diff`). Transient
+failures return both the job and its paired backup request to the retry queue;
+terminal failures retain the durable failure record.
+
+From a trusted container on `prv.network`:
+
+```bash
+admin_base=http://tmdb-mirror-api:8081
+admin_key='<TMDB_ADMIN_API_KEY>'
+
+curl -sS -X POST "$admin_base/admin/v1/backups" \
+  -H "X-API-Key: $admin_key" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: backup-full-20260803' \
+  -d '{"type":"full"}'
+
+curl -sS -X POST "$admin_base/admin/v1/backups" \
+  -H "X-API-Key: $admin_key" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: backup-differential-20260803' \
+  -d '{"type":"differential"}'
+
+curl -sS "$admin_base/admin/v1/backups" \
+  -H "X-API-Key: $admin_key"
+```
+
+Each write returns `202 Accepted` with a durable `jobId`. Poll
+`GET /admin/v1/jobs/{job_id}` until the job reaches a terminal state, then
+verify the paired request through `GET /admin/v1/backups` and inspect the
+repository with `tmdb-pgbackrest info` inside PostgreSQL.
 
 A backup runs `check` after every backup and `verify` after a new full backup.
 It creates the backup with expiration deferred, then expires the old recovery

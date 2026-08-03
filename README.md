@@ -1,58 +1,109 @@
 # TMDB Mirror
 
-Rust + PostgreSQL 18 mirror of TMDB metadata with fast catalog search, strict
-anime isolation, local responsive image storage, and four production
-containers: PostgreSQL, API, main worker, and media worker.
+Rust + PostgreSQL 18 mirror of TMDB metadata with catalog search, strict anime
+isolation, local responsive image storage, durable worker jobs, and four
+runtime services: PostgreSQL, API, main worker, and media worker.
 
-## Run
+## Run with Docker Compose
 
-```powershell
-Copy-Item .env.example .env
-docker compose -f docker-compose-example.yaml pull
-docker compose -f docker-compose-example.yaml up -d
+`deploy/compose.production.yaml` is the canonical checkout deployment. It
+pulls the published Linux AMD64 images and uses these host paths:
+
+| Service | Host port | Purpose |
+| --- | ---: | --- |
+| `postgres` | none | PostgreSQL 18, migrations, WAL archiving, and pgBackRest |
+| `api` | `8080` | Public catalog API |
+| `worker` | none | Migrations, schedules, ingest, retries, and durable jobs |
+| `media` | `8090` | Downloaded public image files |
+
+The admin listener remains on container port `8081` and is not published by
+the production file. A container on the existing `prv.network` can reach it at
+`http://tmdb-mirror-api:8081`.
+
+Keep the real runtime environment outside the repository. The template has
+placeholders only; never commit a token, password, or private key. For a
+Linux deployment:
+
+```bash
+runtime_env=/secure/path/tmdb-mirror.env
+cp .env.example "$runtime_env"
+chmod 600 "$runtime_env"
+# Edit "$runtime_env" and replace every angle-bracket placeholder.
+export TMDB_ENV_FILE="$runtime_env"
+
+./scripts/validate-production-compose.sh \
+  --env-file "$TMDB_ENV_FILE" \
+  --compose-file deploy/compose.production.yaml
+docker compose --env-file "$TMDB_ENV_FILE" \
+  -f deploy/compose.production.yaml pull
+docker compose --env-file "$TMDB_ENV_FILE" \
+  -f deploy/compose.production.yaml up -d
+docker compose --env-file "$TMDB_ENV_FILE" \
+  -f deploy/compose.production.yaml ps
 ```
 
-Set the TMDB read token, PostgreSQL password, and admin API key in `.env`.
-`POSTGRES_DB` and `POSTGRES_USER` are configurable and used directly by every
-service; no duplicate `DATABASE_*` settings exist. Container paths are fixed:
-`/config` for cache/exports/logs and `/media` for final media. Choose host
-paths only in Compose or Unraid mounts.
+The external `prv.network` must already exist. The Compose file creates the
+relative `deploy/data/postgres18`, `deploy/data/config`, and `deploy/data/media`
+directories. The application paths inside containers are fixed: `/config` for
+scratch, exports, checkpoints, logs, and backups; `/media` for public files and
+private `.masters` originals. Masters are never served.
 
-The public API is `http://<host>:8080`; local media is normally
-`http://<host>:8090/media`. The private admin listener is not host-published:
-containers on `prv.network` use `http://tmdb-mirror-api:8081`.
+`docker-compose-example.yaml` remains a compatibility entry point. New
+deployments should use the canonical file above. See
+[production deployment](docs/deployment-production.md) for bind mounts,
+permissions, media policy, and validation.
 
 ## API
 
-Public paths have compatible unversioned and `/v1` forms:
+Public catalog routes require no client key and have both unversioned and
+stable `/v1` forms:
 
 ```text
+GET /v1/health/live
 GET /v1/movies?genreId=28&language=en
 GET /v1/tv/{tmdb_id}
-GET /v1/anime?q=one%20piece
-GET /v1/search?q=matrix
+GET /v1/anime?q=one%20piece&type=tv
+GET /v1/search?q=matrix&limit=20
 GET /v1/openapi.json
 ```
 
-Movie/TV routes never return anime. Anime routes search both anime movies and
-TV unless `type=movie` or `type=tv` is given. See [API reference](docs/api.md).
+Movie and TV routes never return anime. Anime routes remain isolated and can
+search both anime media types unless `type=movie` or `type=tv` is supplied.
+The private admin API supports status, durable job history, explicit scans,
+cancellation/retry, non-destructive media audits, allowlisted analyze jobs,
+and full/differential backup requests. Admin writes require
+`Idempotency-Key` and return `202 Accepted` durable jobs.
 
-Admin uses `X-API-Key` or Bearer authentication and supports status, durable
-job history, explicit scans, cancellation/retry, non-destructive media audits,
-allowlisted analyze jobs, and full/differential backup requests. Admin writes
-require `Idempotency-Key` and return `202 Accepted` jobs.
+See the complete [API reference](docs/api.md), or query the public and private
+OpenAPI documents at `/v1/openapi.json` and `/admin/v1/openapi.json` from their
+respective listeners.
+
+## Development and stress testing
+
+The development Compose file starts only an isolated PostgreSQL fixture:
+
+```bash
+docker compose --env-file deploy/env.example \
+  -f deploy/compose.dev.yaml up -d postgres
+./scripts/verify-postgres.sh
+```
+
+For the full bounded Docker Desktop test, use the Linux/Bash harness in
+[stress testing](docs/stress-testing.md). It reads the real TMDB stress token
+from the ignored `.secrets.txt` file (with `secrets.txt` as a local fallback),
+injects it only into a mode-600 runtime file, and uses a unique project with
+loopback-only ports. Do not put that token in `.env`, Compose YAML, source, or
+test artifacts.
 
 ## Operations
 
-`TZ=America/New_York` controls schedules and readable log timestamps; persisted
-timestamps remain UTC. pgBackRest lives inside PostgreSQL and stores its local
-repository only at `/config/backups/pgbackrest`. See
+`TZ=America/New_York` controls schedule interpretation and readable log
+timestamps; persisted API and database timestamps remain UTC. pgBackRest stores
+its same-host recovery repository at `/config/backups/pgbackrest`. See
 [backup and recovery](docs/backup-recovery.md).
 
-The optional k6 runner is an ephemeral test container, not a fifth production
-service. Run [stress testing](docs/stress-testing.md) deliberately before a
-release. GitHub publishes rolling `main`, immutable `vX.Y.Z` images, and a
-digest-pinned release Compose artifact; details are in [release notes](docs/release.md).
+GitHub publishes rolling `main` images, immutable versioned images, and a
+digest-pinned release Compose artifact. See [release notes](docs/release.md).
 
 ## TMDB attribution
 

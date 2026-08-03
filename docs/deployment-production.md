@@ -71,11 +71,14 @@ application.
 
 ## Environment and startup
 
-Copy the root environment template, replace its angle-bracket values, and keep
-that `.env` file outside source control. It contains the single PostgreSQL
-password, TMDB read token, and admin API key used by the stack. The same file is
-passed to all four containers through `env_file`. No repository checkout or
-local Docker build is needed after GitHub Actions has published the images.
+Copy the root environment template to a mode-600 runtime file outside the
+checkout and replace every angle-bracket value. It contains the PostgreSQL
+owner credentials, least-privilege role credentials, TMDB read token, and admin
+API key used by the stack. Keep that file out of the repository; do not place a
+real token in `.env`, Compose YAML, or a generated artifact. The same runtime
+file is passed to all four containers through `env_file`. No repository
+checkout or local Docker build is needed after GitHub Actions has published the
+images.
 
 Each key has an inline description in `.env.example`. The public, admin, and
 media routes are listed in [api.md](api.md).
@@ -83,11 +86,13 @@ media routes are listed in [api.md](api.md).
 `TZ=America/New_York` controls schedule interpretation and human-readable
 terminal timestamps. PostgreSQL and API timestamps remain UTC.
 
-The app reads only `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` for
-its database identity. You may choose any valid database and owner names; the
-bootstrap script, workers, API readiness check, and PostgreSQL health check
-all use those same values. Its database connection is fixed to the internal
-Compose service `postgres:5432`; do not add `DATABASE_*`, `TMDB_DB_*`, or
+The PostgreSQL service uses `POSTGRES_DB`, `POSTGRES_USER`, and
+`POSTGRES_PASSWORD` for the database owner and health check. Application
+processes use the explicit `TMDB_MIGRATOR_*`, `TMDB_API_READER_*`,
+`TMDB_API_JOB_SUBMITTER_*`, `TMDB_INGEST_WRITER_*`, and
+`TMDB_IMAGE_WRITER_*` role settings so a public read path cannot write catalog
+or job tables. Its database connection is fixed to the internal Compose
+service `postgres:5432`; do not add `DATABASE_*`, `TMDB_DB_*`, or ad-hoc
 per-process database aliases.
 
 Keep `TMDB_RATE_LIMIT` at `40` or lower. The worker rejects a higher value
@@ -111,18 +116,29 @@ IDs/types, retry codes, image entity IDs, safe HTTP status, and safe I/O
 classes such as `permission_denied`. They never print database passwords,
 tokens, image source URLs, payloads, host bind paths, or raw upstream errors.
 
-```powershell
-Copy-Item .env.example .env
-./scripts/validate-production-compose.ps1 -EnvFile .env -ComposeFile deploy/compose.production.yaml
-docker compose -f deploy/compose.production.yaml pull
-docker compose -f deploy/compose.production.yaml up -d
+```bash
+runtime_env=/secure/path/tmdb-mirror.env
+cp .env.example "$runtime_env"
+chmod 600 "$runtime_env"
+# Edit "$runtime_env" and replace every angle-bracket value.
+export TMDB_ENV_FILE="$runtime_env"
+
+./scripts/validate-production-compose.sh \
+  --env-file "$TMDB_ENV_FILE" \
+  --compose-file deploy/compose.production.yaml
+docker compose --env-file "$TMDB_ENV_FILE" \
+  -f deploy/compose.production.yaml config --quiet
+docker compose --env-file "$TMDB_ENV_FILE" \
+  -f deploy/compose.production.yaml pull
+docker compose --env-file "$TMDB_ENV_FILE" \
+  -f deploy/compose.production.yaml up -d
 ```
 
 The main worker applies migrations under the existing PostgreSQL advisory lock;
-restarts are safe. If no completed detail-capable inventory exists, it queues
-one movie and one TV export immediately. That first pass expands into durable
-detail jobs; later daily exports only queue IDs that are missing full catalog
-detail. The worker runs up to eight ingestion loops, bounded by
+restarts are safe and do not start an implicit full catalog scan. The scheduler
+queues only the configured changes, trending, and daily-export jobs. Operators
+request bounded `full`, `missing`, or `changes` scans through the private admin
+API. The worker runs up to eight ingestion loops, bounded by
 `TMDB_MAX_CONNECTIONS` and `TMDB_RATE_LIMIT`. The media worker waits for the
 durable queue schema before claiming image jobs, so first-boot migrations do
 not cause an image-worker crash.
@@ -156,10 +172,11 @@ server rejects that subtree. Temporary files are created only below
 Before exposing the API, validate the deployment definition and run the full
 workspace checks:
 
-```powershell
-./scripts/validate-production-compose.ps1
-docker compose -f deploy/compose.production.yaml ps
-docker compose -f deploy/compose.production.yaml logs --no-color --tail=200 postgres worker api media
+```bash
+./scripts/validate-production-compose.sh --env-file "$TMDB_ENV_FILE"
+docker compose --env-file "$TMDB_ENV_FILE" -f deploy/compose.production.yaml ps
+docker compose --env-file "$TMDB_ENV_FILE" \
+  -f deploy/compose.production.yaml logs --no-color --tail=200 postgres worker api media
 ```
 
 Exercise both `ALLOW_LOCAL_MEDIA` modes, a movie, TV, anime movie, anime TV,

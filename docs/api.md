@@ -1,91 +1,55 @@
 # API reference
 
-All catalog endpoints are `GET` and use the public API base URL, normally
-`http://<server-host>:8080`. They do not require a client key. Catalog responses
-contain `data`; paged title lists also return `nextCursor`.
+The API has three listeners in the four-container deployment:
 
-Every public path below also has a `/v1` alias, for example `/v1/movies` and
-`/v1/anime?q=one%20piece`. Existing unversioned paths remain supported. The
-machine-readable document is `GET /v1/openapi.json`.
+| Listener | Default address | Contract |
+| --- | --- | --- |
+| Public catalog | `http://<host>:8080` | Unauthenticated catalog, search, health, and the public OpenAPI document |
+| Private admin | `http://<private-host>:8081` | API-key protected operations, jobs, backups, and metrics |
+| Media | `http://<host>:8090` | Public verified image files and media health |
 
-`{id}` is a positive TMDB ID. `{type}` is `movie` or `tv`. Use the `nextCursor`
-value unchanged in the next request's `cursor` parameter.
+The production Compose file publishes `8080` and `8090` only. The admin
+listener is available to containers on `prv.network` as
+`http://tmdb-mirror-api:8081`; the disposable stress Compose file publishes it
+to a loopback-only test port.
 
-## Health
+Public catalog routes are available with both their existing unversioned path
+and their stable `/v1` alias. New clients should use `/v1`. The generated
+public contract is `GET /v1/openapi.json`; the private contract is
+`GET /admin/v1/openapi.json` on the admin listener.
 
-| Path | Purpose |
-| --- | --- |
-| `/health/live` | Process liveness check; does not require PostgreSQL. |
-| `/health/ready` | Readiness check for PostgreSQL, schema, extensions, and roles. |
+`{tmdb_id}` is a positive TMDB ID. `{media_type}` is `movie` or `tv`. JSON
+properties use camelCase. Public list responses use `{ "data": [...],
+"nextCursor": ... }`; non-paged resources use `{ "data": ... }`.
 
-## Movies and TV
+## Health and OpenAPI
 
-These paths deliberately exclude anime. They accept `limit` (1-100), `cursor`,
-and the catalog filters listed below.
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/health/live` or `/v1/health/live` | Process liveness; does not require PostgreSQL |
+| `GET` | `/health/ready` or `/v1/health/ready` | PostgreSQL, schema, extensions, and role readiness |
+| `GET` | `/v1/openapi.json` | Machine-readable public catalog route document |
 
-| Path | Order or resource |
-| --- | --- |
-| `/movies` or `/movies/popular` | Popular non-anime movies. |
-| `/movies/recent` | Recently released non-anime movies. |
-| `/movies/top-rated` | Highest-rated non-anime movies. |
-| `/movies/{id}` | Full movie metadata and facets. |
-| `/movies/{id}/credits` | Movie cast and crew. |
-| `/movies/{id}/images` | Movie image metadata and URLs. |
-| `/tv` or `/tv/popular` | Popular non-anime TV series. |
-| `/tv/recent` | Recently aired non-anime TV series. |
-| `/tv/top-rated` | Highest-rated non-anime TV series. |
-| `/tv/{id}` | Full TV metadata and facets. |
-| `/tv/{id}/credits` | TV cast and crew. |
-| `/tv/{id}/images` | TV image metadata and URLs. |
-| `/tv/{id}/seasons` | All seasons for a non-anime TV series. |
-| `/tv/{id}/seasons/{season}` | One season. |
-| `/tv/{id}/seasons/{season}/episodes` | All episodes in one season. |
-| `/tv/{id}/seasons/{season}/episodes/{episode}` | One episode. |
+Example:
 
-For a movie or TV title, these TMDB-parity facets are available on the matching
-path. They preserve the same anime isolation as the title route.
+```bash
+curl -i http://127.0.0.1:8080/v1/health/live
+curl -sS http://127.0.0.1:8080/v1/openapi.json
+```
 
-| Suffix | Data returned |
-| --- | --- |
-| `/translations` | Localized title, overview, tagline, and homepage data. |
-| `/alternate-titles` | Regional and type-specific alternate names. |
-| `/external-ids` | Available IMDB, TVDB, Wikidata, and social identifiers. |
-| `/videos` | TMDB video metadata; it does not proxy video files. |
-| `/release-dates` (movies) | Regional movie dates, release types, and certifications. |
-| `/certifications` (TV) | Regional TV content ratings/certifications. |
+## Common catalog query parameters
 
-## Anime
+`limit` defaults to 20 and accepts 1–100. `cursor` is returned by a paged
+movie, TV, or anime list and must be sent back unchanged. Cursor formats are
+internal contract values; do not construct or modify them.
 
-Anime paths return only titles classified by the `anime` keyword. Normal movie
-and TV paths return `404` for those same titles, so the two catalogs never mix.
+`q` is the search term. It is required by `/search`, optional on the popular
+anime route, limited to 256 characters, and is accent-insensitive. `query` is
+not an alias for `q`.
 
-| Path | Order or resource |
-| --- | --- |
-| `/anime` or `/anime/popular` | Popular anime movies and TV; `q` turns this into anime-only search. |
-| `/anime/recent` | Recently released/aired anime. |
-| `/anime/top-rated` | Highest-rated anime. |
-| `/anime/{type}/{id}` | Anime movie or TV metadata. |
-| `/anime/{type}/{id}/images` | Anime image metadata and URLs. |
-
-Anime detail routes also support `/translations`, `/alternate-titles`,
-`/external-ids`, `/videos`, `/release-dates`, and `/credits`. They always
-require `{type}` to be `movie` or `tv`; list/search routes omit it to search
-both anime namespaces together.
-
-`/anime` and `/anime/popular` accept `type=movie` or `type=tv` to narrow the
-result. Do not add a type when you want both anime movies and anime TV results,
-for example `GET /anime?q=one%20piece`.
-
-## Search and filters
-
-| Path | Required and optional query parameters |
-| --- | --- |
-| `/search` | Required `q`; optional `type=movie\|tv`, `limit`, and catalog filters. Searches only non-anime titles. |
-| `/anime` or `/anime/popular` | Optional `q`, `type=movie\|tv`, `limit`, and catalog filters. Search results remain anime-only. |
-| Movie/TV list paths | Optional `limit`, `cursor`, and catalog filters. |
-
-Catalog filter parameters can be combined on `/search`, movie/TV lists, and
-anime lists:
+`type` and `mediaType` are accepted aliases for `movie` or `tv` where a route
+allows media selection. The following filter aliases are accepted on search,
+movie/TV lists, and anime lists:
 
 | Filter | Accepted names | Example |
 | --- | --- | --- |
@@ -93,106 +57,253 @@ anime lists:
 | Keyword | `keywordId` or `keyword` | `keywordId=210024` |
 | Tag | `tagId` or `tag` | `tagId=7` |
 | Language | `language` or `lang` | `language=en` |
-| Runtime | `runtimeMin`/`lengthMin`, `runtimeMax`/`lengthMax` | `runtimeMin=90&runtimeMax=180` |
-| Cast or crew person | `personId`, `person`, `actorId`, or `actor` | `actorId=500` |
-| Company or studio | `companyId`, `company`, `studioId`, or `studio` | `studioId=420` |
+| Runtime | `runtimeMin`/`lengthMin`, `runtimeMax`/`lengthMax` | `runtimeMin=90` |
+| Person | `personId`, `person`, `actorId`, or `actor` | `actorId=500` |
+| Company | `companyId`, `company`, `studioId`, or `studio` | `studioId=420` |
 | Network | `networkId` or `network` | `networkId=213` |
 | Year | `year` | `year=2024` |
 | Release status | `status` | `status=Released` |
 
-`q` is the search parameter; `query` is not a valid alias. Search is accent
-insensitive, so `q=cafe` can find a title stored with an accented spelling.
+Unknown, duplicate, malformed, or route-incompatible parameters return `400`.
 
-Examples:
+## Movies and TV
+
+These routes always exclude anime. The list routes accept `limit`, `cursor`, and
+the filters above, but not `q`, `type`, or `anime`.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/v1/movies` or `/v1/movies/popular` | Popular non-anime movies |
+| `GET` | `/v1/movies/recent` | Recently released non-anime movies |
+| `GET` | `/v1/movies/top-rated` | Highest-rated non-anime movies |
+| `GET` | `/v1/movies/{tmdb_id}` | Full movie metadata and facets |
+| `GET` | `/v1/movies/{tmdb_id}/credits` | Movie cast and crew |
+| `GET` | `/v1/movies/{tmdb_id}/images` | Movie image metadata and URLs |
+| `GET` | `/v1/tv` or `/v1/tv/popular` | Popular non-anime TV series |
+| `GET` | `/v1/tv/recent` | Recently aired non-anime TV series |
+| `GET` | `/v1/tv/top-rated` | Highest-rated non-anime TV series |
+| `GET` | `/v1/tv/{tmdb_id}` | Full TV metadata and facets |
+| `GET` | `/v1/tv/{tmdb_id}/credits` | TV cast and crew |
+| `GET` | `/v1/tv/{tmdb_id}/images` | TV image metadata and URLs |
+| `GET` | `/v1/tv/{tmdb_id}/seasons` | All seasons |
+| `GET` | `/v1/tv/{tmdb_id}/seasons/{season_number}` | One season |
+| `GET` | `/v1/tv/{tmdb_id}/seasons/{season_number}/episodes` | All episodes in one season |
+| `GET` | `/v1/tv/{tmdb_id}/seasons/{season_number}/episodes/{episode_number}` | One episode |
+
+The following title facets are available on the matching detail routes below;
+movies use `/release-dates`, while TV uses `/certifications`:
+
+| Suffix | Data |
+| --- | --- |
+| `/translations` | Localized title, overview, tagline, and homepage |
+| `/alternate-titles` | Regional and typed alternate names |
+| `/external-ids` | Known IMDB, TVDB, Wikidata, and social identifiers |
+| `/videos` | TMDB video metadata; video files are not proxied |
+| `/release-dates` | Movie regional dates, release types, and certifications |
+| `/certifications` | TV regional certifications |
+
+Movie and TV detail routes return `404` when the ID belongs to the opposite
+anime partition. This prevents an anime title from leaking into the normal
+catalog.
+
+## Anime
+
+Anime routes return only titles classified by the `anime` keyword. The popular
+anime route becomes anime-only search when `q` is supplied. `type=movie` or
+`type=tv` narrows a list or search; omitting it searches both namespaces.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/v1/anime` or `/v1/anime/popular` | Popular anime movies and TV; optional `q` searches |
+| `GET` | `/v1/anime/recent` | Recently released/aired anime |
+| `GET` | `/v1/anime/top-rated` | Highest-rated anime |
+| `GET` | `/v1/anime/{media_type}/{tmdb_id}` | Anime movie or TV metadata |
+| `GET` | `/v1/anime/{media_type}/{tmdb_id}/credits` | Anime cast and crew |
+| `GET` | `/v1/anime/{media_type}/{tmdb_id}/images` | Anime image metadata and URLs |
+| `GET` | `/v1/anime/{media_type}/{tmdb_id}/translations` | Anime translations |
+| `GET` | `/v1/anime/{media_type}/{tmdb_id}/alternate-titles` | Anime alternate titles |
+| `GET` | `/v1/anime/{media_type}/{tmdb_id}/external-ids` | Anime external IDs |
+| `GET` | `/v1/anime/{media_type}/{tmdb_id}/videos` | Anime video metadata |
+| `GET` | `/v1/anime/{media_type}/{tmdb_id}/release-dates` | Anime regional dates/certifications |
+
+The anime `recent` and `top-rated` routes are list routes; they do not accept
+`q`. All anime list routes accept the common filters and `type`/`mediaType`.
+
+## Search, discovery, trends, and calendars
+
+### Search
+
+`GET /v1/search` requires `q`, accepts `type`/`mediaType`, `limit`, and the
+catalog filters, and searches only non-anime titles.
 
 ```text
-GET /search?q=one%20piece&type=tv&limit=20
-GET /anime?q=one%20piece
-GET /movies?genreId=28&language=en&runtimeMax=140&limit=20
-GET /tv/top-rated?networkId=213&year=2024
+GET /v1/search?q=one%20piece&type=tv&limit=20
+GET /v1/movies?genreId=28&language=en&runtimeMax=140&limit=20
+GET /v1/tv/top-rated?networkId=213&year=2024
+GET /v1/anime?q=one%20piece
 ```
 
-## Discovery endpoints
+### Discovery dimensions
 
-These paths return `{ "data": [...] }`. They accept `q` for a name search,
-`limit` (1-100), and optional `anime=true` to list values used by anime only.
-They do not accept catalog filters, `cursor`, or `type`.
+The following routes return `{ "data": [...] }`. They accept `q`, `limit`,
+and `anime=true|false`; they do not accept `cursor`, `type`, or catalog
+filters.
 
-| Path | Data returned |
+| Path | Data |
 | --- | --- |
-| `/genres` | Genres. |
-| `/languages` | Languages. |
-| `/keywords` | TMDB keywords. |
-| `/tags` | Local tags. |
-| `/people` | Cast and crew people. |
-| `/companies` | Production companies/studios. |
-| `/networks` | TV networks. |
-| `/collections` | Movie collections. |
+| `/v1/genres` | Genres |
+| `/v1/languages` | Languages |
+| `/v1/keywords` | TMDB keywords |
+| `/v1/tags` | Local tags |
+| `/v1/people` | Cast and crew people |
+| `/v1/companies` | Production companies/studios |
+| `/v1/networks` | TV networks |
+| `/v1/collections` | Movie collections |
 
-## Trending and calendar
+### Trending
 
-| Path | Purpose |
-| --- | --- |
-| `/trending/day` or `/trending/week` | Current non-anime TMDB trend rankings for movie and TV. |
-| `/anime/trending/day` or `/anime/trending/week` | Same trend rankings restricted to anime. |
-| `/calendar/movies` | Movie release calendar entries. |
-| `/calendar/tv` | TV air-date calendar entries. |
+| Path | Query | Purpose |
+| --- | --- | --- |
+| `/v1/trending/day` or `/v1/trending/week` | optional `type`/`mediaType`, `limit` | Non-anime trend rankings |
+| `/v1/anime/trending/day` or `/v1/anime/trending/week` | optional `type`/`mediaType`, `limit` | Anime-only trend rankings |
 
-Trending refreshes are durable worker jobs. A stale/missing ranking returns a
-normal unavailable/problem response instead of inventing a live upstream
-result in the API request.
+Trending routes reject `q`, `cursor`, `anime`, and catalog filters. Rankings
+are refreshed by durable worker jobs; a missing or stale ranking returns a
+problem response rather than performing an unbounded upstream request.
+
+### Calendar
+
+`/v1/calendar/movies` and `/v1/calendar/tv` require `start=YYYY-MM-DD` and
+`end=YYYY-MM-DD`, accept optional `limit`, and allow a maximum 366-day range.
+The range must not run backwards.
+
+```text
+GET /v1/calendar/movies?start=2026-08-01&end=2026-08-31&limit=50
+GET /v1/calendar/tv?start=2026-08-01&end=2026-08-31
+```
 
 ## Images and media files
 
-Image metadata endpoints above return `url` for each image. With
-`ALLOW_LOCAL_MEDIA=true`, that URL is based on `TMDB_MEDIA_BASE_URL` and points
-to the media server, for example `http://<server-host>:8090/media/...`. With it
-disabled, the API returns the original TMDB image URL instead.
+Image metadata contains the source identity, status, dimensions, MIME type,
+checksum, and responsive `variants`. It also contains a `url` selected by the
+media policy:
 
-Verified local assets include `variants` with deterministic JPEG/WebP paths,
-dimensions, MIME types, byte sizes, and checksums. The media server provides
-an `ETag`; send `If-None-Match` to receive `304 Not Modified` when unchanged.
-Original `.masters` files are private and never returned.
+- With `ALLOW_LOCAL_MEDIA=true`, `url` uses `TMDB_MEDIA_BASE_URL` and points to
+  a verified file on the media listener.
+- With `ALLOW_LOCAL_MEDIA=false`, `url` falls back to the original TMDB URL and
+  no new local image jobs are created.
 
-The media server exposes:
+The media listener exposes:
 
-| Listener | Path | Purpose |
+| Method | Path | Response |
 | --- | --- | --- |
-| `TMDB_MEDIA_BIND` | `/health/live` or `/healthz` | Media-worker health check. |
-| `TMDB_MEDIA_BIND` | `/media/{path}` | Public downloaded image. |
+| `GET` | `/health/live` or `/healthz` | `204 No Content` |
+| `GET` | `/media/{path}` | Verified public file, with `ETag` and immutable cache headers |
 
-`/media/.masters` is intentionally unavailable; original deduplicated masters
-are never public.
+Send `If-None-Match` with the returned `ETag` to receive `304 Not Modified`.
+Path traversal, missing files, and `/media/.masters/...` return `404`. Masters
+are content-addressed private originals and are never public.
 
 ## Private admin API
 
-The admin listener is `TMDB_ADMIN_BIND` and is not host-published by the
-supplied Compose file. It is reachable only to containers on `prv.network` at
-`http://tmdb-mirror-api:8081`. Authenticate with either
-`X-API-Key: <TMDB_ADMIN_API_KEY>` or
-`Authorization: Bearer <TMDB_ADMIN_API_KEY>`.
+The admin listener requires either of these headers:
 
-| Path | Authentication | Purpose |
+```text
+X-API-Key: <TMDB_ADMIN_API_KEY>
+Authorization: Bearer <TMDB_ADMIN_API_KEY>
+```
+
+Production does not publish port `8081`; call these routes from a trusted
+container on `prv.network`. Every write is durable and asynchronous. Include a
+unique `Idempotency-Key` on every write, up to 128 ASCII characters. Reusing a
+key with the same operation and payload returns the original submission;
+changing the payload returns `409 Conflict`.
+
+| Method | Path | Purpose |
 | --- | --- | --- |
-| `/metrics` | `X-API-Key: <TMDB_ADMIN_API_KEY>` or `Authorization: Bearer <TMDB_ADMIN_API_KEY>` | Prometheus metrics. |
-| `/admin/v1/openapi.json` | Same | Private admin OpenAPI document. |
-| `GET /admin/v1/status` | Same | Build/schema, database, pools, catalog counts, queues, component health, and backups. |
-| `GET /admin/v1/jobs` and `/admin/v1/jobs/{id}` | Same | Bounded filters, opaque cursor, immutable job history/events. |
-| `POST /admin/v1/scans` | Same + `Idempotency-Key` | Queue explicit `full`, `missing`, or `changes` movie/TV scans. Restart never starts a full scan. |
-| `POST /admin/v1/jobs/{id}/cancel` or `/retry` | Same + `Idempotency-Key` | Request cancellation or create a new auditable retry job. |
-| `POST /admin/v1/media/audits` | Same + `Idempotency-Key` | Verify metadata/files; `repair=true` only queues replacements and never deletes media. |
-| `POST /admin/v1/maintenance/analyze` | Same + `Idempotency-Key` | Queue allowlisted catalog statistics maintenance. |
-| `GET`/`POST /admin/v1/backups` | Same; POST also uses `Idempotency-Key` | Read backup state or queue one full/differential backup. Restore is offline only. |
+| `GET` | `/admin/v1/openapi.json` | Private OpenAPI document |
+| `GET` | `/admin/v1/status` | Build/schema, database, pools, catalog, queues, component, and backup state |
+| `GET` | `/admin/v1/jobs?limit=50&cursor=...&status=...&jobType=...` | Bounded durable job list; status is `queued`, `running`, `retry_wait`, `succeeded`, `dead_letter`, or `cancelled` |
+| `GET` | `/admin/v1/jobs/{job_id}` | One job and immutable audit events |
+| `POST` | `/admin/v1/scans` | Queue `full`, `missing`, or `changes` scan for one or both media types |
+| `POST` | `/admin/v1/jobs/{job_id}/cancel` | Request cancellation of an eligible job |
+| `POST` | `/admin/v1/jobs/{job_id}/retry` | Queue an auditable retry without rewriting history |
+| `POST` | `/admin/v1/media/audits` | Verify media metadata/files; `repair` only queues replacements |
+| `POST` | `/admin/v1/maintenance/analyze` | Queue fixed, allowlisted catalog statistics maintenance |
+| `GET` | `/admin/v1/backups` | Read backup state |
+| `POST` | `/admin/v1/backups` | Queue a `full` or `differential` pgBackRest backup |
+| `GET` | `/metrics` | Prometheus/OpenMetrics metrics |
 
-All admin writes return `202 Accepted` and a durable job. Reusing a key with
-the same operation/payload returns the original job; a changed payload is
-rejected. There is no admin route for raw SQL, a shell command, arbitrary
-reindexing, direct media deletion, or restore.
+State-changing requests return `202 Accepted` with:
 
-## Errors
+```json
+{
+  "data": {
+    "jobId": "<uuid>",
+    "duplicate": false
+  }
+}
+```
 
-The API returns RFC 9457-style JSON problem responses. Common status codes are
-`400` for invalid paths or parameters, `404` for a missing item or wrong anime
-partition, `401` for unauthenticated private requests, `409` for an idempotency
-payload mismatch, `422` for an operation that is not allowed, and `503` when a
-dependency is unavailable. Responses include an `X-Request-Id` header for tracing.
+Exact request examples:
+
+```bash
+admin_base=http://tmdb-mirror-api:8081
+admin_key='<TMDB_ADMIN_API_KEY>'
+
+curl -sS "$admin_base/admin/v1/status" \
+  -H "X-API-Key: $admin_key"
+
+curl -sS -X POST "$admin_base/admin/v1/scans" \
+  -H "X-API-Key: $admin_key" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: scan-movies-tv-20260803' \
+  -d '{"mode":"missing","mediaTypes":["movie","tv"]}'
+
+curl -sS -X POST "$admin_base/admin/v1/media/audits" \
+  -H "X-API-Key: $admin_key" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: media-audit-20260803' \
+  -d '{"repair":true}'
+
+curl -sS -X POST "$admin_base/admin/v1/backups" \
+  -H "X-API-Key: $admin_key" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: backup-full-20260803' \
+  -d '{"type":"full"}'
+
+curl -sS -X POST "$admin_base/admin/v1/backups" \
+  -H "X-API-Key: $admin_key" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: backup-differential-20260803' \
+  -d '{"type":"differential"}'
+```
+
+`POST /admin/v1/maintenance/analyze` and job cancel/retry requests have no
+JSON body, but still require `Idempotency-Key`. Restore, raw SQL, shell
+execution, arbitrary reindexing, and direct media deletion are intentionally
+not API operations. Restore is the offline procedure in
+[backup-recovery.md](backup-recovery.md).
+
+## Errors and headers
+
+Problem responses use `Content-Type: application/problem+json` and contain
+`type`, `title`, `status`, `detail`, and `requestId`. The API also returns the
+same value in `X-Request-Id` for tracing.
+
+Common statuses are:
+
+| Status | Meaning |
+| ---: | --- |
+| `400` | Invalid path, query, JSON, or required header |
+| `401` | Missing or invalid admin key |
+| `404` | Missing item, wrong anime partition, or private media path |
+| `405` | Method is not allowed |
+| `409` | Idempotency key conflicts with a previous payload |
+| `413` | Admin JSON body exceeds 16 KiB |
+| `422` | Valid admin operation is not currently allowed |
+| `501` | Requested catalog ordering is not implemented |
+| `503` | Database, schema, queue, or ranking dependency is unavailable |
+
+The API never returns credentials, raw SQL, filesystem master paths, or raw
+upstream error bodies in a problem response.

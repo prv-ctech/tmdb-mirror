@@ -1,137 +1,127 @@
 # Isolated stress testing
 
-The stress harness is disposable and isolated from the production Compose
-project. It uses exactly four containers: PostgreSQL 18, the Rust API, the
-consolidated migration/scheduler/ingest worker, and the media worker with its
-embedded static server. Project-scoped named volumes/networks keep it isolated.
-PostgreSQL receives a 1 GiB `/dev/shm` so parallel workers are exercised under
-the same shared-memory contract as production instead of Docker's 64 MiB
-default. The stress database uses 32 MiB `work_mem` to keep broad unaccented
-search sorts in memory; the production compact Compose template uses the same
-setting. The disposable `/media` volume is disk-backed and prepared for UID
-10001 by the bootstrap script, so image downloads do not consume Docker's RAM
-quota; production `/media` is the persistent host bind mount selected by
-Unraid/Compose.
-Host ports default to `55433` (PostgreSQL), `18080` (API), `18081` (admin), and
-`18090` (media), all bound to loopback.
+Run the harness from Linux/WSL with Docker Desktop available. The scripts use
+an isolated Compose project, named volumes, loopback-only ports, and a local
+secret env file. They do not touch the production Compose project or host data.
 
-The disposable harness deliberately uses `tmdb_stress_catalog` and
-`tmdb_stress_owner`, proving that the stack does not require fixed database or
-owner names.
+## Prepare and start
 
-## Start
+Create the ignored secret file and fill in the TMDB v4 read token, v3 API key,
+and optional existing Trawl URL:
 
-Run from the repository root in PowerShell. Copy `secrets.txt.example` to the
-ignored `secrets.txt`, fill in the TMDB v4 read token and v3 API key without
-quotation marks, and optionally set the Trawl URL. The bootstrap script writes
-only the v4 read token to `.stress-runtime/<project>/compose.env`, the single
-Compose environment file for the disposable project.
-
-```powershell
-Copy-Item secrets.txt.example secrets.txt
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-tmdb-auth.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-bootstrap.ps1
+```bash
+cp secrets.txt.example .secrets.txt
+chmod 600 .secrets.txt
+./scripts/test-stress-secrets.sh
+./scripts/stress-tmdb-auth.sh
+./scripts/stress-bootstrap.sh \
+  --project-name tmdb_stress_test \
+  --api-port 18080 \
+  --admin-port 18081 \
+  --image-port 18090 \
+  --postgres-port 55433
 ```
 
-An existing Trawl instance can be used as the image challenge fallback through
-`TMDB_TRAWL_BASE_URL=http://<trawl-host>:8191`. The harness does not start a
-second Trawl container.
+The loader prefers `.secrets.txt` and accepts `secrets.txt` as a local-only
+fallback. Secret values are never written to the general Compose environment,
+logs, JSON results, Docker build context, or Git.
+
+The bootstrap builds the pinned Rust image and the local PostgreSQL/pgBackRest
+image, applies migrations, starts the four-container stack, waits for health,
+verifies UID 10001, and checks that the fixed `/config` and `/media`
+subdirectories are writable by the runtime user. The PostgreSQL stress volume
+is initialized with WAL archiving enabled so the durable backup API can be
+exercised by the built-in pgBackRest scheduler. Use a fresh project name when
+converting an older stock-PostgreSQL stress volume because `archive_mode` is a
+cluster initialization setting. The generated runtime files are under ignored
+`.stress-runtime/<project>/`.
 
 ## Exercise the stack
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-seed.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-http.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-artwork.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-media-assets.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-trawl.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-resilience.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-scan.ps1 -QueueLimit 500
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-collect.ps1
+Run the bounded checks in this order:
+
+```bash
+./scripts/stress-seed.sh --project-name tmdb_stress_test --count 100000
+./scripts/stress-http.sh --project-name tmdb_stress_test --concurrency 100 --requests-per-worker 100
+./scripts/stress-artwork.sh --project-name tmdb_stress_test
+./scripts/stress-media-assets.sh --project-name tmdb_stress_test
+./scripts/stress-trawl.sh --project-name tmdb_stress_test
+./scripts/stress-resilience.sh --project-name tmdb_stress_test
+./scripts/stress-scan.sh --project-name tmdb_stress_test --queue-limit 10
+./scripts/stress-collect.sh --project-name tmdb_stress_test
 ```
 
-`stress-http.ps1` remains a functional smoke check. The canonical load test is
-the ephemeral k6 container described below. `stress-scan.ps1` streams and
-counts the complete daily movie and TV ID exports, while its queue limit
-deliberately bounds detail refresh work. When no explicit `-Date` is supplied,
-it uses the latest matching movie/TV export published by TMDB (up to seven days
-back). Increase the queue limit only after validating the token, rate limit,
-worker concurrency, and database capacity.
+The seed creates a large synthetic catalog for indexed list/search/filter
+tests. Artwork uses real TMDB requests for representative movie, TV, anime,
+and image paths. The Trawl check is skipped when no Trawl URL is configured.
+The export scan downloads the latest matching public movie and TV exports,
+counts their records, and bounds queued detail work with `--queue-limit`.
 
-## k6 performance run
+The HTTP result records request count, failures, throughput, p50/p95/p99
+latency, and semantic route checks. Results and redacted diagnostics remain
+under the ignored runtime directory.
 
-The k6 runner is not part of the production stack. It starts a short-lived,
-digest-pinned k6 container and exits nonzero when any threshold fails. The
-default full profile runs four endpoint-specific 100-client checks and one
-100,000-request mixed burn:
+The private backup API accepts `{"type":"full"}` or
+`{"type":"differential"}` and requires an idempotency key. It returns a durable
+job ID; poll that job through the admin API, then verify the paired request and
+repository with `GET /admin/v1/backups` and `tmdb-pgbackrest info` inside the
+PostgreSQL container. The runner and PITR checks below cover the offline
+restore path as well.
 
-```powershell
-$env:TMDB_K6_ADMIN_API_KEY = '<your admin key>'
-./scripts/k6/run.ps1 `
-  -Profile full `
-  -BaseUrl http://127.0.0.1:18080 `
-  -ComposeFile deploy/compose.stress.yaml `
-  -ComposeEnvFile .stress-runtime/tmdb_stress_test/compose.env `
-  -ComposeProjectName tmdb_stress_test `
-  -AdminMetricsUrl http://127.0.0.1:18081/metrics
+## k6 load profile
+
+The optional k6 runner is an ephemeral test container, not a production
+service. It accepts the same endpoint path overrides as the scenario:
+
+```bash
+./scripts/k6/run.sh \
+  --profile full \
+  --base-url http://127.0.0.1:18080 \
+  --compose-file deploy/compose.stress.yaml \
+  --compose-env-file .stress-runtime/tmdb_stress_test/compose.env \
+  --compose-project-name tmdb_stress_test \
+  --admin-metrics-url http://127.0.0.1:18081/metrics
 ```
 
-For a representative full catalog, pass four known paths rather than relying
-on synthetic defaults:
+Use smaller values first, for example
+`--profile endpoints --virtual-users 20 --requests-per-endpoint 100`, then
+increase only after the bounded smoke checks pass. A failed run writes
+redacted Docker/PostgreSQL diagnostics beside the k6 output.
 
-```powershell
-./scripts/k6/run.ps1 -Profile full -BaseUrl http://<unraid-host>:9001 `
-  -MetadataPath /v1/movies/<known-id> `
-  -ListPath '/v1/movies?limit=20' `
-  -SearchPath '/v1/search?q=matrix&limit=20' `
-  -FilterPath '/v1/movies?genreId=<known-genre>&limit=20'
+## Token refresh
+
+Changing an env file does not update an existing container. Recreate the
+disposable services with the Linux wrapper:
+
+```bash
+./scripts/stress-set-token.sh --project-name tmdb_stress_test
 ```
 
-Metadata/list p95 must be at most 50 ms; indexed filter/search p95 must be at
-most 150 ms; all request/check/count thresholds require zero unexpected
-failures. On a failure, the runner writes redacted k6 output plus Docker
-resource data, PostgreSQL waits, `pg_stat_statements`, representative query
-plans, and bounded application pool/queue/component metrics under the ignored
-`.stress-runtime/k6/` directory.
+If a token has been pasted into a chat, shell history, or log, revoke it and
+issue a replacement before using the environment outside this local test.
 
-The resilience check restarts the media worker and stops PostgreSQL long enough
-to require an API readiness failure, then verifies recovery. Its JSON and log
-artifacts are written below the ignored runtime directory.
+## PostgreSQL, backup, and repository checks
 
-`stress-media-assets.ps1` checks one live file for every media owner class,
-four internal media-worker lease IDs, shared source reuse, and zero dead-letter
-image jobs. `stress-trawl.ps1` verifies the configured existing Trawl instance
-without writing its URL or any credential to an artifact.
-
-`stress-collect.ps1` also fails the run if PostgreSQL logged a deadlock or lock
-timeout after that run started; it scopes this check to the current
-PostgreSQL container logs rather than historical application logs.
-
-The ingestion suite also runs concurrent different-movie writes that touch the
-same genres and people in opposite TMDB payload order. It must finish without
-a PostgreSQL deadlock or lock timeout.
-
-## Refresh a token without rebuilding
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-set-token.ps1
-docker compose --env-file .stress-runtime\tmdb_stress_test\compose.env --project-name tmdb_stress_test --file deploy\compose.stress.yaml up -d --force-recreate --no-deps worker
+```bash
+./scripts/bootstrap-dev.sh
+./scripts/verify-toolchain.sh
+./scripts/validate-production-compose.sh --env-file .env.example
+./scripts/verify-repository-hygiene.sh
+./infra/postgres/tests/pgbackrest-runner.test.sh
+./infra/postgres/tests/pgbackrest-pitr.test.sh
 ```
 
-Docker restart alone does not reload an `env_file`; recreate the worker after
-changing the file. The
-supplied token must be valid before a detail-refresh run can populate
-metadata. If a token has been pasted into a chat, shell history, or logs, revoke
-it and issue a replacement before production use.
+The PITR test builds only disposable PostgreSQL resources, creates a full and
+differential backup, restores to a recorded time, and verifies that a later
+record is excluded. Use a unique disposable Docker project for any additional
+backup experiments; do not prune shared Docker resources.
 
 ## Stop and clean up
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stress-down.ps1
-# Add -RemoveVolumes only when the disposable database and test data are no
-# longer needed.
+```bash
+./scripts/stress-down.sh --project-name tmdb_stress_test
+# Add --remove-volumes only after the disposable data is no longer needed.
 ```
 
-The cleanup script targets only the explicit stress project name. It does not
-touch unrelated Docker containers, volumes, networks, or the production data
-directory.
+The cleanup script targets only the explicit stress project. Runtime files,
+downloads, exports, logs, and results are ignored by Git and Docker.

@@ -47,10 +47,10 @@
 - infra/pgbouncer/Dockerfile: verified source build.
 - infra/pgbouncer/pgbouncer.ini: transaction-pool policy.
 - infra/pgbouncer/entrypoint.sh: tmpfs userlist generation from Docker secrets.
-- scripts/bootstrap-dev.ps1: cryptographically random local secret generation.
-- scripts/verify-toolchain.ps1: immutable toolchain/workspace proof.
-- scripts/verify-postgres.ps1: PostgreSQL version/checksum/extension proof.
-- scripts/verify-foundation.ps1: clean-volume end-to-end acceptance gate.
+- scripts/bootstrap-dev.sh: cryptographically random local secret generation.
+- scripts/verify-toolchain.sh: immutable toolchain/workspace proof.
+- scripts/verify-postgres.sh: PostgreSQL version/checksum/extension proof.
+- scripts/verify-foundation.sh: clean-volume end-to-end acceptance gate.
 - docs/development.md: exact local workflow and troubleshooting.
 
 ### Task 1: Reproducible Cargo workspace
@@ -59,33 +59,34 @@
 - Create: `Cargo.toml`
 - Create: `rust-toolchain.toml`
 - Create: `.cargo/config.toml`
-- Create: `scripts/verify-toolchain.ps1`
+- Create: `scripts/verify-toolchain.sh`
 - Create minimal manifests and entry points beneath `crates/` and `apps/` from the file map.
 - Modify: `.gitignore`
 - Modify: `.dockerignore`
 
 **Interfaces:**
 - Produces workspace packages named tmdb-domain, tmdb-config, tmdb-db, tmdb-jobs, tmdb-observability, tmdb-api, tmdb-ingest, tmdb-images, and tmdb-admin.
-- Produces `scripts/verify-toolchain.ps1` as the canonical containerized Cargo command wrapper.
+- Produces `scripts/verify-toolchain.sh` as the canonical containerized Cargo command wrapper.
 
 - [ ] **Step 1: Write the failing toolchain/workspace check**
 
-```powershell
-$ErrorActionPreference = 'Stop'
-$image = 'rust:1.97-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa'
-$repoPath = (Get-Location).Path
-$rustVersion = docker run --rm $image rustc --version
-if ($rustVersion -notlike 'rustc 1.97.1 *') {
-    throw "Unexpected Rust version: $rustVersion"
+```bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
+image='rust:1.97-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa'
+repo_path="$(pwd)"
+rust_version="$(docker run --rm "$image" rustc --version)"
+[[ "$rust_version" == 'rustc 1.97.1 '* ]] || {
+    printf 'Unexpected Rust version: %s\n' "$rust_version" >&2
+    exit 1
 }
-docker run --rm --mount "type=bind,source=$repoPath,target=/workspace" `
-    --workdir /workspace $image cargo metadata --locked --no-deps --format-version 1 |
-    Out-Null
+docker run --rm --mount "type=bind,source=$repo_path,target=/workspace" \
+    --workdir /workspace "$image" cargo metadata --locked --no-deps --format-version 1 >/dev/null
 ```
 
 - [ ] **Step 2: Run the check and observe the expected failure**
 
-Run: `powershell -NoProfile -File scripts/verify-toolchain.ps1`
+Run: `bash scripts/verify-toolchain.sh`
 
 Expected: Rust reports 1.97.1, then Cargo fails because the workspace manifest does not exist.
 
@@ -167,7 +168,7 @@ fn main() -> anyhow::Result<()> {
 
 - [ ] **Step 5: Generate and verify the lockfile in the pinned container**
 
-Run the pinned image with the repository mounted at `/workspace`, execute `cargo generate-lockfile`, then rerun `scripts/verify-toolchain.ps1`.
+Run the pinned image with the repository mounted at `/workspace`, execute `cargo generate-lockfile`, then rerun `scripts/verify-toolchain.sh`.
 
 Expected: Cargo metadata succeeds and Cargo.lock is created.
 
@@ -180,7 +181,7 @@ Expected: all commands pass.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock rust-toolchain.toml .cargo crates apps scripts/verify-toolchain.ps1 .gitignore .dockerignore
+git add Cargo.toml Cargo.lock rust-toolchain.toml .cargo crates apps scripts/verify-toolchain.sh .gitignore .dockerignore
 git commit -m "build: create reproducible Rust workspace"
 ```
 
@@ -354,8 +355,8 @@ git commit -m "feat: load secrets and validate storage configuration"
 - Create: `deploy/compose.dev.yaml`
 - Create: `deploy/env.example`
 - Create: `deploy/secrets/README.md`
-- Create: `scripts/bootstrap-dev.ps1`
-- Create: `scripts/verify-postgres.ps1`
+- Create: `scripts/bootstrap-dev.sh`
+- Create: `scripts/verify-postgres.sh`
 - Create: `infra/postgres/initdb/10-bootstrap.sh`
 - Modify: `.gitignore`
 
@@ -366,15 +367,16 @@ git commit -m "feat: load secrets and validate storage configuration"
 
 - [ ] **Step 1: Write the failing PostgreSQL verification**
 
-```powershell
-$ErrorActionPreference = 'Stop'
-$compose = 'deploy/compose.dev.yaml'
-$version = docker compose -f $compose exec -T postgres psql -U tmdb_owner -d tmdb -Atc "SHOW server_version"
-if ($version -notlike '18.4*') { throw "Expected PostgreSQL 18.4, got $version" }
-$checksums = docker compose -f $compose exec -T postgres psql -U tmdb_owner -d tmdb -Atc "SHOW data_checksums"
-if ($checksums -ne 'on') { throw 'Data checksums are not enabled' }
-$extensions = docker compose -f $compose exec -T postgres psql -U tmdb_owner -d tmdb -Atc "SELECT string_agg(extname, ',' ORDER BY extname) FROM pg_extension WHERE extname IN ('pg_stat_statements','pg_trgm','unaccent')"
-if ($extensions -ne 'pg_stat_statements,pg_trgm,unaccent') { throw "Missing extensions: $extensions" }
+```bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
+compose='deploy/compose.dev.yaml'
+version="$(docker compose -f "$compose" exec -T postgres psql -U tmdb_owner -d tmdb -Atc 'SHOW server_version')"
+[[ "$version" == 18.4* ]] || { printf 'Expected PostgreSQL 18.4, got %s\n' "$version" >&2; exit 1; }
+checksums="$(docker compose -f "$compose" exec -T postgres psql -U tmdb_owner -d tmdb -Atc 'SHOW data_checksums')"
+[[ "$checksums" == on ]] || { printf '%s\n' 'Data checksums are not enabled' >&2; exit 1; }
+extensions="$(docker compose -f "$compose" exec -T postgres psql -U tmdb_owner -d tmdb -Atc "SELECT string_agg(extname, ',' ORDER BY extname) FROM pg_extension WHERE extname IN ('pg_stat_statements','pg_trgm','unaccent')")"
+[[ "$extensions" == pg_stat_statements,pg_trgm,unaccent ]] || { printf 'Missing extensions: %s\n' "$extensions" >&2; exit 1; }
 ```
 
 - [ ] **Step 2: Observe failure**
@@ -425,7 +427,7 @@ Use Compose project `tmdb_rust_foundation_test`. Confirm the exact volume name b
 Create a sentinel row, restart PostgreSQL, verify it remains, then commit.
 
 ```bash
-git add deploy infra/postgres scripts/bootstrap-dev.ps1 scripts/verify-postgres.ps1 .gitignore
+git add deploy infra/postgres scripts/bootstrap-dev.sh scripts/verify-postgres.sh .gitignore
 git commit -m "feat: add verified PostgreSQL 18 development cluster"
 ```
 
@@ -815,7 +817,7 @@ git commit -m "feat: add read-only legacy database audit"
 ### Task 11: Clean-volume foundation acceptance and CI
 
 **Files:**
-- Create: `scripts/verify-foundation.ps1`
+- Create: `scripts/verify-foundation.sh`
 - Create: `docs/development.md`
 - Create: `.github/workflows/rust-foundation.yml`
 - Modify: `README.md`
@@ -844,8 +846,9 @@ The script must:
 
 The initial script ends immediately after the Docker/project-name guards with:
 
-```powershell
-throw 'FOUNDATION_GATE_UNWIRED: bootstrap-dev-secrets'
+```bash
+printf '%s\n' 'FOUNDATION_GATE_UNWIRED: bootstrap-dev-secrets' >&2
+exit 1
 ```
 
 Run it once and require that exact failure before replacing the throw in Step 3.
@@ -875,7 +878,7 @@ Document bootstrap/start/migrate/doctor/test/log/restart/safe-cleanup. State the
 ```bash
 git status --short
 git diff --check
-git add scripts/verify-foundation.ps1 docs/development.md .github/workflows/rust-foundation.yml README.md
+git add scripts/verify-foundation.sh docs/development.md .github/workflows/rust-foundation.yml README.md
 git commit -m "test: add Rust foundation acceptance gate"
 ```
 
