@@ -5,35 +5,51 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/stress-common.sh"
 
 project="${TMDB_STRESS_PROJECT:-tmdb_stress_test}"
+admin_port="${TMDB_STRESS_ADMIN_PORT:-18081}"
 image_port="${TMDB_STRESS_IMAGE_PORT:-18090}"
 expected_workers=4
 timeout=300
 while (($#)); do
     case "$1" in
         --project-name) project="$2"; shift 2 ;;
+        --admin-port) admin_port="$2"; shift 2 ;;
         --image-port) image_port="$2"; shift 2 ;;
         --expected-workers) expected_workers="$2"; shift 2 ;;
         --timeout) timeout="$2"; shift 2 ;;
-        -h|--help) printf '%s\n' 'Usage: stress-media-assets.sh [--project-name NAME] [--image-port PORT] [--expected-workers N] [--timeout SECONDS]'; exit 0 ;;
+        -h|--help) printf '%s\n' 'Usage: stress-media-assets.sh [--project-name NAME] [--admin-port PORT] [--image-port PORT] [--expected-workers N] [--timeout SECONDS]'; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
 done
 [[ "$timeout" =~ ^[0-9]+$ ]] && (( timeout >= 1 && timeout <= 3600 )) || die 'invalid timeout'
 
-configure_runtime "$project" "${TMDB_STRESS_API_PORT:-18080}" "${TMDB_STRESS_ADMIN_PORT:-18081}" "$image_port" "${TMDB_STRESS_PG_PORT:-55433}"
+configure_runtime "$project" "${TMDB_STRESS_API_PORT:-18080}" "$admin_port" "$image_port" "${TMDB_STRESS_PG_PORT:-55433}"
 load_runtime
 mkdir -p "$RESULT_ROOT"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 result_file="$RESULT_ROOT/media-assets-$stamp.json"
+admin_key="$(env_value TMDB_ADMIN_API_KEY)"
+if ! start_output="$(curl --silent --show-error --fail-with-body -X POST \
+    -H "X-API-Key: $admin_key" \
+    -H "Idempotency-Key: media-assets-start-$stamp" \
+    -H 'Content-Type: application/json' \
+    --data '{"action":"start"}' \
+    "http://127.0.0.1:$admin_port/admin/v1/media/worker" 2>&1)"; then
+    redact "$start_output" >&2
+    die 'could not start the media worker for asset verification'
+fi
+if ! grep -q '"state":"running"' <<<"$start_output"; then
+    redact "$start_output" >&2
+    die 'media worker did not enter the running state'
+fi
 password="$(database_password)"
 dead_letters_before="$(psql_at "$password" "SELECT count(*) FROM ops.jobs WHERE job_type = 'image.download' AND status = 'dead_letter'")"
-pending_image_jobs_before="$(psql_at "$password" "SELECT count(*) FROM ops.jobs WHERE job_type = 'image.download' AND status IN ('queued', 'running')")"
+pending_image_jobs_before="$(psql_at "$password" "SELECT count(*) FROM ops.jobs WHERE job_type = 'image.download' AND status IN ('queued', 'running', 'retry_wait')")"
 
 deadline=$((SECONDS + timeout))
 drain_started=$SECONDS
 pending_image_jobs=-1
 while (( SECONDS < deadline )); do
-    pending_image_jobs="$(psql_at "$password" "SELECT count(*) FROM ops.jobs WHERE job_type = 'image.download' AND status IN ('queued', 'running')" 2>/dev/null || printf '%s' '-1')"
+    pending_image_jobs="$(psql_at "$password" "SELECT count(*) FROM ops.jobs WHERE job_type = 'image.download' AND status IN ('queued', 'running', 'retry_wait')" 2>/dev/null || printf '%s' '-1')"
     if [[ "$pending_image_jobs" =~ ^[0-9]+$ ]] && (( pending_image_jobs == 0 )); then
         break
     fi
@@ -92,7 +108,7 @@ episode_optimized_only="$(psql_at "$password" "SELECT count(*) FROM assets.image
 invalid_variants="$(psql_at "$password" "SELECT count(*) FROM assets.image_variants WHERE mime_type NOT IN ('image/jpeg', 'image/png') OR storage_path !~ '(^|/)optimized/' OR (storage_path ~ '(^|/)optimized/thumbnails/' AND width > 640)")"
 video_counts="$(psql_at "$password" "SELECT COALESCE(json_object_agg(video_type || '/' || site, video_count ORDER BY video_type, site), '{}'::json)::text FROM (SELECT COALESCE(video_type, 'unknown') AS video_type, site, count(*) AS video_count FROM catalog.title_videos GROUP BY COALESCE(video_type, 'unknown'), site) counts")"
 media_permissions=true
-if ! compose exec -T media sh -ec 'test -d /media && test -d /media/movies && test -d /media/tv && test -d /media/anime/movie && test -d /media/anime/tv && test -d /media/people && test -d /media/companies && test -d /media/networks && test -d /media/collections && test ! -e /media/.masters' </dev/null >/dev/null 2>&1; then
+if ! compose exec -T media sh -ec 'test -d /media && test -d /media/movies && test -d /media/tv && test -d /media/people && test -d /media/companies && test -d /media/networks && test -d /media/collections && test ! -e /media/.masters' </dev/null >/dev/null 2>&1; then
     media_permissions=false
 fi
 

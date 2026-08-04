@@ -1,4 +1,4 @@
-use std::{fmt, num::NonZeroU32, str::FromStr};
+use std::{fmt, str::FromStr};
 
 /// The TMDB media namespace for a title.
 #[derive(
@@ -41,32 +41,5 @@ impl FromStr for MediaType {
             "tv" => Ok(Self::Tv),
             _ => Err(ParseMediaTypeError),
         }
-    }
-}
-
-/// A globally distinct TMDB title identity.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct TitleKey {
-    media_type: MediaType,
-    tmdb_id: NonZeroU32,
-}
-
-impl TitleKey {
-    #[must_use]
-    pub const fn new(media_type: MediaType, tmdb_id: NonZeroU32) -> Self {
-        Self {
-            media_type,
-            tmdb_id,
-        }
-    }
-
-    #[must_use]
-    pub const fn media_type(&self) -> MediaType {
-        self.media_type
-    }
-
-    #[must_use]
-    pub const fn tmdb_id(&self) -> NonZeroU32 {
-        self.tmdb_id
     }
 }

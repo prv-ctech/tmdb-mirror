@@ -58,13 +58,13 @@ async fn jobs_migration_has_exact_readiness_indexes_and_hardened_functions(
         versions,
         [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41
         ]
     );
     let revision: String = sqlx::query_scalar("SELECT schema_revision FROM ops.readiness")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(revision, "0030");
+    assert_eq!(revision, "0041");
 
     let indexes: Vec<(String, String)> = sqlx::query_as(
         "SELECT indexname, indexdef
@@ -626,7 +626,9 @@ async fn expired_lease_reclaims_and_wrong_or_expired_owners_cannot_mutate(
     pool: PgPool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = JobRepository::new(pool.clone());
-    let submitted = repo.submit(NewJob::noop("lease-ownership")?).await?;
+    let submitted = repo
+        .submit(NewJob::noop("lease-ownership")?.with_priority(1_000)?)
+        .await?;
     let first_worker = WorkerId::new("worker-first")?;
     let wrong_worker = WorkerId::new("worker-wrong")?;
     let second_worker = WorkerId::new("worker-second")?;
@@ -1374,6 +1376,22 @@ async fn worker_roles_have_effective_lifecycle_access_and_object_level_dml_denia
                 .fetch_one(&worker_pool)
                 .await?;
         assert!(schema_usage, "{role} lacks effective ops schema access");
+        if role == "ingest_writer" {
+            let assets_schema_usage: bool =
+                sqlx::query_scalar("SELECT has_schema_privilege(current_user, 'assets', 'USAGE')")
+                    .fetch_one(&worker_pool)
+                    .await?;
+            assert!(assets_schema_usage, "{role} cannot inspect media assets");
+            let can_read_queue: bool = sqlx::query_scalar(
+                "SELECT has_table_privilege(current_user, 'ops.jobs', 'SELECT')",
+            )
+            .fetch_one(&worker_pool)
+            .await?;
+            assert!(can_read_queue, "{role} cannot read queue capacity state");
+            let _: i64 = sqlx::query_scalar("SELECT count(*) FROM ops.jobs")
+                .fetch_one(&worker_pool)
+                .await?;
+        }
 
         let submitted = owner_repo
             .submit(NewJob::noop(&format!("real-role-lifecycle-{role}"))?)

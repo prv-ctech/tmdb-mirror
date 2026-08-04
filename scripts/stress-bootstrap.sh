@@ -16,7 +16,6 @@ Options:
   --image-port PORT         loopback media port (default: 18090)
   --postgres-port PORT      loopback PostgreSQL port (default: 55433)
   --secrets-file PATH       local ignored secrets file
-  --enable-scheduler        enable the background changes/trending scheduler
   --skip-build              reuse tmdb-stress-app:local
 USAGE
 }
@@ -28,7 +27,6 @@ image_port="${TMDB_STRESS_IMAGE_PORT:-18090}"
 postgres_port="${TMDB_STRESS_PG_PORT:-55433}"
 secrets_file="${TMDB_STRESS_SECRETS_FILE:-}"
 skip_build=false
-scheduler_enabled="${TMDB_STRESS_ENABLE_SCHEDULER:-false}"
 
 while (($#)); do
     case "$1" in
@@ -38,14 +36,11 @@ while (($#)); do
         --image-port) image_port="$2"; shift 2 ;;
         --postgres-port) postgres_port="$2"; shift 2 ;;
         --secrets-file) secrets_file="$2"; shift 2 ;;
-        --enable-scheduler) scheduler_enabled=true; shift ;;
         --skip-build) skip_build=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; die "unknown option: $1" ;;
     esac
 done
-
-[[ "$scheduler_enabled" == true || "$scheduler_enabled" == false ]] || die 'scheduler flag must be true or false'
 
 [[ "$project" =~ ^[a-z0-9][a-z0-9_-]{2,48}$ ]] || die 'project name must be 3-49 lowercase characters'
 for port in "$api_port" "$admin_port" "$image_port" "$postgres_port"; do
@@ -58,8 +53,6 @@ if [[ -z "$secrets_file" ]]; then
     secrets_file="$(select_secrets_file)"
 fi
 export TMDB_STRESS_SECRETS_FILE="$secrets_file"
-export TMDB_STRESS_ENABLE_SCHEDULER="$scheduler_enabled"
-SCHEDULER_ENABLED="$scheduler_enabled"
 read_stress_secrets "$secrets_file"
 [[ -n "$STRESS_READ_TOKEN" ]] || die 'TMDB_STRESS_READ_TOKEN is missing from the local secrets file'
 export TMDB_READ_ACCESS_TOKEN="$STRESS_READ_TOKEN"
@@ -136,7 +129,7 @@ assert_process_identity() {
 assert_process_identity worker tmdb-worker
 assert_process_identity media tmdb-images
 ensure_owner_paths worker 'test -w /config/work && test -w /config/raw && test -w /config/logs'
-ensure_owner_paths media 'test -w /config/media && test -w /media/movies && test -w /media/tv && test -w /media/anime/movie && test -w /media/anime/tv && test -w /media/people && test -w /media/networks && test -w /media/companies && test -w /media/collections'
+ensure_owner_paths media 'test -w /config/media && test -w /media/movies && test -w /media/tv && test -w /media/people && test -w /media/networks && test -w /media/companies && test -w /media/collections'
 
 printf 'Stress stack is ready: http://127.0.0.1:%s\n' "$api_port"
 printf 'Runtime metadata: %s\n' "$METADATA_FILE"

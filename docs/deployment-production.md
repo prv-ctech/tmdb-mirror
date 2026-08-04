@@ -9,14 +9,16 @@ pulls two GitHub-built Linux AMD64 images:
 The stack is deliberately only four services:
 
 1. PostgreSQL 18, including `pg_trgm`, `unaccent`, and `pg_stat_statements`.
-2. API, with catalog/anime/search/admin routes and bounded read connections.
-3. Main worker, which migrates, initializes, schedules, ingests, retries, and
-   maintains durable jobs.
+2. API, with the TMDB v3 read surface and bounded read connections.
+3. Main worker, which migrates and runs explicitly submitted ingest jobs.
 4. Media worker, which downloads/verifies images and serves `/media` directly
    through its embedded read-only HTTP server.
 
 There is no PgBouncer, Nginx, migration container, scheduler container, or
-storage-init container in the canonical deployment. The disposable stress
+storage-init container in the canonical deployment. The worker also has no
+in-process catalog scheduler: restarts do not submit changes, trending, or
+daily-export jobs. A running worker is reset to stopped on restart, while a
+paused worker remains paused. The disposable stress
 Compose file uses the same four-service shape with isolated named volumes.
 The PostgreSQL service also declares a 2 GiB `/dev/shm`; Docker's 64 MiB
 default is too small for parallel query workers during a 100-client burst.
@@ -45,6 +47,11 @@ The API and media services publish host ports `9001` and `9002` to container
 ports `8080` and `8090`. Host mount paths are Compose deployment settings, not
 application environment variables.
 
+All four services use one external Docker network. The tracked Compose files
+use `your.network` as a neutral placeholder; replace the root network
+`name:` value with an existing network name before starting the stack. No
+`tmdb-private` network is created.
+
 The API runs as UID/GID `10001`. The worker and media services begin with a
 tiny built-in startup preparer: it creates their fixed child folders, gives
 those folders to UID/GID `10001`, verifies an actual write as that user, and
@@ -57,8 +64,8 @@ only these app-owned paths:
 
 ```text
 /config/work  /config/raw  /config/logs  /config/media
-/media/movies  /media/tv  /media/anime/{movie,tv}
-/media/people  /media/networks  /media/companies  /media/collections
+/media/movies  /media/tv  /media/people  /media/networks
+/media/companies  /media/collections
 ```
 
 PostgreSQL alone creates `/config/backups/pgbackrest`. The worker and media
@@ -84,8 +91,9 @@ build is needed after GitHub Actions has published the images.
 
 The public, admin, and media routes are listed in [api.md](api.md).
 
-`TZ=America/New_York` controls schedule interpretation and human-readable
-terminal timestamps. PostgreSQL and API timestamps remain UTC.
+`TZ=America/New_York` controls human-readable terminal timestamps. PostgreSQL
+and API timestamps remain UTC. Catalog and media scans are never scheduled by
+the application; the authenticated admin API starts them explicitly.
 
 The PostgreSQL service uses `POSTGRES_DB`, `POSTGRES_USER`, and
 `POSTGRES_PASSWORD` for the database owner and health check. Application
@@ -96,6 +104,38 @@ internal Compose service `postgres:5432`; do not add `DATABASE_*`, `TMDB_DB_*`,
 role identity, or per-process database settings.
 The PostgreSQL service starts as `0:0` so its entrypoint can prepare mounted
 data and pgBackRest children, then drops to PostgreSQL's unprivileged user.
+
+The current environment template is not the older Unraid environment. The
+values users enter are the database owner credentials, `TMDB_ENVIRONMENT`,
+`TZ`, TMDB read token, admin key, API base URL, local-media settings, and the
+worker values shown in `.env.example`. The following are fixed by the image or
+have safe defaults and should normally be omitted:
+
+```text
+TMDB_API_BIND TMDB_ADMIN_BIND TMDB_MEDIA_BIND
+PGDATA POSTGRES_INITDB_ARGS
+TMDB_MEDIA_HOST_ROOT TMDB_WORK_HOST_ROOT TMDB_MEDIA_ROOT TMDB_WORK_ROOT
+TMDB_MIGRATOR_* TMDB_API_READER_* TMDB_API_JOB_SUBMITTER_*
+TMDB_INGEST_WRITER_* TMDB_IMAGE_WRITER_* TMDB_MONITOR_*
+TMDB_ENABLE_SCHEDULER TMDB_ENABLE_DAILY_EXPORT
+```
+
+The first three listener settings default to the container ports `8080`,
+`8081`, and `8090`; host ports are defined only in Compose. The database
+connection is always `postgres:5432`, and the image supplies PostgreSQL init
+defaults. Scheduler toggles are obsolete: catalog and media work are submitted
+through the authenticated admin API and do not start automatically after a
+restart. Optional retry, timeout, lease, heartbeat, polling, logging, and
+image-policy settings remain supported as advanced overrides but are not
+required in the minimal template.
+
+The root `docker-compose-example.yaml` and
+`deploy/compose.production.yaml` describe the same four-service topology and
+security contract. The standalone file expects `.env` beside it and resolves
+`./data/*` from its own directory. The production file defaults to `../.env`
+and resolves its `./data/*` sources relative to `deploy/`; edit those Compose
+`source:` lines for an existing host layout. Do not move host paths or host
+ports into `.env`.
 
 Keep `TMDB_RATE_LIMIT` at `40` or lower. The worker rejects a higher value
 before it starts upstream requests.
@@ -137,12 +177,12 @@ docker compose --env-file "$TMDB_ENV_FILE" \
 ```
 
 The main worker applies migrations under the existing PostgreSQL advisory lock;
-restarts are safe and do not start an implicit full catalog scan. The scheduler
-queues only the configured changes, trending, and daily-export jobs. Operators
-request catalog scans and the media `full`, `missing`, or `audit` scans through
-the private admin API. The same API can start, pause, resume, or cancel the
-durable media queue; pausing blocks new media claims and does not stop the
-container. The worker runs up to eight ingestion loops, bounded by
+restarts are safe and reset a running worker to stopped, so they do not start
+catalog or media work. Operators request
+`full_sweep`, `missing_only`, `prune_cleanup`, or `daily_sync` through the
+private admin API. The same API can start, pause, resume, or cancel either
+worker; pausing blocks new claims and does not stop the container. The worker
+runs up to eight ingestion loops, bounded by
 `TMDB_MAX_CONNECTIONS` and `TMDB_RATE_LIMIT`. The media worker waits for the
 durable queue schema before claiming image jobs, so first-boot migrations do
 not cause an image-worker crash.
@@ -188,8 +228,8 @@ docker compose --env-file "$TMDB_ENV_FILE" \
   -f deploy/compose.production.yaml logs --no-color --tail=200 postgres worker api media
 ```
 
-Exercise both `ALLOW_LOCAL_MEDIA` modes, a movie, TV, anime movie, anime TV,
-season zero and regular seasons, episodes, cast, network, company, and
+Exercise both `ALLOW_LOCAL_MEDIA` modes, a movie, TV, season zero and regular
+seasons, episodes, cast, network, company, and
 collection galleries. Verify root source digests, optimized dimensions, local
 URLs, stable gallery numbering, duplicate source-path handling, and that a
 worker restart leaves no orphan job lease.
@@ -203,9 +243,10 @@ capacity production-ready.
 The existing Trawl instance is used only as the challenge fallback:
 `TMDB_TRAWL_BASE_URL=http://<trawl-host>:8191`.
 
-The API service is also attached to the existing `prv.network`, but port 8081
-is never published to the host. A container on that private network can call
-`http://tmdb-mirror-api:8081/admin/v1/status` or `/metrics` using the existing
-admin key. PostgreSQL, worker, and media remain only on `tmdb-private`.
+The API service shares the configured external network with PostgreSQL, the
+worker, and media. Port 8081 is never published to the host. A trusted
+container on that network can call
+`http://tmdb-mirror-api:8081/admin/v1/status` or `/metrics` using the admin
+key.
 
 Backup and offline recovery steps are in [backup-recovery.md](backup-recovery.md).

@@ -12,7 +12,7 @@ async fn admin_submissions_are_durable_idempotent_and_backups_are_linked(
            FROM ops.submit_admin_job($1, 'admin.scan', $2, 'scan-idempotency', $3)",
     )
     .bind(Uuid::now_v7())
-    .bind(r#"{"mode":"full","mediaTypes":["movie","tv"]}"#)
+    .bind(r#"{"mode":"full_sweep","mediaTypes":["movie","tv"]}"#)
     .bind(request_id)
     .fetch_one(&pool)
     .await?;
@@ -22,7 +22,7 @@ async fn admin_submissions_are_durable_idempotent_and_backups_are_linked(
            FROM ops.submit_admin_job($1, 'admin.scan', $2, 'scan-idempotency', $3)",
     )
     .bind(Uuid::now_v7())
-    .bind(r#"{"mode":"full","mediaTypes":["movie","tv"]}"#)
+    .bind(r#"{"mode":"full_sweep","mediaTypes":["movie","tv"]}"#)
     .bind(Uuid::now_v7())
     .fetch_one(&pool)
     .await?;
@@ -33,7 +33,7 @@ async fn admin_submissions_are_durable_idempotent_and_backups_are_linked(
            FROM ops.submit_admin_job($1, 'admin.scan', $2, 'scan-idempotency', $3)",
     )
     .bind(Uuid::now_v7())
-    .bind(r#"{"mode":"changes","mediaTypes":["tv"]}"#)
+    .bind(r#"{"mode":"daily_sync","mediaTypes":["tv"]}"#)
     .bind(Uuid::now_v7())
     .execute(&pool)
     .await
@@ -363,6 +363,357 @@ async fn media_scan_submission_and_worker_control_are_idempotent_and_bound_claim
             .fetch_one(&pool)
             .await?;
     assert!(cancellation_requested);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+async fn operator_control_gates_ingest_and_media_claims_independently(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let initial: Vec<(String, String)> = sqlx::query_as(
+        "SELECT worker_kind, state
+           FROM ops.worker_control
+          ORDER BY worker_kind",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        initial,
+        [
+            ("ingest".to_owned(), "stopped".to_owned()),
+            ("media".to_owned(), "stopped".to_owned()),
+        ]
+    );
+
+    let ingest_running: Uuid = sqlx::query_scalar(
+        "SELECT job_id
+           FROM ops.submit_job(
+               $1, 'ingest.refresh_movie', 1,
+               '{\"tmdbId\":1}', 0::smallint, 3,
+               clock_timestamp(), 'operator-ingest-running')",
+    )
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await?;
+    let ingest_queued: Uuid = sqlx::query_scalar(
+        "SELECT job_id
+           FROM ops.submit_job(
+               $1, 'ingest.refresh_movie', 1,
+               '{\"tmdbId\":2}', 0::smallint, 3,
+               clock_timestamp(), 'operator-ingest-queued')",
+    )
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await?;
+    let media_job: Uuid = sqlx::query_scalar(
+        "SELECT job_id
+           FROM ops.submit_job(
+               $1, 'image.download', 1, '{}', 0::smallint, 3,
+               clock_timestamp(), 'operator-media')",
+    )
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await?;
+
+    let paused_ingest: Option<Uuid> = sqlx::query_scalar(
+        "SELECT job_id
+           FROM ops.claim_job_for_types(
+               'operator-ingest-test', 1000000,
+               ARRAY['ingest.refresh_movie']::text[])",
+    )
+    .fetch_optional(&pool)
+    .await?;
+    assert!(paused_ingest.is_none());
+
+    let start_ingest: (String, bool) = sqlx::query_as(
+        "SELECT state, was_duplicate
+           FROM ops.set_worker_state('ingest', 'start', 'operator-ingest-start', $1)",
+    )
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(start_ingest, ("running".to_owned(), false));
+
+    let claimed_ingest: Uuid = sqlx::query_scalar(
+        "SELECT job_id
+           FROM ops.claim_job_for_types(
+               'operator-ingest-test', 1000000,
+               ARRAY['ingest.refresh_movie']::text[])",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(claimed_ingest, ingest_running);
+
+    let still_paused_media: Option<Uuid> = sqlx::query_scalar(
+        "SELECT job_id
+           FROM ops.claim_job_for_types(
+               'operator-media-test', 1000000,
+               ARRAY['image.download']::text[])",
+    )
+    .fetch_optional(&pool)
+    .await?;
+    assert!(still_paused_media.is_none());
+
+    let start_media: (String, bool) = sqlx::query_as(
+        "SELECT state, was_duplicate
+           FROM ops.set_worker_state('media', 'start', 'operator-media-start', $1)",
+    )
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(start_media, ("running".to_owned(), false));
+    let claimed_media: Uuid = sqlx::query_scalar(
+        "SELECT job_id
+           FROM ops.claim_job_for_types(
+               'operator-media-test', 1000000,
+               ARRAY['image.download']::text[])",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(claimed_media, media_job);
+
+    let stop_ingest: (String, bool) = sqlx::query_as(
+        "SELECT state, was_duplicate
+           FROM ops.set_worker_state('ingest', 'cancel', 'operator-ingest-cancel', $1)",
+    )
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(stop_ingest, ("stopped".to_owned(), false));
+
+    let queued_status: String = sqlx::query_scalar("SELECT status FROM ops.jobs WHERE id = $1")
+        .bind(ingest_queued)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(queued_status, "cancelled");
+    let running_cancel_requested: bool =
+        sqlx::query_scalar("SELECT cancellation_requested FROM ops.jobs WHERE id = $1")
+            .bind(ingest_running)
+            .fetch_one(&pool)
+            .await?;
+    assert!(running_cancel_requested);
+
+    let media_state: String =
+        sqlx::query_scalar("SELECT state FROM ops.worker_control WHERE worker_kind = 'media'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(media_state, "running");
+    Ok(())
+}
+
+#[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+async fn image_job_submission_stays_bounded_and_keeps_active_duplicates_idempotent(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO ops.jobs (
+             id, job_type, payload_version, payload, status, dedup_key,
+             available_at, created_at, updated_at, finished_at
+         )
+         SELECT gen_random_uuid(), 'image.download', 1, '{}'::jsonb, 'succeeded',
+                'backpressure-' || series::text,
+                clock_timestamp(), clock_timestamp(), clock_timestamp(), clock_timestamp()
+           FROM generate_series(1, 10000) AS series",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "UPDATE ops.jobs
+            SET status = 'queued', finished_at = NULL, updated_at = clock_timestamp()
+          WHERE job_type = 'image.download' AND dedup_key LIKE 'backpressure-%'",
+    )
+    .execute(&pool)
+    .await?;
+
+    let duplicate: (Uuid, bool) = sqlx::query_as(
+        "SELECT job_id, was_duplicate
+           FROM ops.submit_job(
+               $1, 'image.download', 1, '{}', 0::smallint, 3,
+               clock_timestamp(), 'backpressure-1')",
+    )
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await?;
+    assert!(duplicate.1);
+
+    let rejected = sqlx::query(
+        "SELECT job_id
+           FROM ops.submit_job(
+               $1, 'image.download', 1, '{}', 0::smallint, 3,
+               clock_timestamp(), 'backpressure-new')",
+    )
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await
+    .expect_err("a new image job must not exceed the active queue limit");
+    assert_eq!(sqlstate(&rejected).as_deref(), Some("P0004"));
+
+    sqlx::query(
+        "UPDATE ops.jobs
+            SET status = 'cancelled',
+                finished_at = clock_timestamp(),
+                updated_at = clock_timestamp()
+          WHERE job_type = 'image.download'
+            AND dedup_key = 'backpressure-1'",
+    )
+    .execute(&pool)
+    .await?;
+
+    let accepted: (Uuid, bool) = sqlx::query_as(
+        "SELECT job_id, was_duplicate
+           FROM ops.submit_job(
+               $1, 'image.download', 1, '{}', 0::smallint, 3,
+               clock_timestamp(), 'backpressure-new')",
+    )
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await?;
+    assert!(!accepted.1);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+async fn title_refresh_submission_stays_bounded(pool: PgPool) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO ops.jobs (
+             id, job_type, payload_version, payload, status, dedup_key,
+             available_at, created_at, updated_at, finished_at
+         )
+         SELECT gen_random_uuid(), 'ingest.refresh_movie', 1,
+                jsonb_build_object('tmdb_id', series), 'succeeded',
+                'title-backpressure-' || series::text,
+                clock_timestamp(), clock_timestamp(), clock_timestamp(), clock_timestamp()
+           FROM generate_series(1, 1000) AS series",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "UPDATE ops.jobs
+            SET status = 'queued', finished_at = NULL, updated_at = clock_timestamp()
+          WHERE job_type = 'ingest.refresh_movie'
+            AND dedup_key LIKE 'title-backpressure-%'",
+    )
+    .execute(&pool)
+    .await?;
+
+    let rejected = sqlx::query(
+        "SELECT job_id
+           FROM ops.submit_job(
+               $1, 'ingest.refresh_movie', 1, '{\"tmdb_id\":2001}', 0::smallint, 3,
+               clock_timestamp(), 'title-backpressure-new')",
+    )
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await
+    .expect_err("a new title refresh must not exceed the active queue limit");
+    assert_eq!(sqlstate(&rejected).as_deref(), Some("P0004"));
+    Ok(())
+}
+
+#[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+async fn prune_finished_jobs_removes_old_history_but_keeps_scan_roots(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let unreferenced: Uuid = sqlx::query_scalar(
+        "SELECT job_id
+           FROM ops.submit_job(
+               $1, 'system.noop', 1, '{}', 0::smallint, 3,
+               clock_timestamp(), 'prune-unreferenced')",
+    )
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await?;
+    let admin: Uuid = sqlx::query_scalar(
+        "SELECT job_id
+           FROM ops.submit_admin_job(
+               $1, 'admin.analyze', '{}', 'prune-admin-reference', $2)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await?;
+    let (media_scan, scan_run): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT job_id, run_id
+           FROM ops.submit_media_scan(
+               $1, '{\"mode\":\"audit\",\"repair\":false}',
+               'prune-media-reference', $2)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await?;
+
+    let linked_child: Uuid = sqlx::query_scalar(
+        "SELECT job_id
+           FROM ops.submit_job(
+               $1, 'system.noop', 1, '{}', 0::smallint, 3,
+               clock_timestamp(), 'prune-linked-child')",
+    )
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO ops.media_scan_job_links (run_id, job_id, phase)
+         VALUES ($1, $2, 'audit')",
+    )
+    .bind(scan_run)
+    .bind(linked_child)
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "UPDATE ops.jobs
+            SET status = 'succeeded',
+                created_at = clock_timestamp() - interval '31 days',
+                finished_at = clock_timestamp() - interval '31 days',
+                updated_at = clock_timestamp() - interval '31 days'
+          WHERE id = ANY($1)",
+    )
+    .bind(vec![unreferenced, admin, media_scan, linked_child])
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "UPDATE ops.media_scan_runs
+            SET status = 'succeeded', phase = 'completed',
+                started_at = clock_timestamp() - interval '31 days',
+                finished_at = clock_timestamp() - interval '31 days'
+          WHERE id = $1",
+    )
+    .bind(scan_run)
+    .execute(&pool)
+    .await?;
+
+    let pruned: i32 = sqlx::query_scalar(
+        "SELECT ops.prune_finished_jobs(
+                    clock_timestamp() - interval '30 days', 100)",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(pruned, 2);
+
+    let remaining: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id
+           FROM ops.jobs
+          WHERE id = ANY($1)
+          ORDER BY id",
+    )
+    .bind(vec![unreferenced, admin, media_scan])
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(remaining.len(), 2);
+    assert!(!remaining.contains(&unreferenced));
+    assert!(remaining.contains(&admin));
+    assert!(remaining.contains(&media_scan));
+    assert!(!remaining.contains(&linked_child));
+    let link_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ops.media_scan_job_links
+          WHERE run_id = $1 AND job_id = $2",
+    )
+    .bind(scan_run)
+    .bind(linked_child)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(link_count, 0);
     Ok(())
 }
 

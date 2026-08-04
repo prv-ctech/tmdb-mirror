@@ -37,42 +37,9 @@ compose exec -T -e "PGPASSWORD=$password" postgres psql -X -v ON_ERROR_STOP=1 \
 
 verification="$(psql_at "$password" "SELECT json_build_object(
   'titles', count(*),
-  'anime', count(*) FILTER (WHERE is_anime),
-  'keyword_only', count(*) FILTER (WHERE has_anime_keyword AND NOT has_animation_genre),
-  'animation_only', count(*) FILTER (WHERE NOT has_anime_keyword AND has_animation_genre),
-  'classification_mismatches', count(*) FILTER (
-      WHERE is_anime <> (has_anime_keyword AND has_animation_genre)
-  ),
   'search_documents', (SELECT count(*) FROM search.search_documents WHERE title_id IN (
     SELECT id FROM catalog.titles WHERE tmdb_id >= 900000001 AND tmdb_id < 900000001 + $count
   ))
-) FROM (
-  SELECT t.id,
-         t.is_anime,
-         EXISTS (
-             SELECT 1 FROM catalog.title_keywords tk
-             WHERE tk.title_id = t.id AND tk.keyword_id = 210024
-         ) AS has_anime_keyword,
-         EXISTS (
-             SELECT 1 FROM catalog.title_genres tg
-             WHERE tg.title_id = t.id AND tg.genre_id = 16
-         ) AS has_animation_genre
-  FROM catalog.titles t
-  WHERE t.tmdb_id >= 900000001 AND t.tmdb_id < 900000001 + $count
-) AS scoped" )"
+) FROM catalog.titles
+WHERE tmdb_id >= 900000001 AND tmdb_id < 900000001 + $count" )"
 printf '%s\n' "$verification"
-
-mismatches="$(psql_at "$password" "SELECT count(*)
-FROM catalog.titles t
-WHERE t.tmdb_id >= 900000001 AND t.tmdb_id < 900000001 + $count
-  AND t.is_anime <> (
-      EXISTS (
-          SELECT 1 FROM catalog.title_keywords tk
-          WHERE tk.title_id = t.id AND tk.keyword_id = 210024
-      )
-      AND EXISTS (
-          SELECT 1 FROM catalog.title_genres tg
-          WHERE tg.title_id = t.id AND tg.genre_id = 16
-      )
-  )" )"
-[[ "$mismatches" == 0 ]] || die "stress seed classification mismatch count: $mismatches"

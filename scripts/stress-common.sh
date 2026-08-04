@@ -13,7 +13,6 @@ API_PORT="${TMDB_STRESS_API_PORT:-18080}"
 ADMIN_PORT="${TMDB_STRESS_ADMIN_PORT:-18081}"
 IMAGE_PORT="${TMDB_STRESS_IMAGE_PORT:-18090}"
 POSTGRES_PORT="${TMDB_STRESS_PG_PORT:-55433}"
-SCHEDULER_ENABLED="${TMDB_STRESS_ENABLE_SCHEDULER:-false}"
 COMPOSE_FILE="$REPO_ROOT/deploy/compose.stress.yaml"
 RUNTIME_ROOT="$REPO_ROOT/.stress-runtime/$PROJECT_NAME"
 SECRET_RUNTIME_ROOT="${TMDB_STRESS_SECRET_RUNTIME_ROOT:-/tmp/tmdb-stress-secrets}"
@@ -249,7 +248,7 @@ wait_for_migrations() {
             continue
         fi
         version="$(psql_at "$password" "SELECT COALESCE(max(version), 0) FROM ops._sqlx_migrations WHERE success" 2>/dev/null || true)"
-        if [[ "$version" =~ ^[0-9]+$ ]] && (( version >= 30 )); then
+        if [[ "$version" =~ ^[0-9]+$ ]] && (( version >= 41 )); then
             return 0
         fi
         sleep 2
@@ -319,9 +318,6 @@ TMDB_STRESS_PG_EFFECTIVE_CACHE_SIZE=8GB
 TMDB_STRESS_PG_WORK_MEM=32MB
 TMDB_STRESS_PG_MAINTENANCE_WORK_MEM=512MB
 ALLOW_LOCAL_MEDIA=true
-TMDB_ENABLE_SCHEDULER=$SCHEDULER_ENABLED
-TMDB_SCHEDULER_INTERVAL_SECONDS=60
-TMDB_ENABLE_DAILY_EXPORT=false
 $trawl_line
 EOF
     cat >"$tmp_override" <<'EOF'

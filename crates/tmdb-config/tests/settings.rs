@@ -28,6 +28,7 @@ fn valid_entries(environment: &str) -> Vec<(OsString, OsString)> {
         ("POSTGRES_USER", "example_owner"),
         ("POSTGRES_PASSWORD", DATABASE_PASSWORD),
         ("TMDB_TRAWL_BASE_URL", "http://trawl.internal:8080"),
+        ("TMDB_MEDIA_BASE_URL", "http://media.internal:8090/media"),
         ("TMDB_API_KEY", ADMIN_API_KEY),
     ]
     .into_iter()
@@ -247,6 +248,14 @@ fn app_config_parses_typed_settings_and_redacts_secrets() -> Result<(), Box<dyn 
             .as_ref()
             .and_then(|uri| uri.scheme_str()),
         Some("http")
+    );
+    assert_eq!(
+        config
+            .media_base_url
+            .as_ref()
+            .and_then(|uri| uri.path_and_query())
+            .map(http::uri::PathAndQuery::as_str),
+        Some("/media")
     );
 
     let rendered = format!("{config:?}");

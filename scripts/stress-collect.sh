@@ -46,7 +46,6 @@ db_stats="$(psql_at "$password" "SELECT json_build_object(
   'database_size_bytes', pg_database_size(current_database()),
   'database_size', pg_size_pretty(pg_database_size(current_database())),
   'titles', (SELECT count(*) FROM catalog.titles),
-  'anime_titles', (SELECT count(*) FROM catalog.titles WHERE is_anime),
   'people', (SELECT count(*) FROM catalog.people),
   'image_assets_ready', (SELECT count(*) FROM assets.image_assets WHERE status = 'ready'),
   'image_assets_by_kind', (SELECT COALESCE(json_object_agg(image_kind, asset_count ORDER BY image_kind), '{}'::json) FROM (SELECT image_kind, count(*) AS asset_count FROM assets.image_assets WHERE status = 'ready' GROUP BY image_kind) image_counts),

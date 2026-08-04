@@ -75,7 +75,7 @@ services:
       retries: 30
       start_period: 30s
     networks:
-      - tmdb-private
+      - app-network
 
   api:
     <<: *app-common
@@ -92,8 +92,7 @@ services:
       retries: 12
       start_period: 10s
     networks:
-      tmdb-private: {}
-      prv-network:
+      app-network:
         aliases:
           - tmdb-mirror-api
 
@@ -114,7 +113,7 @@ services:
           create_host_path: true
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SETPCAP]
     networks:
-      - tmdb-private
+      - app-network
 
   media:
     <<: *app-common
@@ -146,13 +145,10 @@ services:
       retries: 12
       start_period: 10s
     networks:
-      - tmdb-private
+      - app-network
 
 networks:
-  tmdb-private:
-    driver: bridge
-  # The private administrative listener remains unpublished on the host. Other
-  # containers on prv.network use http://tmdb-mirror-api:8081.
-  prv-network:
+  # Replace your.network with the existing external Docker network name.
+  app-network:
     external: true
-    name: prv.network
+    name: your.network

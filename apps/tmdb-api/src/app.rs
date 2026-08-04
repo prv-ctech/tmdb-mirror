@@ -155,11 +155,7 @@ fn build_router_inner(
     let request_id = HeaderName::from_static("x-request-id");
     let mut router = Router::new()
         .route("/health/live", get(health::live))
-        .route("/health/ready", get(health::ready))
-        // Keep every public health surface available through the stable v1
-        // prefix as well as the original unversioned compatibility paths.
-        .route("/v1/health/live", get(health::live))
-        .route("/v1/health/ready", get(health::ready));
+        .route("/health/ready", get(health::ready));
     if include_test_routes {
         router = router
             .route("/__test/panic", get(test_panic))

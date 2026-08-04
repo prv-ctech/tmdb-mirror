@@ -1,7 +1,7 @@
 # TMDB Mirror
 
-Rust + PostgreSQL 18 mirror of TMDB metadata with catalog search, strict anime
-isolation, local optimized image storage, durable worker jobs, and four
+Rust + PostgreSQL 18 mirror of TMDB metadata with the TMDB v3 read surface,
+local image storage, durable worker jobs, and four
 runtime services: PostgreSQL, API, main worker, and media worker.
 
 ## Run with Docker Compose
@@ -13,11 +13,11 @@ pulls the published Linux AMD64 images and uses relative `./data` bind mounts:
 | --- | ---: | --- |
 | `postgres` | none | PostgreSQL 18, migrations, WAL archiving, and pgBackRest |
 | `api` | `9001` | Public catalog API |
-| `worker` | none | Migrations, schedules, ingest, retries, and durable jobs |
+| `worker` | none | Migrations and explicitly submitted ingest jobs |
 | `media` | `9002` | Downloaded public image files |
 
 The admin listener remains on container port `8081` and is not published by
-the production file. A container on the existing `prv.network` can reach it at
+the production file. A container on the configured external network can reach it at
 `http://tmdb-mirror-api:8081`.
 
 Keep the real runtime environment outside the repository. The template has
@@ -42,9 +42,12 @@ docker compose --env-file "$TMDB_ENV_FILE" \
   -f deploy/compose.production.yaml ps
 ```
 
-The external `prv.network` must already exist. The application paths inside
-containers are fixed: `/config` for scratch, exports, checkpoints, logs, and
-backups; `/media` for public image files.
+The external network named in the Compose file must already exist. The Git
+examples use `your.network` as a neutral placeholder; replace only that
+`name:` value with your existing Docker network. All four services use this
+one external network. The application paths inside containers are fixed:
+`/config` for scratch, exports, checkpoints, logs, and backups; `/media` for
+public image files.
 
 To reuse existing host directories, edit the `source:` values in the Compose
 file. Host mount paths are deployment settings, not application environment.
@@ -55,31 +58,47 @@ New checkout deployments can use the canonical file above. See
 [production deployment](docs/deployment-production.md) for bind mounts,
 permissions, media policy, and validation.
 
+These files replace the older deployment contract. The four services and host
+ports remain the same, but the current files use the `tmdb-runtime` startup
+wrapper for worker/media storage preparation, relative Compose bind sources,
+and no published admin port. The root standalone file reads `.env` beside it;
+the production file reads `../.env` by default or the file selected by
+`TMDB_ENV_FILE`.
+
+The current `.env.example` is intentionally minimal. Enter database owner
+credentials, the TMDB read token, admin key, API base URL, media settings, and
+worker tuning shown there. Do not carry forward listener binds, `PGDATA`,
+`POSTGRES_INITDB_ARGS`, host-path variables, per-role credentials, or scheduler
+toggles from an older environment. Host paths and host ports belong in
+Compose.
+
 ## API
 
 Public catalog routes require no client key and have both unversioned and
 stable `/v1` forms:
 
 ```text
-GET /v1/health/live
-GET /v1/movies?genreId=28&language=en
-GET /v1/tv/{tmdb_id}
-GET /v1/anime?q=one%20piece&type=tv
-GET /v1/search?q=matrix&limit=20
-GET /v1/openapi.json
+GET /health/live
+GET /3/configuration
+GET /3/movie/{movie_id}
+GET /3/movie/{movie_id}/images
+GET /3/tv/{tv_id}/season/{season_number}/episode/{episode_number}
+GET /3/search/movie?query=matrix
 ```
 
-Movie and TV routes never return anime. Anime routes remain isolated and can
-search both anime media types unless `type=movie` or `type=tv` is supplied.
-The private admin API supports status, durable job history, explicit scans,
-cancellation/retry, non-destructive media audits, allowlisted analyze jobs,
-durable media full/missing/audit scans, persistent media-worker controls, and
+The private admin API supports status, durable job history, explicit
+`full_sweep`, `missing_only`, `prune_cleanup`, and `daily_sync` scans,
+cancellation/retry, media audits, persistent worker controls, and
 full/differential backup requests. Admin writes require
 `Idempotency-Key` and return `202 Accepted` durable jobs.
 
-See the complete [API reference](docs/api.md), or query the public and private
-OpenAPI documents at `/v1/openapi.json` and `/admin/v1/openapi.json` from their
-respective listeners.
+Neither worker runs a catalog scheduler or starts queued work automatically
+after a restart. A previously running worker is reset to stopped; a paused
+worker remains paused. Use the authenticated admin worker controls and scan
+routes to start work deliberately.
+
+See the complete [API reference](docs/api.md) and the private OpenAPI document
+at `/admin/v1/openapi.json`.
 
 ## Media galleries
 

@@ -2,23 +2,23 @@
 
 use std::collections::VecDeque;
 use std::sync::{
-    Arc,
     atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 use std::time::Duration;
 
-use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
 use axum::response::Response;
-use http::{HeaderValue, StatusCode, header::AUTHORIZATION};
+use axum::Router;
+use http::{header::AUTHORIZATION, HeaderValue, StatusCode};
 use reqwest::Url;
 use secrecy::SecretString;
 use tempfile::tempdir;
 use tmdb_domain::MediaType;
 use tmdb_upstream::{
-    RateLimitPolicy, ResponseClass, RetryPolicy, TmdbClient, TmdbClientError, TrawlDecision,
-    classify_response, trawl_decision,
+    classify_response, trawl_decision, RateLimitPolicy, ResponseClass, RetryPolicy, TmdbClient,
+    TmdbClientError, TrawlDecision,
 };
 use tokio::sync::Mutex;
 
@@ -218,6 +218,42 @@ async fn episode_images_allow_specials_season_and_reject_zero_episode() {
 }
 
 #[tokio::test]
+async fn season_and_episode_details_use_exact_tmdb_routes_without_appends() {
+    let (base_url, state, task) = mock_server(vec![
+        MockResponse {
+            status: StatusCode::OK,
+            body: r#"{"id":900,"season_number":1,"episodes":[{"id":901,"episode_number":1,"name":"Pilot"}]}"#,
+            retry_after: None,
+        },
+        MockResponse {
+            status: StatusCode::OK,
+            body: r#"{"id":901,"season_number":1,"episode_number":1,"name":"Pilot"}"#,
+            retry_after: None,
+        },
+    ])
+    .await;
+
+    let (season_raw, season) = client(&base_url)
+        .fetch_season_with_raw(119_495, 1)
+        .await
+        .expect("season detail");
+    assert_eq!(season_raw["id"], 900);
+    assert_eq!(season.episodes[0].id, 901);
+
+    let (episode_raw, episode) = client(&base_url)
+        .fetch_episode_with_raw(119_495, 1, 1)
+        .await
+        .expect("episode detail");
+    assert_eq!(episode_raw["id"], 901);
+    assert_eq!(episode.name.as_deref(), Some("Pilot"));
+
+    let uris = state.uris.lock().await.clone();
+    assert_eq!(uris[0], "/tv/119495/season/1");
+    assert_eq!(uris[1], "/tv/119495/season/1/episode/1");
+    task.abort();
+}
+
+#[tokio::test]
 async fn retry_after_is_honored_before_success() {
     let (base_url, state, task) = mock_server(vec![
         MockResponse {
@@ -292,6 +328,24 @@ async fn auth_and_not_found_are_permanent() {
     ));
     assert_eq!(state.calls.load(Ordering::Relaxed), 1);
     task.abort();
+}
+
+#[tokio::test]
+async fn arbitrary_document_paths_reject_traversal_and_empty_segments() {
+    let base_url = "http://127.0.0.1/3/";
+    let upstream = client(base_url);
+    assert!(matches!(
+        upstream
+            .fetch_json::<serde_json::Value>("../configuration", &[], true)
+            .await,
+        Err(TmdbClientError::InvalidPath)
+    ));
+    assert!(matches!(
+        upstream
+            .fetch_json::<serde_json::Value>("movie//42", &[], true)
+            .await,
+        Err(TmdbClientError::InvalidPath)
+    ));
 }
 
 #[tokio::test]

@@ -61,8 +61,7 @@ failures continue to retry normally.
 
 ## Media layout
 
-Title assets use one of `movies/<movie_id>`, `tv/<tv_id>`,
-`anime/movie/<movie_id>`, or `anime/tv/<tv_id>`:
+Title assets use `movies/<movie_id>` or `tv/<tv_id>`:
 
 ```text
 <scope>/<title_id>/

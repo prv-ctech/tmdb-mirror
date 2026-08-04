@@ -108,9 +108,6 @@ pub struct ImageJobPayload {
     pub language: Option<String>,
     /// Optional source/catalog revision.
     pub source_revision: Option<String>,
-    /// Whether the title belongs to the explicit anime partition.
-    #[serde(default)]
-    pub anime: bool,
     /// Season number for season/episode assets.
     #[serde(default)]
     pub season_number: Option<u16>,
@@ -160,7 +157,6 @@ impl ImageJobPayload {
             source_url: source_url.into(),
             language,
             source_revision,
-            anime: false,
             season_number: None,
             episode_number: None,
             title_tmdb_id: None,
@@ -205,42 +201,6 @@ impl ImageJobPayload {
         self.asset_index = asset_index;
         self.validate()?;
         Ok(self)
-    }
-
-    /// Constructs a title-scoped payload with the explicit anime partition.
-    /// Existing version-one jobs remain compatible because the additional
-    /// fields are optional during deserialization.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ImagePayloadError`] when any supplied field is invalid.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_scoped(
-        entity_type: ImageEntityType,
-        entity_id: i64,
-        kind: ImageKind,
-        tmdb_path: impl Into<String>,
-        source_url: impl Into<String>,
-        language: Option<String>,
-        source_revision: Option<String>,
-        anime: bool,
-        season_number: Option<u16>,
-        episode_number: Option<u16>,
-    ) -> Result<Self, ImagePayloadError> {
-        let mut payload = Self::new(
-            entity_type,
-            entity_id,
-            kind,
-            tmdb_path,
-            source_url,
-            language,
-            source_revision,
-        )?;
-        payload.anime = anime;
-        payload.season_number = season_number;
-        payload.episode_number = episode_number;
-        payload.validate()?;
-        Ok(payload)
     }
 
     /// Validates a deserialized payload before it is executed.
@@ -1425,33 +1385,21 @@ fn semantic_path(payload: &ImageJobPayload, mime_type: &str) -> Result<PathBuf, 
     };
     match payload.entity_type {
         ImageEntityType::Movie => title_asset(
-            if payload.anime {
-                TitleScope::AnimeMovie
-            } else {
-                TitleScope::Movie
-            },
+            TitleScope::Movie,
             payload.entity_id,
             variant,
             format,
         )
         .map_err(|_| ()),
         ImageEntityType::Tv => title_asset(
-            if payload.anime {
-                TitleScope::AnimeTv
-            } else {
-                TitleScope::Tv
-            },
+            TitleScope::Tv,
             payload.entity_id,
             variant,
             format,
         )
         .map_err(|_| ()),
         ImageEntityType::Season | ImageEntityType::Episode => title_asset(
-            if payload.anime {
-                TitleScope::AnimeTv
-            } else {
-                TitleScope::Tv
-            },
+            TitleScope::Tv,
             payload.title_tmdb_id.ok_or(())?,
             variant,
             format,
@@ -1524,11 +1472,7 @@ fn semantic_derivative_path(payload: &ImageJobPayload, width_hint: u32) -> Resul
     };
     match payload.entity_type {
         ImageEntityType::Movie => optimized_title_asset(
-            if payload.anime {
-                TitleScope::AnimeMovie
-            } else {
-                TitleScope::Movie
-            },
+            TitleScope::Movie,
             payload.entity_id,
             variant,
             format,
@@ -1536,11 +1480,7 @@ fn semantic_derivative_path(payload: &ImageJobPayload, width_hint: u32) -> Resul
         )
         .map_err(|_| ()),
         ImageEntityType::Tv => optimized_title_asset(
-            if payload.anime {
-                TitleScope::AnimeTv
-            } else {
-                TitleScope::Tv
-            },
+            TitleScope::Tv,
             payload.entity_id,
             variant,
             format,
@@ -1548,11 +1488,7 @@ fn semantic_derivative_path(payload: &ImageJobPayload, width_hint: u32) -> Resul
         )
         .map_err(|_| ()),
         ImageEntityType::Season | ImageEntityType::Episode => optimized_title_asset(
-            if payload.anime {
-                TitleScope::AnimeTv
-            } else {
-                TitleScope::Tv
-            },
+            TitleScope::Tv,
             payload.title_tmdb_id.ok_or(())?,
             variant,
             format,
@@ -2568,8 +2504,7 @@ mod tests {
         let work = tempfile::tempdir()?;
         let images = tempfile::tempdir()?;
         let store = ImageStore::with_semantic_layout(work.path().join("work"), images.path())?;
-        let mut job = payload()?;
-        job.anime = true;
+        let job = payload()?;
         let image = DownloadedImage {
             body: PNG.to_vec(),
             mime_type: "image/png".to_owned(),
@@ -2582,14 +2517,14 @@ mod tests {
         let stored = store.publish(&job, &image).await?;
         assert_eq!(
             stored.metadata.storage_path,
-            "anime/movie/123/posters/poster.png"
+            "movies/123/posters/poster.png"
         );
         assert_eq!(stored.metadata.mime_type, "image/png");
         assert!(images.path().join(&stored.metadata.storage_path).is_file());
         assert_eq!(stored.metadata.variants.len(), 1);
         assert_eq!(
             stored.metadata.variants[0].storage_path,
-            "anime/movie/123/optimized/posters/poster-w640.jpg"
+            "movies/123/optimized/posters/poster-w640.jpg"
         );
         assert!(!images.path().join(".private").exists());
         Ok(())

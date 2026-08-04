@@ -137,6 +137,11 @@ pub async fn run() -> anyhow::Result<()> {
         pool.close().await;
         return Ok(());
     }
+    let startup_state: String = sqlx::query_scalar("SELECT ops.stop_worker_on_startup('media')")
+        .fetch_one(&pool)
+        .await
+        .context("reset media worker state after restart")?;
+    tracing::info!(event = "media_worker_control_ready", startup_state);
     let heartbeat = spawn_component_heartbeat(pool.clone(), cancellation.clone());
     let result = run_workers(workers, cancellation.clone()).await;
     cancellation.cancel();
@@ -322,7 +327,6 @@ where
                         WHEN asset.title_id IS NOT NULL THEN title.tmdb_id
                         ELSE asset.owner_id
                     END AS entity_id,
-                    COALESCE(title.is_anime, season_title.is_anime, episode_title.is_anime, false) AS anime,
                     season.season_number,
                     episode.episode_number,
                     COALESCE(season_title.tmdb_id, episode_title.tmdb_id) AS title_tmdb_id
@@ -417,7 +421,6 @@ struct MediaAuditAssetRow {
     language: Option<String>,
     entity_type: Option<String>,
     entity_id: Option<i64>,
-    anime: bool,
     season_number: Option<i32>,
     episode_number: Option<i32>,
     title_tmdb_id: Option<i64>,
@@ -592,7 +595,6 @@ fn repair_job(row: &MediaAuditAssetRow) -> Option<NewJob> {
         "sourceUrl": row.source_url,
         "language": row.language,
         "sourceRevision": Value::Null,
-        "anime": row.anime,
         "seasonNumber": season_number,
         "episodeNumber": episode_number,
         "titleTmdbId": row.title_tmdb_id,
@@ -656,7 +658,6 @@ where
             entity_type = image_entity_type_name(payload.entity_type),
             entity_id = payload.entity_id,
             image_kind = image_kind_name(payload.kind),
-            anime = payload.anime,
         );
         if !self.allow_local_media {
             tracing::debug!(

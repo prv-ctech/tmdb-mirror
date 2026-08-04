@@ -1,20 +1,12 @@
 //! Database access primitives for the TMDB mirror.
 
-mod catalog;
+mod documents;
 mod migrate;
 mod options;
 mod pool;
 mod readiness;
 
-pub use catalog::{
-    AnimeScope, CatalogAlternateTitle, CatalogCollection, CatalogCompany, CatalogCredit,
-    CatalogDetail, CatalogEpisode, CatalogError, CatalogExternalIds, CatalogFacets, CatalogFilters,
-    CatalogGenre, CatalogImageAsset, CatalogImageVariant, CatalogKeyword, CatalogLanguage,
-    CatalogMovieDetails, CatalogNetwork, CatalogPage, CatalogPerson, CatalogRecentPage,
-    CatalogReleaseDate, CatalogRepository, CatalogSeason, CatalogTag, CatalogTitle, CatalogTopPage,
-    CatalogTranslation, CatalogTrend, CatalogTvDetails, CatalogVideo, PopularCursor, RecentCursor,
-    TopCursor,
-};
+pub use documents::TmdbDocumentRepository;
 pub use migrate::{MIGRATOR, MigrationReport, migrate};
 pub use pool::{PoolPolicy, connect_direct};
 pub use readiness::{ReadinessReport, readiness};

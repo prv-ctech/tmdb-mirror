@@ -1,5 +1,5 @@
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, Cursor, Read};
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 
 use flate2::read::GzDecoder;
@@ -104,6 +104,52 @@ impl DailyExportParser {
     /// Returns a sanitized file, gzip, JSON, or bound error.
     pub fn count_file(&self, path: impl AsRef<Path>) -> Result<usize, ExportParseError> {
         self.scan_file(path, |_| {})
+    }
+
+    /// Writes one validated TMDB ID per line to an atomically published file.
+    ///
+    /// The normalized file lets a durable export continuation seek directly to
+    /// its next byte offset instead of rescanning a compressed export from the
+    /// beginning for every batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized file, gzip, JSON, or bound error.
+    pub fn write_id_file(
+        &self,
+        source: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> Result<usize, ExportParseError> {
+        let destination = destination.as_ref();
+        if destination.as_os_str().is_empty() || destination.file_name().is_none() {
+            return Err(ExportParseError::Io);
+        }
+        let temporary = destination.with_extension("ids.tmp");
+        let file = File::create(&temporary)?;
+        let mut writer = BufWriter::new(file);
+        let mut write_error = None;
+        let records = self.scan_file(source, |record| {
+            if write_error.is_none()
+                && writeln!(writer, "{}", record.id).is_err()
+            {
+                write_error = Some(());
+            }
+        });
+        if write_error.is_some() {
+            let _ = fs::remove_file(&temporary);
+            return Err(ExportParseError::Io);
+        }
+        let records = match records {
+            Ok(records) => records,
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(error);
+            }
+        };
+        writer.flush().map_err(|_| ExportParseError::Io)?;
+        drop(writer);
+        fs::rename(&temporary, destination)?;
+        Ok(records)
     }
 
     /// Validates and visits every record in a plain or gzip daily export file without retaining
@@ -372,6 +418,23 @@ mod tests {
         encoder.write_all(plain).map_err(|_| ExportParseError::Io)?;
         let compressed = encoder.finish().map_err(|_| ExportParseError::Io)?;
         assert_eq!(parse_daily_export(&compressed)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn writes_validated_id_file_for_seekable_continuations() -> Result<(), ExportParseError> {
+        let source = tempfile::NamedTempFile::new().map_err(|_| ExportParseError::Io)?;
+        let destination = tempfile::NamedTempFile::new().map_err(|_| ExportParseError::Io)?;
+        std::fs::write(
+            source.path(),
+            br#"{"id":7,"adult":false,"video":false}
+{"id":8,"adult":false,"video":false}
+"#,
+        )
+        .map_err(|_| ExportParseError::Io)?;
+        let records = DailyExportParser::default().write_id_file(source.path(), destination.path())?;
+        assert_eq!(records, 2);
+        assert_eq!(std::fs::read_to_string(destination.path()).map_err(|_| ExportParseError::Io)?, "7\n8\n");
         Ok(())
     }
 

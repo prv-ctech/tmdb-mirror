@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use http::{HeaderMap, StatusCode, header::RETRY_AFTER};
+use http::{header::RETRY_AFTER, HeaderMap, StatusCode};
 use reqwest::{Client, Url};
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tmdb_domain::MediaType;
 use tokio::fs::{self, File, OpenOptions};
@@ -15,13 +16,21 @@ use tokio::time::sleep;
 
 use crate::policy::{PolicyError, RequestGate, RetryPolicy};
 use crate::{
-    ChangeHistory, ChangePage, TmdbImages, TmdbMovie, TmdbSeason, TmdbTrendingPage, TmdbTv,
-    TmdbVideos,
+    ChangeHistory, ChangePage, TmdbEpisode, TmdbImages, TmdbMovie, TmdbSeason, TmdbTrendingPage,
+    TmdbTv, TmdbVideos,
 };
 
 /// Hard upper bound for one streamed daily export download.
 pub const MAX_DAILY_EXPORT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
+/// Query used by the movie detail ingest request.
+pub const MOVIE_DETAIL_QUERY_STRING: &str = "append_to_response=keywords,credits,translations,alternative_titles,external_ids,videos,release_dates";
+/// Query used by the TV detail ingest request.
+pub const TV_DETAIL_QUERY_STRING: &str = "append_to_response=keywords,credits,translations,alternative_titles,external_ids,videos,content_ratings";
+/// Query used by TMDB image-gallery endpoints.
+pub const IMAGE_GALLERY_QUERY_STRING: &str = "language=en-US&include_image_language=en,null";
+/// Query used by TMDB video-gallery endpoints.
+pub const VIDEO_GALLERY_QUERY_STRING: &str = "language=en-US&include_video_language=en,null";
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Metadata returned after a streamed daily export is atomically published.
@@ -134,25 +143,88 @@ impl TmdbClient {
         self.policy
     }
 
+    /// Fetches TMDB's current image configuration document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_configuration(&self) -> Result<Value, TmdbClientError> {
+        self.fetch_json("configuration", &[], true).await
+    }
+
+    /// Fetches one validated TMDB v3 JSON document and returns the canonical
+    /// query string used by the local document store.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_document(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<(Value, String), TmdbClientError> {
+        let response = self.fetch_json(path, query, true).await?;
+        let query_string = query
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        Ok((response, query_string))
+    }
+
     /// Fetches a typed movie detail response.
     ///
     /// # Errors
     ///
     /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
     pub async fn fetch_movie(&self, tmdb_id: u32) -> Result<TmdbMovie, TmdbClientError> {
+        self.fetch_movie_with_raw(tmdb_id)
+            .await
+            .map(|(_, movie)| movie)
+    }
+
+    /// Fetches the exact JSON document used by the movie detail ingest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_movie_with_raw(
+        &self,
+        tmdb_id: u32,
+    ) -> Result<(Value, TmdbMovie), TmdbClientError> {
         if tmdb_id == 0 {
             return Err(TmdbClientError::InvalidPath);
         }
-        self.fetch_json(
-            &format!("movie/{tmdb_id}"),
-            &[ (
-                "append_to_response",
-                "keywords,credits,translations,alternative_titles,external_ids,videos,release_dates"
-                    .to_owned(),
-            )],
-            true,
-        )
-        .await
+        let raw: Value = self
+            .fetch_json(
+                &format!("movie/{tmdb_id}"),
+                &[(
+                    "append_to_response",
+                    MOVIE_DETAIL_QUERY_STRING
+                        .trim_start_matches("append_to_response=")
+                        .to_owned(),
+                )],
+                true,
+            )
+            .await?;
+        let movie: TmdbMovie =
+            serde_json::from_value(raw.clone()).map_err(|_| TmdbClientError::MalformedJson {
+                endpoint: bounded_endpoint(&format!("movie/{tmdb_id}")),
+            })?;
+        Ok((raw, movie))
+    }
+
+    /// Fetches the default movie detail document without appended resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_movie_base(&self, tmdb_id: u32) -> Result<Value, TmdbClientError> {
+        if tmdb_id == 0 {
+            return Err(TmdbClientError::InvalidPath);
+        }
+        self.fetch_json(&format!("movie/{tmdb_id}"), &[], true)
+            .await
     }
 
     /// Fetches a typed television detail response.
@@ -161,22 +233,55 @@ impl TmdbClient {
     ///
     /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
     pub async fn fetch_tv(&self, tmdb_id: u32) -> Result<TmdbTv, TmdbClientError> {
+        self.fetch_tv_with_raw(tmdb_id)
+            .await
+            .map(|(_, series)| series)
+    }
+
+    /// Fetches the exact JSON document used by the TV detail ingest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_tv_with_raw(
+        &self,
+        tmdb_id: u32,
+    ) -> Result<(Value, TmdbTv), TmdbClientError> {
         if tmdb_id == 0 {
             return Err(TmdbClientError::InvalidPath);
         }
-        self.fetch_json(
-            &format!("tv/{tmdb_id}"),
-            &[ (
-                "append_to_response",
-                "keywords,credits,translations,alternative_titles,external_ids,videos,content_ratings"
-                    .to_owned(),
-            )],
-            true,
-        )
-        .await
+        let raw: Value = self
+            .fetch_json(
+                &format!("tv/{tmdb_id}"),
+                &[(
+                    "append_to_response",
+                    TV_DETAIL_QUERY_STRING
+                        .trim_start_matches("append_to_response=")
+                        .to_owned(),
+                )],
+                true,
+            )
+            .await?;
+        let series: TmdbTv =
+            serde_json::from_value(raw.clone()).map_err(|_| TmdbClientError::MalformedJson {
+                endpoint: bounded_endpoint(&format!("tv/{tmdb_id}")),
+            })?;
+        Ok((raw, series))
     }
 
-    /// Fetches a full TV season, including episodes and episode credits.
+    /// Fetches the default TV detail document without appended resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_tv_base(&self, tmdb_id: u32) -> Result<Value, TmdbClientError> {
+        if tmdb_id == 0 {
+            return Err(TmdbClientError::InvalidPath);
+        }
+        self.fetch_json(&format!("tv/{tmdb_id}"), &[], true).await
+    }
+
+    /// Fetches a full TV season, including its episode list.
     ///
     /// # Errors
     ///
@@ -191,10 +296,78 @@ impl TmdbClient {
         }
         self.fetch_json(
             &format!("tv/{tv_id}/season/{season_number}"),
-            &[("append_to_response", "credits".to_owned())],
+            &[],
             true,
         )
         .await
+    }
+
+    /// Fetches a TV season document together with its typed representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_season_with_raw(
+        &self,
+        tv_id: u32,
+        season_number: u16,
+    ) -> Result<(Value, TmdbSeason), TmdbClientError> {
+        if tv_id == 0 {
+            return Err(TmdbClientError::InvalidPath);
+        }
+        let raw: Value = self
+            .fetch_json(
+                &format!("tv/{tv_id}/season/{season_number}"),
+                &[],
+                true,
+            )
+            .await?;
+        let season: TmdbSeason =
+            serde_json::from_value(raw.clone()).map_err(|_| TmdbClientError::MalformedJson {
+                endpoint: bounded_endpoint(&format!("tv/{tv_id}/season/{season_number}")),
+            })?;
+        Ok((raw, season))
+    }
+
+    /// Fetches one TV episode detail response.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_episode(
+        &self,
+        tv_id: u32,
+        season_number: u16,
+        episode_number: u16,
+    ) -> Result<TmdbEpisode, TmdbClientError> {
+        self.fetch_episode_with_raw(tv_id, season_number, episode_number)
+            .await
+            .map(|(_, episode)| episode)
+    }
+
+    /// Fetches one TV episode detail document with its typed representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_episode_with_raw(
+        &self,
+        tv_id: u32,
+        season_number: u16,
+        episode_number: u16,
+    ) -> Result<(Value, TmdbEpisode), TmdbClientError> {
+        if tv_id == 0 || episode_number == 0 {
+            return Err(TmdbClientError::InvalidPath);
+        }
+        let path = format!(
+            "tv/{tv_id}/season/{season_number}/episode/{episode_number}"
+        );
+        let raw: Value = self.fetch_json(&path, &[], true).await?;
+        let episode: TmdbEpisode =
+            serde_json::from_value(raw.clone()).map_err(|_| TmdbClientError::MalformedJson {
+                endpoint: bounded_endpoint(&path),
+            })?;
+        Ok((raw, episode))
     }
 
     /// Fetches the complete English and untagged movie image gallery.
@@ -203,7 +376,21 @@ impl TmdbClient {
     ///
     /// Returns a sanitized TMDB client error when the ID is invalid or the request fails.
     pub async fn fetch_movie_images(&self, tmdb_id: u32) -> Result<TmdbImages, TmdbClientError> {
-        self.fetch_images(&format!("movie/{tmdb_id}/images"), tmdb_id != 0)
+        self.fetch_movie_images_with_raw(tmdb_id)
+            .await
+            .map(|(_, images)| images)
+    }
+
+    /// Fetches a movie image gallery with its exact JSON document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_movie_images_with_raw(
+        &self,
+        tmdb_id: u32,
+    ) -> Result<(Value, TmdbImages), TmdbClientError> {
+        self.fetch_images_with_raw(&format!("movie/{tmdb_id}/images"), tmdb_id != 0)
             .await
     }
 
@@ -213,7 +400,21 @@ impl TmdbClient {
     ///
     /// Returns a sanitized TMDB client error when the ID is invalid or the request fails.
     pub async fn fetch_tv_images(&self, tmdb_id: u32) -> Result<TmdbImages, TmdbClientError> {
-        self.fetch_images(&format!("tv/{tmdb_id}/images"), tmdb_id != 0)
+        self.fetch_tv_images_with_raw(tmdb_id)
+            .await
+            .map(|(_, images)| images)
+    }
+
+    /// Fetches a TV image gallery with its exact JSON document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_tv_images_with_raw(
+        &self,
+        tmdb_id: u32,
+    ) -> Result<(Value, TmdbImages), TmdbClientError> {
+        self.fetch_images_with_raw(&format!("tv/{tmdb_id}/images"), tmdb_id != 0)
             .await
     }
 
@@ -230,7 +431,25 @@ impl TmdbClient {
         if tv_id == 0 {
             return Err(TmdbClientError::InvalidPath);
         }
-        self.fetch_images(&format!("tv/{tv_id}/season/{season_number}/images"), true)
+        self.fetch_season_images_with_raw(tv_id, season_number)
+            .await
+            .map(|(_, images)| images)
+    }
+
+    /// Fetches a season image gallery with its exact JSON document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_season_images_with_raw(
+        &self,
+        tv_id: u32,
+        season_number: u16,
+    ) -> Result<(Value, TmdbImages), TmdbClientError> {
+        if tv_id == 0 {
+            return Err(TmdbClientError::InvalidPath);
+        }
+        self.fetch_images_with_raw(&format!("tv/{tv_id}/season/{season_number}/images"), true)
             .await
     }
 
@@ -248,7 +467,26 @@ impl TmdbClient {
         if tv_id == 0 || episode_number == 0 {
             return Err(TmdbClientError::InvalidPath);
         }
-        self.fetch_images(
+        self.fetch_episode_images_with_raw(tv_id, season_number, episode_number)
+            .await
+            .map(|(_, images)| images)
+    }
+
+    /// Fetches an episode image gallery with its exact JSON document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_episode_images_with_raw(
+        &self,
+        tv_id: u32,
+        season_number: u16,
+        episode_number: u16,
+    ) -> Result<(Value, TmdbImages), TmdbClientError> {
+        if tv_id == 0 || episode_number == 0 {
+            return Err(TmdbClientError::InvalidPath);
+        }
+        self.fetch_images_with_raw(
             &format!("tv/{tv_id}/season/{season_number}/episode/{episode_number}/images"),
             true,
         )
@@ -261,7 +499,21 @@ impl TmdbClient {
     ///
     /// Returns a sanitized TMDB client error when the ID is invalid or the request fails.
     pub async fn fetch_person_images(&self, tmdb_id: u32) -> Result<TmdbImages, TmdbClientError> {
-        self.fetch_images(&format!("person/{tmdb_id}/images"), tmdb_id != 0)
+        self.fetch_person_images_with_raw(tmdb_id)
+            .await
+            .map(|(_, images)| images)
+    }
+
+    /// Fetches a person image gallery with its exact JSON document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_person_images_with_raw(
+        &self,
+        tmdb_id: u32,
+    ) -> Result<(Value, TmdbImages), TmdbClientError> {
+        self.fetch_images_with_raw(&format!("person/{tmdb_id}/images"), tmdb_id != 0)
             .await
     }
 
@@ -271,7 +523,21 @@ impl TmdbClient {
     ///
     /// Returns a sanitized TMDB client error when the ID is invalid or the request fails.
     pub async fn fetch_company_images(&self, tmdb_id: u32) -> Result<TmdbImages, TmdbClientError> {
-        self.fetch_images(&format!("company/{tmdb_id}/images"), tmdb_id != 0)
+        self.fetch_company_images_with_raw(tmdb_id)
+            .await
+            .map(|(_, images)| images)
+    }
+
+    /// Fetches a company image gallery with its exact JSON document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_company_images_with_raw(
+        &self,
+        tmdb_id: u32,
+    ) -> Result<(Value, TmdbImages), TmdbClientError> {
+        self.fetch_images_with_raw(&format!("company/{tmdb_id}/images"), tmdb_id != 0)
             .await
     }
 
@@ -281,7 +547,21 @@ impl TmdbClient {
     ///
     /// Returns a sanitized TMDB client error when the ID is invalid or the request fails.
     pub async fn fetch_network_images(&self, tmdb_id: u32) -> Result<TmdbImages, TmdbClientError> {
-        self.fetch_images(&format!("network/{tmdb_id}/images"), tmdb_id != 0)
+        self.fetch_network_images_with_raw(tmdb_id)
+            .await
+            .map(|(_, images)| images)
+    }
+
+    /// Fetches a network image gallery with its exact JSON document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_network_images_with_raw(
+        &self,
+        tmdb_id: u32,
+    ) -> Result<(Value, TmdbImages), TmdbClientError> {
+        self.fetch_images_with_raw(&format!("network/{tmdb_id}/images"), tmdb_id != 0)
             .await
     }
 
@@ -294,7 +574,21 @@ impl TmdbClient {
         &self,
         tmdb_id: u32,
     ) -> Result<TmdbImages, TmdbClientError> {
-        self.fetch_images(&format!("collection/{tmdb_id}/images"), tmdb_id != 0)
+        self.fetch_collection_images_with_raw(tmdb_id)
+            .await
+            .map(|(_, images)| images)
+    }
+
+    /// Fetches a collection image gallery with its exact JSON document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_collection_images_with_raw(
+        &self,
+        tmdb_id: u32,
+    ) -> Result<(Value, TmdbImages), TmdbClientError> {
+        self.fetch_images_with_raw(&format!("collection/{tmdb_id}/images"), tmdb_id != 0)
             .await
     }
 
@@ -304,7 +598,21 @@ impl TmdbClient {
     ///
     /// Returns a sanitized TMDB client error when the ID is invalid or the request fails.
     pub async fn fetch_movie_videos(&self, tmdb_id: u32) -> Result<TmdbVideos, TmdbClientError> {
-        self.fetch_videos(&format!("movie/{tmdb_id}/videos"), tmdb_id != 0)
+        self.fetch_movie_videos_with_raw(tmdb_id)
+            .await
+            .map(|(_, videos)| videos)
+    }
+
+    /// Fetches movie videos with their exact JSON document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_movie_videos_with_raw(
+        &self,
+        tmdb_id: u32,
+    ) -> Result<(Value, TmdbVideos), TmdbClientError> {
+        self.fetch_videos_with_raw(&format!("movie/{tmdb_id}/videos"), tmdb_id != 0)
             .await
     }
 
@@ -314,46 +622,72 @@ impl TmdbClient {
     ///
     /// Returns a sanitized TMDB client error when the ID is invalid or the request fails.
     pub async fn fetch_tv_videos(&self, tmdb_id: u32) -> Result<TmdbVideos, TmdbClientError> {
-        self.fetch_videos(&format!("tv/{tmdb_id}/videos"), tmdb_id != 0)
+        self.fetch_tv_videos_with_raw(tmdb_id)
+            .await
+            .map(|(_, videos)| videos)
+    }
+
+    /// Fetches TV videos with their exact JSON document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_tv_videos_with_raw(
+        &self,
+        tmdb_id: u32,
+    ) -> Result<(Value, TmdbVideos), TmdbClientError> {
+        self.fetch_videos_with_raw(&format!("tv/{tmdb_id}/videos"), tmdb_id != 0)
             .await
     }
 
-    async fn fetch_images(
+    async fn fetch_images_with_raw(
         &self,
         path: &str,
         valid_id: bool,
-    ) -> Result<TmdbImages, TmdbClientError> {
+    ) -> Result<(Value, TmdbImages), TmdbClientError> {
         if !valid_id {
             return Err(TmdbClientError::InvalidPath);
         }
-        self.fetch_json(
-            path,
-            &[
-                ("language", "en-US".to_owned()),
-                ("include_image_language", "en,null".to_owned()),
-            ],
-            true,
-        )
-        .await
+        let raw: Value = self
+            .fetch_json(
+                path,
+                &[
+                    ("language", "en-US".to_owned()),
+                    ("include_image_language", "en,null".to_owned()),
+                ],
+                true,
+            )
+            .await?;
+        let images =
+            serde_json::from_value(raw.clone()).map_err(|_| TmdbClientError::MalformedJson {
+                endpoint: bounded_endpoint(path),
+            })?;
+        Ok((raw, images))
     }
 
-    async fn fetch_videos(
+    async fn fetch_videos_with_raw(
         &self,
         path: &str,
         valid_id: bool,
-    ) -> Result<TmdbVideos, TmdbClientError> {
+    ) -> Result<(Value, TmdbVideos), TmdbClientError> {
         if !valid_id {
             return Err(TmdbClientError::InvalidPath);
         }
-        self.fetch_json(
-            path,
-            &[
-                ("language", "en-US".to_owned()),
-                ("include_video_language", "en,null".to_owned()),
-            ],
-            true,
-        )
-        .await
+        let raw: Value = self
+            .fetch_json(
+                path,
+                &[
+                    ("language", "en-US".to_owned()),
+                    ("include_video_language", "en,null".to_owned()),
+                ],
+                true,
+            )
+            .await?;
+        let videos =
+            serde_json::from_value(raw.clone()).map_err(|_| TmdbClientError::MalformedJson {
+                endpoint: bounded_endpoint(path),
+            })?;
+        Ok((raw, videos))
     }
 
     /// Fetches one page of changed IDs for movies or television.
@@ -366,12 +700,33 @@ impl TmdbClient {
         media_type: MediaType,
         page: u32,
     ) -> Result<ChangePage, TmdbClientError> {
+        self.fetch_changes_with_raw(media_type, page)
+            .await
+            .map(|(_, changes)| changes)
+    }
+
+    /// Fetches one change page and preserves the exact upstream JSON document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_changes_with_raw(
+        &self,
+        media_type: MediaType,
+        page: u32,
+    ) -> Result<(Value, ChangePage), TmdbClientError> {
         if page == 0 {
             return Err(TmdbClientError::InvalidPath);
         }
         let path = format!("{media_type}/changes");
-        self.fetch_json(&path, &[("page", page.to_string())], true)
-            .await
+        let raw: Value = self
+            .fetch_json(&path, &[("page", page.to_string())], true)
+            .await?;
+        let changes =
+            serde_json::from_value(raw.clone()).map_err(|_| TmdbClientError::MalformedJson {
+                endpoint: bounded_endpoint(&path),
+            })?;
+        Ok((raw, changes))
     }
 
     /// Fetches the first page of a typed TMDB trending feed.
@@ -388,11 +743,31 @@ impl TmdbClient {
         media_type: MediaType,
         trend_window: &str,
     ) -> Result<TmdbTrendingPage, TmdbClientError> {
+        self.fetch_trending_with_raw(media_type, trend_window)
+            .await
+            .map(|(_, trending)| trending)
+    }
+
+    /// Fetches a trending page and preserves the exact upstream JSON document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_trending_with_raw(
+        &self,
+        media_type: MediaType,
+        trend_window: &str,
+    ) -> Result<(Value, TmdbTrendingPage), TmdbClientError> {
         if !matches!(trend_window, "day" | "week") {
             return Err(TmdbClientError::InvalidPath);
         }
-        self.fetch_json(&format!("trending/{media_type}/{trend_window}"), &[], true)
-            .await
+        let path = format!("trending/{media_type}/{trend_window}");
+        let raw: Value = self.fetch_json(&path, &[], true).await?;
+        let trending =
+            serde_json::from_value(raw.clone()).map_err(|_| TmdbClientError::MalformedJson {
+                endpoint: bounded_endpoint(&path),
+            })?;
+        Ok((raw, trending))
     }
 
     /// Fetches one page of field-level changes for a specific entity.
@@ -611,6 +986,8 @@ impl TmdbClient {
             || path.starts_with('/')
             || path.starts_with("//")
             || path.contains("://")
+            || path.contains("..")
+            || path.contains("//")
             || path.contains(['?', '#'])
             || path.chars().any(char::is_control)
         {
@@ -621,7 +998,9 @@ impl TmdbClient {
             .join(path)
             .map_err(|_| TmdbClientError::InvalidPath)?;
         let mut url = url;
-        {
+        if query.is_empty() {
+            url.set_query(None);
+        } else {
             let mut pairs = url.query_pairs_mut();
             pairs.clear();
             for (name, value) in query {

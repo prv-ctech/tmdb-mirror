@@ -354,11 +354,10 @@ async fn resolve_owner(
             };
             sqlx::query_scalar(
                 "SELECT id FROM catalog.titles
-                  WHERE media_type = $1 AND tmdb_id = $2 AND active AND is_anime = $3",
+                  WHERE media_type = $1 AND tmdb_id = $2 AND active",
             )
             .bind(media_type)
             .bind(payload.entity_id)
-            .bind(payload.anime)
             .fetch_optional(&mut **transaction)
             .await
             .map_err(|_| PersistError::Database)?
@@ -398,12 +397,10 @@ async fn resolve_owner(
               WHERE season.id = $1
                 AND title.media_type = 'tv'
                 AND title.tmdb_id = $2
-                AND title.active
-                AND title.is_anime = $3",
+                AND title.active",
         )
         .bind(payload.entity_id)
         .bind(payload.title_tmdb_id)
-        .bind(payload.anime)
         .fetch_optional(&mut **transaction)
         .await
         .map_err(|_| PersistError::Database)?,
@@ -414,12 +411,10 @@ async fn resolve_owner(
               WHERE episode.id = $1
                 AND title.media_type = 'tv'
                 AND title.tmdb_id = $2
-                AND title.active
-                AND title.is_anime = $3",
+                AND title.active",
         )
         .bind(payload.entity_id)
         .bind(payload.title_tmdb_id)
-        .bind(payload.anime)
         .fetch_optional(&mut **transaction)
         .await
         .map_err(|_| PersistError::Database)?,
@@ -919,12 +914,12 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
-    async fn title_partition_and_parent_identity_are_verified_before_persisting(
+    async fn title_and_parent_identity_are_verified_before_persisting(
         pool: PgPool,
     ) -> sqlx::Result<()> {
         let title_id: i64 = sqlx::query_scalar(
-            "INSERT INTO catalog.titles (media_type, tmdb_id, display_title, is_anime, active)
-             VALUES ('tv', 700, 'Ownership fixture', false, true)
+            "INSERT INTO catalog.titles (media_type, tmdb_id, display_title, active)
+             VALUES ('tv', 700, 'Ownership fixture', true)
              RETURNING id",
         )
         .fetch_one(&pool)
@@ -937,15 +932,12 @@ mod tests {
         .execute(&pool)
         .await?;
 
-        let anime_mismatch = ImageJobPayload::new_scoped(
+        let missing_title = ImageJobPayload::new(
             ImageEntityType::Tv,
-            700,
+            999,
             ImageKind::Poster,
             "/ownership-tv.jpg",
             "https://image.tmdb.org/t/p/original/ownership-tv.jpg",
-            None,
-            None,
-            true,
             None,
             None,
         )
@@ -953,8 +945,8 @@ mod tests {
         assert_eq!(
             persist_ready(
                 &pool,
-                &anime_mismatch,
-                &metadata(&anime_mismatch, "anime/tv/700/posters/poster.jpg"),
+                &missing_title,
+                &metadata(&missing_title, "tv/999/posters/poster.jpg"),
             )
             .await,
             Err(PersistError::OwnerNotFound)

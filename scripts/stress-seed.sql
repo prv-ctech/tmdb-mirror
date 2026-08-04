@@ -79,7 +79,7 @@ INSERT INTO catalog.titles (
     id, media_type, tmdb_id, display_title, original_title, overview, tagline,
     status, original_language, release_date, first_air_date, last_air_date,
     popularity, vote_average, vote_count, runtime_minutes, adult, video,
-    homepage, poster_path, backdrop_path, is_anime, active, source_updated_at
+    homepage, poster_path, backdrop_path, active, source_updated_at
 )
 SELECT :seed_base + value,
        CASE WHEN value % 2 = 0 THEN 'tv' ELSE 'movie' END,
@@ -103,7 +103,6 @@ SELECT :seed_base + value,
        'https://stress.invalid/title/' || (:seed_base + value),
        '/stress/poster-' || value || '.jpg',
        '/stress/backdrop-' || value || '.jpg',
-       (value % 17 = 0),
        (value % 113 <> 0),
        clock_timestamp()
 FROM generate_series(1, :seed_count) AS value
@@ -120,7 +119,6 @@ ON CONFLICT (media_type, tmdb_id) DO UPDATE SET
     vote_average = EXCLUDED.vote_average,
     vote_count = EXCLUDED.vote_count,
     runtime_minutes = EXCLUDED.runtime_minutes,
-    is_anime = EXCLUDED.is_anime,
     active = EXCLUDED.active,
     updated_at = clock_timestamp();
 

@@ -38,7 +38,7 @@ impl AdminApiStore for FakeAdminStore {
         Ok(AdminStatus {
             build: AdminBuildStatus {
                 version: "test".to_owned(),
-                schema_revision: Some("0030".to_owned()),
+                schema_revision: Some("0041".to_owned()),
             },
             database: AdminDatabaseStatus {
                 reachable: true,
@@ -54,8 +54,6 @@ impl AdminApiStore for FakeAdminStore {
             catalog: AdminCatalogCounts {
                 movies: 3,
                 tv: 4,
-                anime_movies: 1,
-                anime_tv: 2,
             },
             queues: Vec::new(),
             ingest: AdminComponentHealth::ready(),
@@ -128,6 +126,19 @@ impl AdminApiStore for FakeAdminStore {
     }
 
     async fn media_worker(&self) -> Result<AdminMediaWorkerStatus, AdminApiError> {
+        Err(AdminApiError::Unavailable)
+    }
+
+    async fn set_worker(
+        &self,
+        _action: AdminMediaWorkerAction,
+        _idempotency_key: &str,
+        _request_id: &str,
+    ) -> Result<AdminMediaWorkerStatus, AdminApiError> {
+        Err(AdminApiError::Unavailable)
+    }
+
+    async fn worker(&self) -> Result<AdminMediaWorkerStatus, AdminApiError> {
         Err(AdminApiError::Unavailable)
     }
 
@@ -214,6 +225,12 @@ async fn media_controls_require_authentication_and_validate_scan_requests()
 
     let response = app
         .clone()
+        .oneshot(Request::get("/admin/v1/worker").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .clone()
         .oneshot(
             Request::post("/admin/v1/media/scans")
                 .header("x-api-key", "a-test-key-that-is-long-enough-to-be-valid")
@@ -268,6 +285,7 @@ async fn private_openapi_documents_every_admin_operation() -> Result<(), Box<dyn
         "/admin/v1/media/scans",
         "/admin/v1/media/scans/{run_id}",
         "/admin/v1/media/worker",
+        "/admin/v1/worker",
         "/admin/v1/media/audits",
         "/admin/v1/maintenance/analyze",
         "/admin/v1/backups",
@@ -292,7 +310,7 @@ async fn status_and_bounded_job_history_are_available_to_an_admin()
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 4096).await?)?;
-    assert_eq!(body["data"]["build"]["schemaRevision"], "0030");
+    assert_eq!(body["data"]["build"]["schemaRevision"], "0041");
 
     let response = app
         .clone()
@@ -344,7 +362,7 @@ async fn state_changing_operations_require_idempotency_and_return_durable_jobs()
     };
     let response = app
         .clone()
-        .oneshot(request().body(Body::from(r#"{"mode":"full","mediaTypes":["movie","tv"]}"#))?)
+        .oneshot(request().body(Body::from(r#"{"mode":"full_sweep","mediaTypes":["movie","tv"]}"#))?)
         .await?;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
@@ -353,7 +371,7 @@ async fn state_changing_operations_require_idempotency_and_return_durable_jobs()
         .oneshot(
             request()
                 .header("idempotency-key", "scan-1")
-                .body(Body::from(r#"{"mode":"full","mediaTypes":["movie","tv"]}"#))?,
+                .body(Body::from(r#"{"mode":"full_sweep","mediaTypes":["movie","tv"]}"#))?,
         )
         .await?;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
@@ -405,7 +423,7 @@ async fn operation_payloads_and_keys_are_bounded() -> Result<(), Box<dyn std::er
                 .header("x-api-key", "a-test-key-that-is-long-enough-to-be-valid")
                 .header("idempotency-key", "scan-1")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"mode":"full","mediaTypes":[]}"#))?,
+                .body(Body::from(r#"{"mode":"full_sweep","mediaTypes":[]}"#))?,
         )
         .await?;
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);

@@ -1,6 +1,6 @@
-# Production Rust image for the TMDB API, workers, and admin CLI.
+# Production Rust image for the TMDB API and workers.
 #
-# The builder and runtime references are immutable.  Update the digest only as
+# The builder and runtime references are immutable. Update the digest only as
 # part of a reviewed dependency/image upgrade, then rebuild every service.
 FROM rust:1.97-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS builder
 
@@ -24,7 +24,6 @@ RUN apt-get update \
     && useradd --system --uid 10001 --gid 10001 --home-dir /nonexistent \
         --shell /usr/sbin/nologin tmdb
 
-COPY --from=builder /workspace/target/release/tmdb-admin /usr/local/bin/tmdb-admin
 COPY --from=builder /workspace/target/release/tmdb-api /usr/local/bin/tmdb-api
 COPY --from=builder /workspace/target/release/tmdb-images /usr/local/bin/tmdb-images
 COPY --from=builder /workspace/target/release/tmdb-ingest /usr/local/bin/tmdb-ingest

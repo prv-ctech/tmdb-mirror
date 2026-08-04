@@ -38,10 +38,10 @@ impl PoolPolicy {
             // PostgreSQL. Keep enough bounded slots for health probes and
             // catalog requests to progress without request serialization.
             Self::ReadOnly => 32,
-            // The consolidated worker runs up to eight ingestion loops plus
-            // the durable scheduler. Leave headroom for image persistence
-            // and direct administrative work without approaching PostgreSQL's
-            // deployment-level connection cap.
+            // The consolidated worker runs up to eight ingestion loops. Leave
+            // headroom for image persistence and direct administrative work
+            // without approaching PostgreSQL's deployment-level connection
+            // cap.
             Self::ReadWrite => 12,
         }
     }

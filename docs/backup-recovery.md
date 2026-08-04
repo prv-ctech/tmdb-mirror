@@ -25,7 +25,7 @@ internal durable job type for the latter is `database.backup_diff`). Transient
 failures return both the job and its paired backup request to the retry queue;
 terminal failures retain the durable failure record.
 
-From a trusted container on `prv.network`:
+From a trusted container on the external network configured in Compose:
 
 ```bash
 admin_base=http://tmdb-mirror-api:8081

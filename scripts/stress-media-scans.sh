@@ -124,6 +124,10 @@ if [[ "$auth_status" != 401 ]]; then
     failures=$((failures + 1))
 fi
 
+api_call POST /admin/v1/worker "ingest-worker-start-$stamp" '{"action":"start"}'
+expect_status start_ingest_worker 200
+expect_value start_ingest_worker data.state running
+
 api_call POST /admin/v1/media/worker "media-worker-start-$stamp" '{"action":"start"}'
 expect_status start_worker 200
 initial_state="$(json_value data.state 2>/dev/null || true)"

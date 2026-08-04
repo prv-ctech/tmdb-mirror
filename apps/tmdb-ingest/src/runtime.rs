@@ -1,12 +1,12 @@
 use std::time::Duration;
 
-use anyhow::{Context, bail};
-use chrono::{DateTime, Days, NaiveDate, Utc};
+use anyhow::Context;
+use chrono::Utc;
 use tmdb_config::{
     ConfigSource, EnvSource, Environment, load_database_for_role, load_secret_for_environment,
 };
 use tmdb_db::{PoolPolicy, connect_direct, migrate};
-use tmdb_jobs::{JobRepository, NewJob, Worker, WorkerConfig, WorkerId};
+use tmdb_jobs::{JobRepository, Worker, WorkerConfig, WorkerId};
 use tmdb_media::{RAW_ROOT, RuntimeStorageRole, prepare_runtime_storage};
 use tmdb_observability::init_tracing_from_env;
 use tmdb_upstream::{MAX_DAILY_EXPORT_BYTES, RateLimitPolicy, RetryPolicy, TmdbClient};
@@ -14,13 +14,10 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::jobs::{DAILY_EXPORT_JOB, INGEST_PAYLOAD_VERSION, IngestExecutor, TRENDING_REFRESH_JOB};
+use crate::jobs::IngestExecutor;
 
-const DAILY_EXPORT_REFRESH_PRIORITY: i16 = -100;
 const MAX_INGEST_WORKER_CONCURRENCY: usize = 8;
 const COMPONENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-const TRENDING_DAY_REFRESH_SECONDS: i64 = 30 * 60;
-const TRENDING_WEEK_REFRESH_SECONDS: i64 = 6 * 60 * 60;
 
 /// Starts the direct-database ingestion worker shell.
 ///
@@ -75,9 +72,8 @@ pub async fn run() -> anyhow::Result<()> {
     result.map_err(|error| anyhow::anyhow!(error))
 }
 
-/// Starts the consolidated main worker.  It applies migrations under the
-/// database-level migration lock, then runs ingestion and the durable
-/// scheduler in one process.
+/// Starts the consolidated main worker. It applies migrations under the
+/// database-level migration lock, then waits for explicitly submitted jobs.
 ///
 /// # Errors
 ///
@@ -120,11 +116,13 @@ pub async fn run_worker() -> anyhow::Result<()> {
         .await
         .map_err(|error| anyhow::anyhow!(error))
         .context("connect worker database")?;
-    let daily_export_enabled = parse_or(source, "TMDB_ENABLE_DAILY_EXPORT", true)?;
-    // A restart must not create an implicit full scan. Operators request one
-    // through POST /admin/v1/scans; the scheduler still handles its explicitly
-    // configured incremental/daily export cadence after the worker is ready.
-    tracing::info!(event = "catalog_seed_not_automatic", daily_export_enabled,);
+    let startup_state: String = sqlx::query_scalar("SELECT ops.stop_worker_on_startup('ingest')")
+        .fetch_one(&pool)
+        .await
+        .context("reset ingest worker state after restart")?;
+    // A restart must not create an implicit scan or synchronization run.
+    // Operators submit those operations through the authenticated admin API.
+    tracing::info!(event = "catalog_seed_not_automatic", startup_state);
     let executor = ingest_executor.with_database(pool.clone());
     let workers = ingest_worker_configs(worker_config, worker_concurrency)?
         .into_iter()
@@ -133,7 +131,7 @@ pub async fn run_worker() -> anyhow::Result<()> {
     tracing::info!(
         event = "main_worker_ready",
         ingest_workers = worker_concurrency,
-        daily_export_enabled,
+        automatic_work_disabled = true,
     );
     let cancellation = CancellationToken::new();
     let signal_cancellation = cancellation.clone();
@@ -147,15 +145,8 @@ pub async fn run_worker() -> anyhow::Result<()> {
         signal_cancellation.cancel();
     });
     let heartbeat = spawn_component_heartbeat(pool.clone(), "worker", cancellation.clone());
-    let scheduler_cancellation = cancellation.clone();
-    let scheduler_pool = pool.clone();
-    let scheduler =
-        tokio::spawn(
-            async move { run_scheduler(scheduler_pool, scheduler_cancellation, source).await },
-        );
     let result = run_ingest_workers(workers, cancellation.clone()).await;
     cancellation.cancel();
-    let _ = scheduler.await;
     let _ = heartbeat.await;
     pool.close().await;
     result.map_err(|error| anyhow::anyhow!(error))
@@ -244,141 +235,6 @@ async fn run_ingest_workers(
         }
     }
     Ok(())
-}
-
-async fn run_scheduler(
-    pool: sqlx::PgPool,
-    cancellation: CancellationToken,
-    source: EnvSource,
-) -> anyhow::Result<()> {
-    if !parse_or(source, "TMDB_ENABLE_SCHEDULER", true)? {
-        tracing::info!(event = "scheduler_disabled");
-        cancellation.cancelled().await;
-        return Ok(());
-    }
-    let interval_seconds = parse_or(source, "TMDB_SCHEDULER_INTERVAL_SECONDS", 60_u64)?;
-    if interval_seconds == 0 {
-        bail!("TMDB_SCHEDULER_INTERVAL_SECONDS must be positive");
-    }
-    let daily_export_enabled = parse_or(source, "TMDB_ENABLE_DAILY_EXPORT", true)?;
-    tracing::info!(
-        event = "scheduler_started",
-        interval_seconds,
-        daily_export_enabled,
-    );
-    let mut interval = tokio::time::interval(Duration::from_secs(interval_seconds));
-    loop {
-        tokio::select! {
-            () = cancellation.cancelled() => return Ok(()),
-            _ = interval.tick() => scheduler_tick(&pool, interval_seconds, daily_export_enabled).await?,
-        }
-    }
-}
-
-async fn scheduler_tick(
-    pool: &sqlx::PgPool,
-    interval_seconds: u64,
-    daily_export_enabled: bool,
-) -> anyhow::Result<()> {
-    scheduler_tick_at(pool, interval_seconds, daily_export_enabled, Utc::now()).await
-}
-
-async fn scheduler_tick_at(
-    pool: &sqlx::PgPool,
-    interval_seconds: u64,
-    daily_export_enabled: bool,
-    now: DateTime<Utc>,
-) -> anyhow::Result<()> {
-    let bucket = now.timestamp().div_euclid(
-        i64::try_from(interval_seconds)
-            .map_err(|_| anyhow::anyhow!("scheduler interval is too large"))?,
-    );
-    for media_type in ["movie", "tv"] {
-        let schedule_key = format!("changes_sync:{media_type}");
-        let run_key = bucket.to_string();
-        if !claim_schedule_slot(pool, &schedule_key, &run_key).await? {
-            continue;
-        }
-        let payload = serde_json::json!({"media_type": media_type, "page": 1});
-        let job = NewJob::new(
-            "ingest.changes_sync",
-            1,
-            payload,
-            &format!("ingest.changes_sync:{media_type}:{bucket}"),
-        )?;
-        JobRepository::new(pool.clone()).submit(job).await?;
-    }
-    schedule_trending_jobs(pool, now).await?;
-    if daily_export_enabled {
-        // TMDB publishes the previous UTC day's exports.  The schedule key is
-        // date-based, so a short scheduler interval cannot duplicate a job.
-        let export_date = previous_export_date()?;
-        let date_text = export_date.format("%m_%d_%Y").to_string();
-        for media_type in ["movie", "tv"] {
-            let schedule_key = format!("daily_export:{media_type}");
-            if !claim_schedule_slot(pool, &schedule_key, &date_text).await? {
-                continue;
-            }
-            let job = daily_export_job(media_type, &date_text)?;
-            JobRepository::new(pool.clone()).submit(job).await?;
-        }
-    }
-    // Scheduler checkpoints are bounded retention state, not the catalog.
-    sqlx::query(
-        "DELETE FROM ops.scheduler_runs WHERE created_at < clock_timestamp() - interval '90 days'",
-    )
-    .execute(pool)
-    .await?;
-    // Terminal job rows and their immutable events are pruned through the
-    // security-definer function installed by migration 0014.  The worker has
-    // no direct table-write privilege for ops.jobs.
-    sqlx::query_scalar::<_, i32>(
-        "SELECT ops.prune_finished_jobs(clock_timestamp() - interval '90 days', 1000)",
-    )
-    .fetch_one(pool)
-    .await?;
-    Ok(())
-}
-
-async fn schedule_trending_jobs(pool: &sqlx::PgPool, now: DateTime<Utc>) -> anyhow::Result<()> {
-    for (trend_window, refresh_seconds) in [
-        ("day", TRENDING_DAY_REFRESH_SECONDS),
-        ("week", TRENDING_WEEK_REFRESH_SECONDS),
-    ] {
-        let bucket = now.timestamp().div_euclid(refresh_seconds);
-        for media_type in ["movie", "tv"] {
-            let schedule_key = format!("trending:{media_type}:{trend_window}");
-            if !claim_schedule_slot(pool, &schedule_key, &bucket.to_string()).await? {
-                continue;
-            }
-            let job = NewJob::new(
-                TRENDING_REFRESH_JOB,
-                INGEST_PAYLOAD_VERSION,
-                serde_json::json!({"media_type": media_type, "trend_window": trend_window}),
-                &format!("{TRENDING_REFRESH_JOB}:{media_type}:{trend_window}:{bucket}"),
-            )?;
-            JobRepository::new(pool.clone()).submit(job).await?;
-        }
-    }
-    Ok(())
-}
-
-async fn claim_schedule_slot(
-    pool: &sqlx::PgPool,
-    schedule_key: &str,
-    run_key: &str,
-) -> anyhow::Result<bool> {
-    let inserted: Option<bool> = sqlx::query_scalar(
-        "INSERT INTO ops.scheduler_runs (schedule_key, run_key)
-         VALUES ($1, $2)
-         ON CONFLICT DO NOTHING
-         RETURNING true",
-    )
-    .bind(schedule_key)
-    .bind(run_key)
-    .fetch_optional(pool)
-    .await?;
-    Ok(inserted.is_some())
 }
 
 fn load_tmdb_client(source: EnvSource, environment: Environment) -> anyhow::Result<TmdbClient> {
@@ -496,156 +352,9 @@ async fn shutdown_signal() -> anyhow::Result<()> {
     }
 }
 
-fn previous_export_date() -> anyhow::Result<NaiveDate> {
-    Utc::now()
-        .date_naive()
-        .checked_sub_days(Days::new(1))
-        .ok_or_else(|| anyhow::anyhow!("scheduler date underflow"))
-}
-
-#[cfg(test)]
-async fn ensure_catalog_seed(pool: &sqlx::PgPool, export_date: NaiveDate) -> anyhow::Result<usize> {
-    let date_text = export_date.format("%m_%d_%Y").to_string();
-    let repository = JobRepository::new(pool.clone());
-    let mut submitted = 0_usize;
-    for media_type in ["movie", "tv"] {
-        if !catalog_seed_needed(pool, media_type).await? {
-            continue;
-        }
-        let outcome = repository
-            .submit(daily_export_job(media_type, &date_text)?)
-            .await?;
-        if !outcome.was_duplicate() {
-            submitted = submitted.saturating_add(1);
-            tracing::info!(event = "catalog_seed_queued", media_type);
-        }
-    }
-    Ok(submitted)
-}
-
-#[cfg(test)]
-async fn catalog_seed_needed(pool: &sqlx::PgPool, media_type: &str) -> anyhow::Result<bool> {
-    sqlx::query_scalar(
-        "SELECT NOT EXISTS (
-             SELECT 1
-               FROM ops.jobs
-              WHERE job_type = $1
-                AND status = 'succeeded'
-                AND payload ->> 'media_type' = $2
-                AND result_summary ? 'detail_refresh_candidates'
-         )",
-    )
-    .bind(DAILY_EXPORT_JOB)
-    .bind(media_type)
-    .fetch_one(pool)
-    .await
-    .map_err(Into::into)
-}
-
-fn daily_export_job(media_type: &str, date_text: &str) -> anyhow::Result<NewJob> {
-    let file_prefix = match media_type {
-        "movie" => "movie_ids",
-        "tv" => "tv_series_ids",
-        _ => bail!("invalid daily export media type"),
-    };
-    let url = format!("https://files.tmdb.org/p/exports/{file_prefix}_{date_text}.json.gz");
-    NewJob::new(
-        DAILY_EXPORT_JOB,
-        INGEST_PAYLOAD_VERSION,
-        serde_json::json!({"media_type": media_type, "url": url}),
-        &format!("{DAILY_EXPORT_JOB}:{media_type}:{date_text}"),
-    )?
-    .with_priority(DAILY_EXPORT_REFRESH_PRIORITY)
-    .map_err(Into::into)
-}
-
 #[cfg(test)]
 mod tests {
-    use serde_json::Value;
-    use sqlx::PgPool;
-
     use super::*;
-
-    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
-    async fn catalog_seed_queues_each_media_type_once_until_completed(
-        pool: PgPool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let export_date = NaiveDate::from_ymd_opt(2026, 7, 30).ok_or("date")?;
-
-        assert_eq!(ensure_catalog_seed(&pool, export_date).await?, 2);
-        let jobs: Vec<(Value, String)> = sqlx::query_as(
-            "SELECT payload, dedup_key
-               FROM ops.jobs
-              WHERE job_type = 'ingest.daily_export'
-              ORDER BY payload ->> 'media_type'",
-        )
-        .fetch_all(&pool)
-        .await?;
-        assert_eq!(jobs.len(), 2);
-        assert_eq!(jobs[0].0["media_type"], "movie");
-        assert_eq!(
-            jobs[0].0["url"],
-            "https://files.tmdb.org/p/exports/movie_ids_07_30_2026.json.gz"
-        );
-        assert_eq!(jobs[1].0["media_type"], "tv");
-        assert_eq!(
-            jobs[1].0["url"],
-            "https://files.tmdb.org/p/exports/tv_series_ids_07_30_2026.json.gz"
-        );
-        assert_eq!(ensure_catalog_seed(&pool, export_date).await?, 0);
-
-        sqlx::query(
-            "UPDATE ops.jobs
-                SET status = 'succeeded',
-                    attempts = 1,
-                    result_summary = '{\"detail_refresh_candidates\": 1}'::jsonb,
-                    finished_at = clock_timestamp(),
-                    updated_at = clock_timestamp()
-              WHERE job_type = 'ingest.daily_export'",
-        )
-        .execute(&pool)
-        .await?;
-        assert_eq!(ensure_catalog_seed(&pool, export_date).await?, 0);
-        Ok(())
-    }
-
-    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
-    async fn scheduler_enqueues_each_trending_scope_once_per_refresh_window(
-        pool: PgPool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-08-02T12:00:00Z")?.to_utc();
-
-        scheduler_tick_at(&pool, 60, false, now).await?;
-        scheduler_tick_at(&pool, 60, false, now).await?;
-
-        let jobs: Vec<(Value, String)> = sqlx::query_as(
-            "SELECT payload, dedup_key
-               FROM ops.jobs
-              WHERE job_type = 'ingest.trending'
-              ORDER BY payload ->> 'media_type', payload ->> 'trend_window'",
-        )
-        .fetch_all(&pool)
-        .await?;
-        assert_eq!(jobs.len(), 4);
-        assert_eq!(
-            jobs[0].0,
-            serde_json::json!({"media_type": "movie", "trend_window": "day"})
-        );
-        assert_eq!(
-            jobs[1].0,
-            serde_json::json!({"media_type": "movie", "trend_window": "week"})
-        );
-        assert_eq!(
-            jobs[2].0,
-            serde_json::json!({"media_type": "tv", "trend_window": "day"})
-        );
-        assert_eq!(
-            jobs[3].0,
-            serde_json::json!({"media_type": "tv", "trend_window": "week"})
-        );
-        assert_ne!(jobs[0].1, jobs[1].1);
-        Ok(())
-    }
 
     #[test]
     fn parallel_ingest_workers_receive_distinct_lease_ids() -> Result<(), Box<dyn std::error::Error>>

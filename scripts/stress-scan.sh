@@ -5,114 +5,134 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/stress-common.sh"
 
 project="${TMDB_STRESS_PROJECT:-tmdb_stress_test}"
-# A detail scan can fan out to many image downloads. Keep the default small
-# enough for the companion media verifier to drain within its bounded window;
-# callers can raise it deliberately when they also extend that window.
-queue_limit=10
-max_image_job_fanout=50000
-max_lookback=7
-requested_date="$(date -u +%F)"
-explicit_date=false
+admin_port="${TMDB_STRESS_ADMIN_PORT:-18081}"
+media_port="${TMDB_STRESS_IMAGE_PORT:-18090}"
+timeout=300
+max_active=1000
 while (($#)); do
     case "$1" in
         --project-name) project="$2"; shift 2 ;;
-        --date) requested_date="$2"; explicit_date=true; shift 2 ;;
-        --queue-limit) queue_limit="$2"; shift 2 ;;
-        --max-image-job-fanout) max_image_job_fanout="$2"; shift 2 ;;
-        --max-lookback-days) max_lookback="$2"; shift 2 ;;
-        -h|--help) printf '%s\n' 'Usage: stress-scan.sh [--project-name NAME] [--date YYYY-MM-DD] [--queue-limit N] [--max-image-job-fanout N] [--max-lookback-days N] (default queue limit: 10)'; exit 0 ;;
+        --admin-port) admin_port="$2"; shift 2 ;;
+        --media-port) media_port="$2"; shift 2 ;;
+        --timeout) timeout="$2"; shift 2 ;;
+        --max-active) max_active="$2"; shift 2 ;;
+        -h|--help) printf '%s\n' 'Usage: stress-scan.sh [--project-name NAME] [--admin-port PORT] [--media-port PORT] [--timeout SECONDS] [--max-active N]'; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
 done
-[[ "$requested_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die 'date must be YYYY-MM-DD'
-[[ "$queue_limit" =~ ^[0-9]+$ ]] && (( queue_limit <= 100000 )) || die 'invalid queue limit'
-[[ "$max_image_job_fanout" =~ ^[0-9]+$ ]] && (( max_image_job_fanout <= 1000000 )) || die 'invalid max image job fanout'
-[[ "$max_lookback" =~ ^[0-9]+$ ]] && (( max_lookback <= 14 )) || die 'invalid max lookback'
+[[ "$timeout" =~ ^[0-9]+$ ]] && (( timeout >= 30 && timeout <= 1800 )) || die 'invalid timeout'
+[[ "$max_active" =~ ^[0-9]+$ ]] && (( max_active > 0 && max_active <= 10000 )) || die 'invalid max-active'
 
-configure_runtime "$project" "${TMDB_STRESS_API_PORT:-18080}" "${TMDB_STRESS_ADMIN_PORT:-18081}" \
-    "${TMDB_STRESS_IMAGE_PORT:-18090}" "${TMDB_STRESS_PG_PORT:-55433}"
+configure_runtime "$project" "${TMDB_STRESS_API_PORT:-18080}" "$admin_port" "$media_port" "${TMDB_STRESS_PG_PORT:-55433}"
 load_runtime
-mkdir -p "$EXPORT_ROOT" "$RESULT_ROOT"
+require_command curl
+require_command python3
+mkdir -p "$RESULT_ROOT"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-result_file="$RESULT_ROOT/tmdb-scan-$stamp.json"
+result_file="$RESULT_ROOT/catalog-scan-$stamp.json"
+admin_key="$(env_value TMDB_ADMIN_API_KEY)"
+[[ -n "$admin_key" ]] || die 'TMDB_ADMIN_API_KEY is missing from the stress runtime'
+base_url="http://127.0.0.1:$admin_port"
 password="$(database_password)"
-image_jobs_before="$(psql_at "$password" "SELECT count(*) FROM ops.jobs WHERE job_type = 'image.download'")"
-[[ "$image_jobs_before" =~ ^[0-9]+$ ]] || die 'could not read the image-job baseline'
+trap 'unset admin_key' EXIT
 
-date_for_offset() { date -u -d "$requested_date - $1 day" +%m_%d_%Y; }
-selected_date=''
-movie_file=''
-tv_file=''
-for ((offset=0; offset<=max_lookback; offset++)); do
-    date_text="$(date_for_offset "$offset")"
-    candidate_movie="$EXPORT_ROOT/movie_ids_$date_text.json.gz"
-    candidate_tv="$EXPORT_ROOT/tv_series_ids_$date_text.json.gz"
-    movie_url="https://files.tmdb.org/p/exports/movie_ids_$date_text.json.gz"
-    tv_url="https://files.tmdb.org/p/exports/tv_series_ids_$date_text.json.gz"
-    movie_status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 10 --max-time 30 "$movie_url" || printf '000')"
-    tv_status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 10 --max-time 30 "$tv_url" || printf '000')"
-    if [[ "$movie_status" == 200 && "$tv_status" == 200 ]]; then
-        curl --silent --show-error --fail --connect-timeout 10 --max-time 300 "$movie_url" -o "$candidate_movie"
-        curl --silent --show-error --fail --connect-timeout 10 --max-time 300 "$tv_url" -o "$candidate_tv"
-        selected_date="$(date -u -d "$requested_date - $offset day" +%F)"
-        movie_file="$candidate_movie"
-        tv_file="$candidate_tv"
-        break
+admin_post() {
+    local path="$1" key="$2" body="$3" response_file error_file http_status response
+    response_file="$(mktemp)"
+    error_file="$(mktemp)"
+    if ! http_status="$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+        -X POST \
+        -H "X-API-Key: $admin_key" \
+        -H "Idempotency-Key: $key" \
+        -H 'Content-Type: application/json' \
+        --data "$body" \
+        --output "$response_file" --write-out '%{http_code}' \
+        "$base_url$path" 2>"$error_file")"; then
+        redact "$(<"$error_file")" >&2
+        rm -f "$response_file" "$error_file"
+        die "admin request failed: $path"
     fi
-    if [[ "$explicit_date" == true ]]; then
-        die "TMDB exports for the requested date are unavailable"
+    response="$(<"$response_file")"
+    if [[ "$http_status" != 200 && "$http_status" != 202 ]]; then
+        redact "$response$(<"$error_file")" >&2
+        rm -f "$response_file" "$error_file"
+        die "admin request returned HTTP $http_status: $path"
     fi
-done
-[[ -n "$selected_date" ]] || die "TMDB did not publish matching exports within $max_lookback day(s)"
-
-scan_one() {
-    local media_type="$1" host_file="$2" file_name container output json_line target_path
-    file_name="$(basename "$host_file")"
-    container="$(compose ps -q worker)"
-    [[ -n "$container" ]] || die 'worker container is unavailable'
-    target_path="/config/raw/$file_name"
-    docker_command cp "$(docker_path "$host_file")" "$container:$target_path"
-    if ! output="$(compose run --rm --no-deps --entrypoint /usr/local/bin/tmdb-admin worker \
-        scan-export --path "$target_path" --media-type "$media_type" --queue-limit "$queue_limit" 2>&1)"; then
-        redact "$output" >&2
-        die "TMDB export scan failed for $media_type"
-    fi
-    json_line="$(grep -E '^[[:space:]]*\{' <<<"$output" | tail -n 1 || true)"
-    [[ -n "$json_line" ]] || { redact "$output" >&2; die "TMDB export scan returned no JSON for $media_type"; }
-    printf '%s\t%s\t%s\n' "$media_type" "$(gzip -dc "$host_file" | wc -l)" "$json_line"
+    rm -f "$response_file" "$error_file"
+    printf '%s\n' "$response"
 }
 
-movie_result="$(scan_one movie "$movie_file")"
-tv_result="$(scan_one tv "$tv_file")"
-movie_records="$(cut -f2 <<<"$movie_result")"
-tv_records="$(cut -f2 <<<"$tv_result")"
-movie_json="$(cut -f3- <<<"$movie_result")"
-tv_json="$(cut -f3- <<<"$tv_result")"
-image_jobs_after="$(psql_at "$password" "SELECT count(*) FROM ops.jobs WHERE job_type = 'image.download'")"
-[[ "$image_jobs_after" =~ ^[0-9]+$ ]] || die 'could not read the image-job total'
-image_job_fanout=$((image_jobs_after - image_jobs_before))
-(( image_job_fanout >= 0 )) || die 'image-job count moved backwards during scan'
-fanout_exceeded=false
-(( image_job_fanout <= max_image_job_fanout )) || fanout_exceeded=true
+start_worker() {
+    local path="$1" key="$2" response
+    response="$(admin_post "$path" "$key" '{"action":"start"}')"
+    grep -q '"state":"running"' <<<"$response" || die "worker did not enter running state: $path"
+}
+
+start_worker /admin/v1/worker "catalog-scan-start-ingest-$stamp"
+start_worker /admin/v1/media/worker "catalog-scan-start-media-$stamp"
+
+active_work() {
+    psql_at "$password" "SELECT count(*) FROM ops.jobs WHERE status IN ('queued', 'running', 'retry_wait')"
+}
+
+active_before="$(active_work)"
+dead_letters_before="$(psql_at "$password" "SELECT count(*) FROM ops.jobs WHERE status = 'dead_letter'")"
+scan_response="$(admin_post /admin/v1/scans "catalog-scan-$stamp" '{"mode":"missing_only","mediaTypes":["movie","tv"]}')"
+scan_job_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["jobId"])' <<<"$scan_response")"
+[[ "$scan_job_id" =~ ^[0-9a-fA-F-]{36}$ ]] || die 'catalog scan response returned no valid job ID'
+
+scan_status='pending'
+scan_deadline=$((SECONDS + timeout))
+while (( SECONDS < scan_deadline )); do
+    job_response="$(curl --silent --show-error --fail \
+        -H "X-API-Key: $admin_key" \
+        "$base_url/admin/v1/jobs/$scan_job_id" 2>/dev/null || true)"
+    scan_status="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["job"]["status"])' <<<"$job_response" 2>/dev/null || printf 'pending')"
+    case "$scan_status" in
+        succeeded|dead_letter|cancelled|failed) break ;;
+    esac
+    sleep 2
+done
+
+active_peak="$active_before"
+pending_child_jobs=-1
+drain_deadline=$((SECONDS + timeout))
+while (( SECONDS < drain_deadline )); do
+    pending_child_jobs="$(psql_at "$password" "SELECT count(*) FROM ops.jobs WHERE job_type IN ('ingest.refresh_movie', 'ingest.refresh_tv', 'ingest.refresh_season', 'ingest.refresh_reusable_gallery', 'image.download') AND status IN ('queued', 'running', 'retry_wait')" 2>/dev/null || printf '%s' '-1')"
+    active_now="$(active_work 2>/dev/null || printf '%s' '-1')"
+    if [[ "$active_now" =~ ^[0-9]+$ ]] && (( active_now > active_peak )); then
+        active_peak="$active_now"
+    fi
+    if [[ "$pending_child_jobs" =~ ^[0-9]+$ ]] && (( pending_child_jobs == 0 )); then
+        break
+    fi
+    sleep 3
+done
+
+active_after="$(active_work 2>/dev/null || printf '%s' '-1')"
+dead_letters_after="$(psql_at "$password" "SELECT count(*) FROM ops.jobs WHERE status = 'dead_letter'")"
+new_dead_letters=$((dead_letters_after - dead_letters_before))
 
 cat >"$result_file" <<EOF
 {
   "checked_at_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "selected_date_utc": "$selected_date",
-  "movie_export_records": $movie_records,
-  "tv_export_records": $tv_records,
-  "queue_limit": $queue_limit,
-  "image_jobs_before": $image_jobs_before,
-  "image_jobs_after": $image_jobs_after,
-  "image_job_fanout": $image_job_fanout,
-  "max_image_job_fanout": $max_image_job_fanout,
-  "image_job_fanout_exceeded": $fanout_exceeded,
-  "movie_scan": $movie_json,
-  "tv_scan": $tv_json
+  "scan_mode": "missing_only",
+  "scan_job_id": "$scan_job_id",
+  "scan_status": "$scan_status",
+  "active_before": $active_before,
+  "active_peak": $active_peak,
+  "active_after": $active_after,
+  "pending_catalog_or_media_children": $pending_child_jobs,
+  "max_active": $max_active,
+  "dead_letters_before": $dead_letters_before,
+  "dead_letters_after": $dead_letters_after,
+  "new_dead_letters": $new_dead_letters
 }
 EOF
 cat "$result_file"
-printf 'TMDB scan artifact: %s\n' "$result_file"
-if [[ "$fanout_exceeded" == true ]]; then
-    die "downstream image-job fanout exceeded the bounded scan limit: $image_job_fanout > $max_image_job_fanout"
+printf 'Catalog scan artifact: %s\n' "$result_file"
+
+if [[ "$scan_status" != succeeded ]] || (( pending_child_jobs != 0 || active_peak > max_active || new_dead_letters != 0 )); then
+    die 'API-controlled catalog scan verification failed'
 fi
+printf '%s\n' 'API-controlled catalog scan verification passed.'

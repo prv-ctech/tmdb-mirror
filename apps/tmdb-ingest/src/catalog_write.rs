@@ -3,7 +3,8 @@ use std::{collections::BTreeSet, path::Path, time::Duration};
 use chrono::{DateTime, NaiveDate, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
-use tmdb_domain::{MediaType, classify_anime};
+use tmdb_db::TmdbDocumentRepository;
+use tmdb_domain::MediaType;
 use tmdb_jobs::JobExecutionError;
 use tmdb_upstream::{
     ChangePage, TmdbAlternateTitle, TmdbCollection, TmdbCompany, TmdbContentRating, TmdbCredit,
@@ -15,6 +16,20 @@ use uuid::Uuid;
 
 const IMAGE_JOB_TYPE: &str = "image.download";
 const IMAGE_JOB_PAYLOAD_VERSION: i32 = 1;
+const MAX_ACTIVE_IMAGE_JOBS: i64 = 10_000;
+
+/// Persists the exact upstream JSON used for a detail refresh.
+pub(crate) async fn persist_tmdb_document(
+    pool: &PgPool,
+    endpoint_path: &str,
+    query_string: &str,
+    response: &serde_json::Value,
+) -> Result<(), JobExecutionError> {
+    TmdbDocumentRepository::new(pool.clone())
+        .upsert(endpoint_path, query_string, response)
+        .await
+        .map_err(database_error)
+}
 
 use super::catalog_locks::{
     changes_write_resources, movie_write_resources, prelock_catalog_write_resources,
@@ -45,10 +60,6 @@ pub(crate) async fn persist_movie_with_options(
     let resources = movie_write_resources(movie, tmdb_id)?;
     let mut transaction = pool.begin().await.map_err(database_error)?;
     prelock_catalog_write_resources(&mut transaction, resources).await?;
-    let is_anime = classify_anime(
-        movie.keywords.iter().map(|keyword| keyword.id),
-        movie.genres.iter().map(|genre| genre.id),
-    );
     let title_id = upsert_title(
         &mut transaction,
         "movie",
@@ -65,7 +76,6 @@ pub(crate) async fn persist_movie_with_options(
         runtime_minutes,
         false,
         false,
-        is_anime,
     )
     .await?;
 
@@ -133,7 +143,6 @@ pub(crate) async fn persist_movie_with_options(
         movie.poster_path.as_deref(),
         movie.backdrop_path.as_deref(),
         &movie.images,
-        is_anime,
         allow_local_media,
     )
     .await?;
@@ -166,10 +175,6 @@ pub(crate) async fn persist_tv_with_options(
     let resources = tv_write_resources(series, tmdb_id)?;
     let mut transaction = pool.begin().await.map_err(database_error)?;
     prelock_catalog_write_resources(&mut transaction, resources).await?;
-    let is_anime = classify_anime(
-        series.keywords.iter().map(|keyword| keyword.id),
-        series.genres.iter().map(|genre| genre.id),
-    );
     let title_id = upsert_title(
         &mut transaction,
         "tv",
@@ -186,7 +191,6 @@ pub(crate) async fn persist_tv_with_options(
         None,
         false,
         false,
-        is_anime,
     )
     .await?;
 
@@ -219,7 +223,6 @@ pub(crate) async fn persist_tv_with_options(
         title_id,
         tmdb_id,
         series.seasons.as_slice(),
-        is_anime,
         allow_local_media,
     )
     .await?;
@@ -266,7 +269,6 @@ pub(crate) async fn persist_tv_with_options(
         series.poster_path.as_deref(),
         series.backdrop_path.as_deref(),
         &series.images,
-        is_anime,
         allow_local_media,
     )
     .await?;
@@ -289,8 +291,8 @@ pub(crate) async fn persist_season_with_options(
     let resources = season_write_resources(tv_id, season, season_id)?;
     let mut transaction = pool.begin().await.map_err(database_error)?;
     prelock_catalog_write_resources(&mut transaction, resources).await?;
-    let parent: Option<(i64, bool)> = sqlx::query_as(
-        "SELECT id, is_anime FROM catalog.titles
+    let parent: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM catalog.titles
          WHERE media_type = 'tv' AND tmdb_id = $1 AND active
          FOR UPDATE",
     )
@@ -298,7 +300,7 @@ pub(crate) async fn persist_season_with_options(
     .fetch_optional(&mut *transaction)
     .await
     .map_err(database_error)?;
-    let Some((title_id, anime)) = parent else {
+    let Some(title_id) = parent else {
         return Err(JobExecutionError::retry(
             "entity_not_ready",
             Duration::from_secs(5),
@@ -340,7 +342,6 @@ pub(crate) async fn persist_season_with_options(
         "poster",
         season.poster_path.as_deref(),
         &season.images.posters,
-        anime,
         Some(season.season_number),
         None,
         Some(tv_id),
@@ -355,7 +356,6 @@ pub(crate) async fn persist_season_with_options(
             tv_id,
             season.season_number,
             episode,
-            anime,
             allow_local_media,
         )
         .await?;
@@ -363,7 +363,7 @@ pub(crate) async fn persist_season_with_options(
     transaction.commit().await.map_err(database_error)
 }
 
-/// Materializes changed IDs as active title identities for the refresh scheduler.
+/// Materializes changed IDs as active title identities for bounded refresh work.
 pub(crate) async fn persist_changes(
     pool: &PgPool,
     media_type: MediaType,
@@ -404,15 +404,14 @@ async fn upsert_title(
     runtime_minutes: Option<i32>,
     adult: bool,
     video: bool,
-    is_anime: bool,
 ) -> Result<i64, JobExecutionError> {
     sqlx::query_scalar(
         "INSERT INTO catalog.titles (
              media_type, tmdb_id, display_title, original_title, overview,
              original_language, release_date, first_air_date, popularity,
              vote_average, vote_count, runtime_minutes, adult, video,
-             active, source_updated_at, is_anime
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true, $15, $16)
+             active, source_updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true, $15)
          ON CONFLICT (media_type, tmdb_id) DO UPDATE SET
              display_title = EXCLUDED.display_title,
              original_title = EXCLUDED.original_title,
@@ -426,7 +425,6 @@ async fn upsert_title(
              runtime_minutes = COALESCE(EXCLUDED.runtime_minutes, catalog.titles.runtime_minutes),
              adult = EXCLUDED.adult,
              video = EXCLUDED.video,
-             is_anime = EXCLUDED.is_anime,
              active = true,
              source_updated_at = EXCLUDED.source_updated_at,
              updated_at = clock_timestamp()
@@ -447,7 +445,6 @@ async fn upsert_title(
     .bind(adult)
     .bind(video)
     .bind(Utc::now())
-    .bind(is_anime)
     .fetch_one(&mut **transaction)
     .await
     .map_err(database_error)
@@ -579,7 +576,6 @@ async fn replace_credits(
                 "profile",
                 credit.profile_path.as_deref(),
                 &credit.images.profiles,
-                false,
                 allow_local_media,
             )
             .await?;
@@ -626,7 +622,6 @@ async fn replace_season_summaries(
     title_id: i64,
     tv_id: i64,
     seasons: &[TmdbSeasonSummary],
-    anime: bool,
     allow_local_media: bool,
 ) -> Result<(), JobExecutionError> {
     for season in seasons {
@@ -665,7 +660,6 @@ async fn replace_season_summaries(
             season_id,
             "poster",
             season.poster_path.as_deref(),
-            anime,
             Some(season.season_number),
             None,
             Some(tv_id),
@@ -682,6 +676,16 @@ async fn enqueue_season_refresh(
     tv_id: i64,
     season_number: u16,
 ) -> Result<(), JobExecutionError> {
+    if !season_refresh_queue_has_capacity(transaction).await? {
+        tracing::warn!(
+            event = "season_refresh_queue_capacity_deferred",
+            tv_id,
+            season_number,
+            max_active_jobs = super::MAX_PENDING_REFRESH_JOBS,
+            "deferring season refresh until a later explicit scan"
+        );
+        return Ok(());
+    }
     let payload = serde_json::json!({
         "tv_id": tv_id,
         "season_number": season_number,
@@ -703,6 +707,32 @@ async fn enqueue_season_refresh(
     .await
     .map_err(database_error)?;
     Ok(())
+}
+
+async fn season_refresh_queue_has_capacity(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<bool, JobExecutionError> {
+    sqlx::query(
+        "SELECT pg_catalog.pg_advisory_xact_lock(
+             pg_catalog.hashtextextended('queue:season.refresh', 0)
+         )",
+    )
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+
+    let active_jobs: i64 = sqlx::query_scalar(
+        "SELECT pg_catalog.count(*)::bigint
+           FROM ops.jobs
+          WHERE job_type = $1
+            AND status IN ('queued', 'running', 'retry_wait')",
+    )
+    .bind(super::REFRESH_SEASON_JOB)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+
+    Ok(active_jobs < super::MAX_PENDING_REFRESH_JOBS)
 }
 
 async fn upsert_person(
@@ -755,7 +785,6 @@ async fn persist_episode(
     tv_id: i64,
     season_number: u16,
     episode: &TmdbEpisode,
-    anime: bool,
     allow_local_media: bool,
 ) -> Result<(), JobExecutionError> {
     let episode_id = source_id(episode.id)?;
@@ -807,7 +836,6 @@ async fn persist_episode(
         "still",
         episode.still_path.as_deref(),
         &episode.images.stills,
-        anime,
         Some(season_number),
         Some(episode.episode_number),
         Some(tv_id),
@@ -852,7 +880,6 @@ async fn replace_episode_credits(
                 "profile",
                 credit.profile_path.as_deref(),
                 &credit.images.profiles,
-                false,
                 allow_local_media,
             )
             .await?;
@@ -926,7 +953,6 @@ async fn replace_companies(
             "logo",
             company.logo_path.as_deref(),
             &company.images.logos,
-            false,
             allow_local_media,
         )
         .await?;
@@ -980,7 +1006,6 @@ async fn replace_networks(
             "logo",
             network.logo_path.as_deref(),
             &network.images.logos,
-            false,
             allow_local_media,
         )
         .await?;
@@ -1069,7 +1094,6 @@ async fn replace_collection(
         "poster",
         collection.poster_path.as_deref(),
         &collection.images.posters,
-        false,
         allow_local_media,
     )
     .await?;
@@ -1080,7 +1104,6 @@ async fn replace_collection(
         "backdrop",
         collection.backdrop_path.as_deref(),
         &collection.images.backdrops,
-        false,
         allow_local_media,
     )
     .await?;
@@ -1423,7 +1446,6 @@ pub(crate) async fn enqueue_reusable_gallery(
                 "profile",
                 primary.as_deref(),
                 &images.profiles,
-                false,
                 allow_local_media,
             )
             .await?;
@@ -1436,7 +1458,6 @@ pub(crate) async fn enqueue_reusable_gallery(
                 "logo",
                 primary.as_deref(),
                 &images.logos,
-                false,
                 allow_local_media,
             )
             .await?;
@@ -1449,7 +1470,6 @@ pub(crate) async fn enqueue_reusable_gallery(
                 "poster",
                 primary.as_deref(),
                 &images.posters,
-                false,
                 allow_local_media,
             )
             .await?;
@@ -1460,7 +1480,6 @@ pub(crate) async fn enqueue_reusable_gallery(
                 "backdrop",
                 secondary.as_deref(),
                 &images.backdrops,
-                false,
                 allow_local_media,
             )
             .await?;
@@ -1481,7 +1500,6 @@ async fn enqueue_title_images(
     poster_path: Option<&str>,
     backdrop_path: Option<&str>,
     images: &TmdbImages,
-    anime: bool,
     allow_local_media: bool,
 ) -> Result<(), JobExecutionError> {
     enqueue_gallery_images(
@@ -1491,7 +1509,6 @@ async fn enqueue_title_images(
         "poster",
         poster_path,
         &images.posters,
-        anime,
         allow_local_media,
     )
     .await?;
@@ -1502,7 +1519,6 @@ async fn enqueue_title_images(
         "backdrop",
         backdrop_path,
         &images.backdrops,
-        anime,
         allow_local_media,
     )
     .await?;
@@ -1513,7 +1529,6 @@ async fn enqueue_title_images(
         "logo",
         None,
         &images.logos,
-        anime,
         allow_local_media,
     )
     .await
@@ -1530,7 +1545,6 @@ async fn enqueue_gallery_images(
     kind: &str,
     primary_path: Option<&str>,
     images: &[TmdbImage],
-    anime: bool,
     allow_local_media: bool,
 ) -> Result<(), JobExecutionError> {
     enqueue_gallery_images_with_position(
@@ -1540,7 +1554,6 @@ async fn enqueue_gallery_images(
         kind,
         primary_path,
         images,
-        anime,
         None,
         None,
         None,
@@ -1560,7 +1573,6 @@ async fn enqueue_gallery_images_with_position(
     kind: &str,
     primary_path: Option<&str>,
     images: &[TmdbImage],
-    anime: bool,
     season_number: Option<u16>,
     episode_number: Option<u16>,
     title_tmdb_id: Option<i64>,
@@ -1570,6 +1582,21 @@ async fn enqueue_gallery_images_with_position(
         return Ok(());
     }
     let paths = ordered_gallery_paths(primary_path, images);
+    if paths.is_empty() {
+        return Ok(());
+    }
+    if !image_queue_has_capacity(transaction, paths.len()).await? {
+        tracing::warn!(
+            event = "image_queue_capacity_deferred",
+            entity_type,
+            entity_id,
+            image_kind = kind,
+            candidate_count = paths.len(),
+            max_active_jobs = MAX_ACTIVE_IMAGE_JOBS,
+            "deferring image jobs until a later media scan"
+        );
+        return Ok(());
+    }
     for (offset, path) in paths.into_iter().enumerate() {
         let asset_index = u16::try_from(offset + 1)
             .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
@@ -1579,7 +1606,6 @@ async fn enqueue_gallery_images_with_position(
             entity_id,
             kind,
             Some(path),
-            anime,
             season_number,
             episode_number,
             title_tmdb_id,
@@ -1589,6 +1615,36 @@ async fn enqueue_gallery_images_with_position(
         .await?;
     }
     Ok(())
+}
+
+async fn image_queue_has_capacity(
+    transaction: &mut Transaction<'_, Postgres>,
+    candidate_count: usize,
+) -> Result<bool, JobExecutionError> {
+    sqlx::query(
+        "SELECT pg_catalog.pg_advisory_xact_lock(
+             pg_catalog.hashtextextended('queue:image.download', 0)
+         )",
+    )
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+
+    let active_jobs: i64 = sqlx::query_scalar(
+        "SELECT pg_catalog.count(*)::bigint
+           FROM ops.jobs
+          WHERE job_type = $1
+            AND status IN ('queued', 'running', 'retry_wait')",
+    )
+    .bind(IMAGE_JOB_TYPE)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+
+    Ok(
+        active_jobs.saturating_add(i64::try_from(candidate_count).unwrap_or(i64::MAX))
+            <= MAX_ACTIVE_IMAGE_JOBS,
+    )
 }
 
 fn ordered_gallery_paths<'a>(
@@ -1619,19 +1675,32 @@ async fn enqueue_image_job_with_position(
     entity_id: i64,
     kind: &str,
     tmdb_path: Option<&str>,
-    anime: bool,
     season_number: Option<u16>,
     episode_number: Option<u16>,
     title_tmdb_id: Option<i64>,
     allow_local_media: bool,
 ) -> Result<(), JobExecutionError> {
+    if !allow_local_media || !tmdb_path.is_some_and(|path| valid_image_path(path)) {
+        return Ok(());
+    }
+    if !image_queue_has_capacity(transaction, 1).await? {
+        tracing::warn!(
+            event = "image_queue_capacity_deferred",
+            entity_type,
+            entity_id,
+            image_kind = kind,
+            candidate_count = 1,
+            max_active_jobs = MAX_ACTIVE_IMAGE_JOBS,
+            "deferring image job until a later media scan"
+        );
+        return Ok(());
+    }
     enqueue_image_job_with_position_and_index(
         transaction,
         entity_type,
         entity_id,
         kind,
         tmdb_path,
-        anime,
         season_number,
         episode_number,
         title_tmdb_id,
@@ -1648,7 +1717,6 @@ async fn enqueue_image_job_with_position_and_index(
     entity_id: i64,
     kind: &str,
     tmdb_path: Option<&str>,
-    anime: bool,
     season_number: Option<u16>,
     episode_number: Option<u16>,
     title_tmdb_id: Option<i64>,
@@ -1680,7 +1748,6 @@ async fn enqueue_image_job_with_position_and_index(
         "sourceUrl": source_url,
         "language": serde_json::Value::Null,
         "sourceRevision": serde_json::Value::Null,
-        "anime": anime,
         "seasonNumber": season_number,
         "episodeNumber": episode_number,
         "titleTmdbId": title_tmdb_id,
@@ -1747,8 +1814,8 @@ mod tests {
     use serde_json::Value;
     use sqlx::PgPool;
     use tmdb_upstream::{
-        TmdbCredit, TmdbCredits, TmdbEpisode, TmdbGenre, TmdbImage, TmdbKeyword, TmdbMovie,
-        TmdbSeason, TmdbSeasonSummary, TmdbTv,
+        TmdbCredit, TmdbCredits, TmdbEpisode, TmdbGenre, TmdbImage, TmdbMovie, TmdbSeason,
+        TmdbSeasonSummary, TmdbTv,
     };
     use tokio::sync::Barrier;
 
@@ -1840,52 +1907,128 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
-    async fn movie_and_tv_persistence_require_keyword_and_animation_genre(
+    async fn catalog_refresh_defers_image_fanout_when_queue_is_full(
         pool: PgPool,
     ) -> sqlx::Result<()> {
-        let keyword_only_movie = TmdbMovie {
-            id: 44,
-            title: Some("Keyword-only live adaptation".to_owned()),
-            keywords: vec![TmdbKeyword {
-                id: 210_024,
-                name: Some("anime".to_owned()),
-            }],
-            genres: vec![TmdbGenre {
-                id: 28,
-                name: Some("Action".to_owned()),
-            }],
+        sqlx::query(
+            "INSERT INTO ops.jobs (id, job_type, payload_version, payload, status, dedup_key)
+             SELECT gen_random_uuid(), 'image.download', 1, '{}'::jsonb, 'queued',
+                    'capacity-fixture-' || series::text
+               FROM generate_series(1, 10000) AS series",
+        )
+        .execute(&pool)
+        .await?;
+
+        let movie = TmdbMovie {
+            id: 9001,
+            title: Some("Queue capacity fixture".to_owned()),
+            poster_path: Some("/capacity-poster.jpg".to_owned()),
+            backdrop_path: Some("/capacity-backdrop.jpg".to_owned()),
             ..TmdbMovie::default()
         };
-        let anime_tv = TmdbTv {
+        persist_movie_with_options(&pool, &movie, true)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+
+        let mut transaction = pool.begin().await?;
+        enqueue_image_job_with_position(
+            &mut transaction,
+            "season",
+            9002,
+            "poster",
+            Some("/capacity-season-poster.jpg"),
+            Some(1),
+            None,
+            Some(9001),
+            true,
+        )
+        .await
+        .map_err(|error| as_sqlx_error(&error))?;
+        transaction.commit().await?;
+
+        let active_images: i64 = sqlx::query_scalar(
+            "SELECT count(*)
+               FROM ops.jobs
+              WHERE job_type = 'image.download'
+                AND status IN ('queued', 'running', 'retry_wait')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        let catalog_title: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM catalog.titles
+                  WHERE tmdb_id = 9001 AND media_type = 'movie'
+             )",
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(active_images, MAX_ACTIVE_IMAGE_JOBS);
+        assert!(catalog_title);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn catalog_refresh_defers_season_fanout_when_queue_is_full(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO ops.jobs (id, job_type, payload_version, payload, status, dedup_key)
+             SELECT gen_random_uuid(), 'ingest.refresh_season', 1,
+                    jsonb_build_object('tv_id', series, 'season_number', 1),
+                    'queued', 'season-capacity-fixture-' || series::text
+               FROM generate_series(1, 1000) AS series",
+        )
+        .execute(&pool)
+        .await?;
+
+        let mut transaction = pool.begin().await?;
+        enqueue_season_refresh(&mut transaction, 9001, 1)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+        transaction.commit().await?;
+
+        let active_seasons: i64 = sqlx::query_scalar(
+            "SELECT count(*)
+               FROM ops.jobs
+              WHERE job_type = 'ingest.refresh_season'
+                AND status IN ('queued', 'running', 'retry_wait')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(active_seasons, 1_000);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn movie_and_tv_persistence_use_the_same_media_surface(pool: PgPool) -> sqlx::Result<()> {
+        let movie = TmdbMovie {
+            id: 44,
+            title: Some("Movie fixture".to_owned()),
+            ..TmdbMovie::default()
+        };
+        let tv = TmdbTv {
             id: 45,
-            name: Some("Strict anime TV fixture".to_owned()),
-            keywords: vec![TmdbKeyword {
-                id: 210_024,
-                name: Some("anime".to_owned()),
-            }],
-            genres: vec![TmdbGenre {
-                id: 16,
-                name: Some("Animation".to_owned()),
-            }],
+            name: Some("TV fixture".to_owned()),
             ..TmdbTv::default()
         };
 
-        persist_movie_with_options(&pool, &keyword_only_movie, false)
+        persist_movie_with_options(&pool, &movie, false)
             .await
             .map_err(|error| as_sqlx_error(&error))?;
-        persist_tv_with_options(&pool, &anime_tv, false)
+        persist_tv_with_options(&pool, &tv, false)
             .await
             .map_err(|error| as_sqlx_error(&error))?;
 
         let rows: Vec<(String, bool)> = sqlx::query_as(
-            "SELECT media_type, is_anime
+            "SELECT media_type, active
                FROM catalog.titles
               WHERE tmdb_id IN (44, 45)
               ORDER BY tmdb_id",
         )
         .fetch_all(&pool)
         .await?;
-        assert_eq!(rows, [("movie".to_owned(), false), ("tv".to_owned(), true)]);
+        assert_eq!(rows, [("movie".to_owned(), true), ("tv".to_owned(), true)]);
         Ok(())
     }
 

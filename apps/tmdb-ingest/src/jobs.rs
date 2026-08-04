@@ -1,4 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -10,9 +12,11 @@ use sqlx::{FromRow, PgPool};
 use tmdb_domain::MediaType;
 use tmdb_jobs::{ClaimedJob, JobError, JobExecutionError, JobExecutor, JobRepository, NewJob};
 use tmdb_upstream::{
-    DailyExportParser, MAX_DAILY_EXPORT_BYTES, TmdbClient, TmdbClientError, TmdbImages,
-    TmdbTrendingItem,
+    DailyExportParser, IMAGE_GALLERY_QUERY_STRING, MAX_DAILY_EXPORT_BYTES,
+    MOVIE_DETAIL_QUERY_STRING, TV_DETAIL_QUERY_STRING, TmdbClient, TmdbClientError, TmdbImages,
+    TmdbTrendingItem, TmdbVideos, VIDEO_GALLERY_QUERY_STRING,
 };
+use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 use uuid::Uuid;
 
 #[path = "catalog_locks.rs"]
@@ -30,6 +34,8 @@ pub const REFRESH_SEASON_JOB: &str = "ingest.refresh_season";
 pub const CHANGES_SYNC_JOB: &str = "ingest.changes_sync";
 /// Versioned durable job names accepted by the ingestion worker.
 pub const DAILY_EXPORT_JOB: &str = "ingest.daily_export";
+/// Refresh TMDB's image configuration document.
+pub const CONFIGURATION_JOB: &str = "ingest.configuration";
 /// Refresh a typed TMDB trending window into the durable ranking table.
 pub const TRENDING_REFRESH_JOB: &str = "ingest.trending";
 /// Refresh one reusable people, company, network, or collection gallery.
@@ -48,6 +54,7 @@ const INGEST_JOB_TYPES: &[&str] = &[
     REFRESH_SEASON_JOB,
     CHANGES_SYNC_JOB,
     DAILY_EXPORT_JOB,
+    CONFIGURATION_JOB,
     TRENDING_REFRESH_JOB,
     REFRESH_REUSABLE_GALLERY_JOB,
     ADMIN_SCAN_JOB,
@@ -55,6 +62,7 @@ const INGEST_JOB_TYPES: &[&str] = &[
     ADMIN_ANALYZE_JOB,
 ];
 const DAILY_EXPORT_REFRESH_PRIORITY: i16 = -100;
+const MAX_PENDING_REFRESH_JOBS: i64 = 1_000;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -81,6 +89,10 @@ struct ChangesPayload {
 struct DailyExportPayload {
     media_type: MediaType,
     url: String,
+    #[serde(default)]
+    offset: u64,
+    #[serde(default)]
+    refresh_all: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -134,14 +146,17 @@ struct MediaScanPayload {
     repair: bool,
     #[serde(default)]
     step: u32,
+    #[serde(default)]
+    cursor: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminScanMode {
-    Full,
-    Missing,
-    Changes,
+    FullSweep,
+    MissingOnly,
+    PruneCleanup,
+    DailySync,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -149,6 +164,8 @@ pub enum AdminScanMode {
 struct AdminScanPayload {
     mode: AdminScanMode,
     media_types: Vec<MediaType>,
+    #[serde(default)]
+    cursor: u64,
 }
 
 /// A validated, idempotent ingestion job payload.
@@ -163,7 +180,14 @@ pub enum IngestJob {
     /// Fetch one page of media changes.
     ChangesSync { media_type: MediaType, page: u32 },
     /// Fetch and parse one daily ID export.
-    DailyExport { media_type: MediaType, url: String },
+    DailyExport {
+        media_type: MediaType,
+        url: String,
+        offset: u64,
+        refresh_all: bool,
+    },
+    /// Fetch TMDB's image configuration document.
+    Configuration,
     /// Refresh a named trending window for a single public media namespace.
     Trending {
         media_type: MediaType,
@@ -180,11 +204,13 @@ pub enum IngestJob {
         mode: MediaScanMode,
         repair: bool,
         step: u32,
+        cursor: u64,
     },
     /// Expand one explicit operational scan into safely bounded ingest jobs.
     AdminScan {
         mode: AdminScanMode,
         media_types: Vec<MediaType>,
+        cursor: u64,
     },
     /// Analyze only the fixed catalog/search relation allowlist.
     AdminAnalyze,
@@ -204,12 +230,18 @@ impl IngestJob {
             Self::ChangesSync { media_type, page } => {
                 format!("{CHANGES_SYNC_JOB}:{media_type}:{page}")
             }
-            Self::DailyExport { media_type, url } => {
+            Self::DailyExport {
+                media_type,
+                url,
+                offset,
+                ..
+            } => {
                 let mut digest = Sha256::new();
                 digest.update(url.as_bytes());
                 let digest = digest.finalize();
-                format!("{DAILY_EXPORT_JOB}:{media_type}:{digest:x}")
+                format!("{DAILY_EXPORT_JOB}:{media_type}:{digest:x}:{offset}")
             }
+            Self::Configuration => CONFIGURATION_JOB.to_owned(),
             Self::Trending {
                 media_type,
                 trend_window,
@@ -221,11 +253,20 @@ impl IngestJob {
                 "{REFRESH_REUSABLE_GALLERY_JOB}:{}:{tmdb_id}",
                 entity_type.as_str()
             ),
-            Self::MediaScan { run_id, step, .. } => {
-                format!("{ADMIN_MEDIA_SCAN_JOB}:{run_id}:{step}")
+            Self::MediaScan {
+                run_id,
+                step,
+                cursor,
+                ..
+            } => {
+                format!("{ADMIN_MEDIA_SCAN_JOB}:{run_id}:{step}:{cursor}")
             }
-            Self::AdminScan { mode, media_types } => {
-                format!("{ADMIN_SCAN_JOB}:{mode:?}:{media_types:?}")
+            Self::AdminScan {
+                mode,
+                media_types,
+                cursor,
+            } => {
+                format!("{ADMIN_SCAN_JOB}:{mode:?}:{media_types:?}:{cursor}")
             }
             Self::AdminAnalyze => ADMIN_ANALYZE_JOB.to_owned(),
         }
@@ -285,8 +326,12 @@ pub fn parse_job(
             Ok(IngestJob::DailyExport {
                 media_type: payload.media_type,
                 url: payload.url,
+                offset: payload.offset,
+                refresh_all: payload.refresh_all,
             })
         }
+        CONFIGURATION_JOB if payload == &serde_json::json!({}) => Ok(IngestJob::Configuration),
+        CONFIGURATION_JOB => Err(JobPayloadError::InvalidPayload),
         TRENDING_REFRESH_JOB => {
             let payload: TrendingPayload = parse_payload(payload)?;
             if !matches!(payload.trend_window.as_str(), "day" | "week") {
@@ -315,12 +360,14 @@ pub fn parse_job(
                 mode: payload.mode,
                 repair: payload.repair,
                 step: payload.step,
+                cursor: payload.cursor,
             })
         }
         ADMIN_SCAN_JOB => {
             let payload: AdminScanPayload = parse_payload(payload)?;
             if payload.media_types.is_empty()
                 || payload.media_types.len() > 2
+                || payload.cursor > i64::MAX as u64
                 || payload
                     .media_types
                     .windows(2)
@@ -331,6 +378,7 @@ pub fn parse_job(
             Ok(IngestJob::AdminScan {
                 mode: payload.mode,
                 media_types: payload.media_types,
+                cursor: payload.cursor,
             })
         }
         ADMIN_ANALYZE_JOB if payload == &serde_json::json!({}) => Ok(IngestJob::AdminAnalyze),
@@ -463,6 +511,52 @@ impl IngestExecutor {
 }
 
 const MAX_SHARED_GALLERY_ENTITIES: usize = 256;
+const MAX_LINKED_DOCUMENTS: usize = 256;
+
+const GLOBAL_DOCUMENT_PATHS: &[&str] = &[
+    "configuration/countries",
+    "configuration/jobs",
+    "configuration/languages",
+    "configuration/primary_translations",
+    "configuration/timezones",
+    "certification/movie/list",
+    "certification/tv/list",
+    "genre/movie/list",
+    "genre/tv/list",
+    "watch/providers/regions",
+    "watch/providers/movie",
+    "watch/providers/tv",
+    "movie/changes",
+    "movie/latest",
+    "movie/now_playing",
+    "movie/popular",
+    "movie/top_rated",
+    "movie/upcoming",
+    "person/changes",
+    "person/latest",
+    "person/popular",
+    "tv/airing_today",
+    "tv/changes",
+    "tv/latest",
+    "tv/on_the_air",
+    "tv/popular",
+    "tv/top_rated",
+    "trending/all/day",
+    "trending/all/week",
+    "trending/movie/day",
+    "trending/movie/week",
+    "trending/person/day",
+    "trending/person/week",
+    "trending/tv/day",
+    "trending/tv/week",
+];
+
+#[derive(Clone, Debug)]
+struct CapturedDocument {
+    endpoint_path: String,
+    query_string: String,
+    response: Value,
+}
 
 fn optional_gallery(
     result: Result<TmdbImages, TmdbClientError>,
@@ -473,6 +567,155 @@ fn optional_gallery(
     }
 }
 
+fn optional_gallery_with_raw(
+    result: Result<(Value, TmdbImages), TmdbClientError>,
+) -> Result<(Option<Value>, TmdbImages), TmdbClientError> {
+    match result {
+        Ok((raw, images)) => Ok((Some(raw), images)),
+        Err(TmdbClientError::NotFound) => Ok((None, TmdbImages::default())),
+        Err(error) => Err(error),
+    }
+}
+
+async fn capture_optional_documents(
+    client: &TmdbClient,
+    paths: Vec<String>,
+) -> Result<Vec<CapturedDocument>, TmdbClientError> {
+    let mut documents = Vec::new();
+    for endpoint_path in paths {
+        match client.fetch_document(&endpoint_path, &[]).await {
+            Ok((response, query_string)) => documents.push(CapturedDocument {
+                endpoint_path,
+                query_string,
+                response,
+            }),
+            Err(TmdbClientError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(documents)
+}
+
+fn linked_document_paths(
+    documents: &[CapturedDocument],
+    detail_sources: &[(&str, &Value)],
+) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    for document in documents {
+        collect_linked_document_paths(&document.endpoint_path, &document.response, &mut paths);
+    }
+    for (endpoint_path, response) in detail_sources {
+        collect_linked_document_paths(endpoint_path, response, &mut paths);
+    }
+    paths.into_iter().take(MAX_LINKED_DOCUMENTS).collect()
+}
+
+fn collect_linked_document_paths(
+    endpoint_path: &str,
+    response: &Value,
+    paths: &mut BTreeSet<String>,
+) {
+    let is_credit_document = endpoint_path.ends_with("/credits")
+        || endpoint_path.ends_with("/aggregate_credits")
+        || response.get("cast").is_some()
+        || response.get("crew").is_some()
+        || response.get("credits").is_some()
+        || response.get("aggregate_credits").is_some();
+    if is_credit_document {
+        for section in [response.get("cast"), response.get("crew")] {
+            if let Some(rows) = section.and_then(Value::as_array) {
+                for row in rows {
+                    if let Some(credit_id) = row.get("credit_id").and_then(path_component) {
+                        paths.insert(format!("credit/{credit_id}"));
+                    }
+                }
+            }
+        }
+        for section_name in ["credits", "aggregate_credits"] {
+            if let Some(credits) = response.get(section_name) {
+                collect_linked_document_paths(endpoint_path, credits, paths);
+            }
+        }
+    }
+
+    if endpoint_path.ends_with("/reviews") {
+        add_result_paths(response, "review", paths);
+    }
+    if endpoint_path.ends_with("/keywords") || response.get("keywords").is_some() {
+        for rows in [response.get("keywords"), response.get("results")] {
+            add_id_paths(rows, "keyword", paths);
+        }
+    }
+    if endpoint_path.ends_with("/episode_groups") || response.get("episode_groups").is_some() {
+        for rows in [response.get("episode_groups"), response.get("results")] {
+            add_id_paths(rows, "tv/episode_group", paths);
+        }
+    }
+}
+
+fn add_result_paths(response: &Value, prefix: &str, paths: &mut BTreeSet<String>) {
+    add_id_paths(response.get("results"), prefix, paths);
+}
+
+fn add_id_paths(value: Option<&Value>, prefix: &str, paths: &mut BTreeSet<String>) {
+    let Some(rows) = value.and_then(|value| {
+        value.as_array().or_else(|| {
+            value
+                .get("results")
+                .and_then(Value::as_array)
+                .or_else(|| value.get("keywords").and_then(Value::as_array))
+        })
+    }) else {
+        return;
+    };
+    for row in rows {
+        let Some(id) = row.get("id").and_then(path_component) else {
+            continue;
+        };
+        paths.insert(format!("{prefix}/{id}"));
+        if prefix == "keyword" {
+            paths.insert(format!("{prefix}/{id}/movies"));
+        }
+    }
+}
+
+fn path_component(value: &Value) -> Option<String> {
+    let value = if let Some(value) = value.as_str() {
+        value.to_owned()
+    } else if let Some(id) = value.as_u64().filter(|id| *id > 0) {
+        id.to_string()
+    } else {
+        return None;
+    };
+    if value.is_empty()
+        || value.len() > 128
+        || value == "."
+        || value == ".."
+        || value.chars().any(char::is_control)
+        || value.contains(['/', '\\', '?', '#'])
+    {
+        return None;
+    }
+    Some(value)
+}
+
+async fn capture_linked_documents(
+    client: &TmdbClient,
+    documents: &mut Vec<CapturedDocument>,
+    detail_sources: &[(&str, &Value)],
+) -> Result<(), TmdbClientError> {
+    let existing = documents
+        .iter()
+        .map(|document| format!("{}\0{}", document.endpoint_path, document.query_string))
+        .collect::<HashSet<_>>();
+    let paths = linked_document_paths(documents, detail_sources)
+        .into_iter()
+        .filter(|path| !existing.contains(&format!("{path}\0")))
+        .collect();
+    documents.extend(capture_optional_documents(client, paths).await?);
+    Ok(())
+}
+
 fn upstream_id(raw: u64) -> Result<u32, TmdbClientError> {
     u32::try_from(raw).map_err(|_| TmdbClientError::InvalidPath)
 }
@@ -481,26 +724,114 @@ async fn fetch_reusable_gallery(
     client: &TmdbClient,
     entity_type: ReusableGalleryEntity,
     tmdb_id: u32,
-) -> Result<TmdbImages, TmdbClientError> {
-    optional_gallery(match entity_type {
-        ReusableGalleryEntity::Person => client.fetch_person_images(tmdb_id).await,
-        ReusableGalleryEntity::Company => client.fetch_company_images(tmdb_id).await,
-        ReusableGalleryEntity::Network => client.fetch_network_images(tmdb_id).await,
-        ReusableGalleryEntity::Collection => client.fetch_collection_images(tmdb_id).await,
-    })
+) -> Result<(TmdbImages, Vec<CapturedDocument>), TmdbClientError> {
+    let path = format!("{}/{tmdb_id}/images", entity_type.as_str());
+    let (raw, images) = match entity_type {
+        ReusableGalleryEntity::Person => {
+            optional_gallery_with_raw(client.fetch_person_images_with_raw(tmdb_id).await)?
+        }
+        ReusableGalleryEntity::Company => {
+            optional_gallery_with_raw(client.fetch_company_images_with_raw(tmdb_id).await)?
+        }
+        ReusableGalleryEntity::Network => {
+            optional_gallery_with_raw(client.fetch_network_images_with_raw(tmdb_id).await)?
+        }
+        ReusableGalleryEntity::Collection => {
+            optional_gallery_with_raw(client.fetch_collection_images_with_raw(tmdb_id).await)?
+        }
+    };
+    let mut documents = Vec::new();
+    if let Some(response) = raw {
+        documents.push(CapturedDocument {
+            endpoint_path: path,
+            query_string: IMAGE_GALLERY_QUERY_STRING.to_owned(),
+            response,
+        });
+    }
+    let detail_path = format!("{}/{tmdb_id}", entity_type.as_str());
+    documents.extend(capture_optional_documents(client, vec![detail_path]).await?);
+    let suffixes: &[&str] = match entity_type {
+        ReusableGalleryEntity::Person => &[
+            "changes",
+            "combined_credits",
+            "external_ids",
+            "movie_credits",
+            "tagged_images",
+            "translations",
+            "tv_credits",
+        ],
+        ReusableGalleryEntity::Company => &["alternative_names"],
+        ReusableGalleryEntity::Network => &["alternative_names"],
+        ReusableGalleryEntity::Collection => &["translations"],
+    };
+    documents.extend(
+        capture_optional_documents(
+            client,
+            suffixes
+                .iter()
+                .map(|suffix| format!("{}/{tmdb_id}/{suffix}", entity_type.as_str()))
+                .collect(),
+        )
+        .await?,
+    );
+    Ok((images, documents))
 }
 
 async fn hydrate_movie_galleries(
     client: &TmdbClient,
     movie: &mut tmdb_upstream::TmdbMovie,
-    allow_local_media: bool,
-) -> Result<(), TmdbClientError> {
-    if !allow_local_media {
-        return Ok(());
-    }
+    detail_raw: &Value,
+) -> Result<Vec<CapturedDocument>, TmdbClientError> {
+    let mut documents = Vec::new();
     let movie_id = upstream_id(movie.id)?;
-    movie.images = optional_gallery(client.fetch_movie_images(movie_id).await)?;
-    movie.videos = client.fetch_movie_videos(movie_id).await?;
+    let (image_raw, images) =
+        optional_gallery_with_raw(client.fetch_movie_images_with_raw(movie_id).await)?;
+    movie.images = images;
+    if let Some(response) = image_raw {
+        documents.push(CapturedDocument {
+            endpoint_path: format!("movie/{movie_id}/images"),
+            query_string: IMAGE_GALLERY_QUERY_STRING.to_owned(),
+            response,
+        });
+    }
+    let (video_raw, videos) = match client.fetch_movie_videos_with_raw(movie_id).await {
+        Ok((response, videos)) => (Some(response), videos),
+        Err(TmdbClientError::NotFound) => (None, TmdbVideos::default()),
+        Err(error) => return Err(error),
+    };
+    movie.videos = videos;
+    if let Some(response) = video_raw {
+        documents.push(CapturedDocument {
+            endpoint_path: format!("movie/{movie_id}/videos"),
+            query_string: VIDEO_GALLERY_QUERY_STRING.to_owned(),
+            response,
+        });
+    }
+    documents.extend(
+        capture_optional_documents(
+            client,
+            [
+                "account_states",
+                "alternative_titles",
+                "changes",
+                "credits",
+                "external_ids",
+                "keywords",
+                "lists",
+                "recommendations",
+                "release_dates",
+                "reviews",
+                "similar",
+                "translations",
+                "watch/providers",
+            ]
+            .into_iter()
+            .map(|suffix| format!("movie/{movie_id}/{suffix}"))
+            .collect(),
+        )
+        .await?,
+    );
+    capture_linked_documents(client, &mut documents, &[("movie detail", detail_raw)]).await?;
     hydrate_credit_galleries(client, &mut movie.credits).await?;
     for company in movie
         .production_companies
@@ -514,20 +845,67 @@ async fn hydrate_movie_galleries(
         let collection_id = upstream_id(collection.id)?;
         collection.images = optional_gallery(client.fetch_collection_images(collection_id).await)?;
     }
-    Ok(())
+    Ok(documents)
 }
 
 async fn hydrate_tv_galleries(
     client: &TmdbClient,
     series: &mut tmdb_upstream::TmdbTv,
-    allow_local_media: bool,
-) -> Result<(), TmdbClientError> {
-    if !allow_local_media {
-        return Ok(());
-    }
+    detail_raw: &Value,
+) -> Result<Vec<CapturedDocument>, TmdbClientError> {
+    let mut documents = Vec::new();
     let series_id = upstream_id(series.id)?;
-    series.images = optional_gallery(client.fetch_tv_images(series_id).await)?;
-    series.videos = client.fetch_tv_videos(series_id).await?;
+    let (image_raw, images) =
+        optional_gallery_with_raw(client.fetch_tv_images_with_raw(series_id).await)?;
+    series.images = images;
+    if let Some(response) = image_raw {
+        documents.push(CapturedDocument {
+            endpoint_path: format!("tv/{series_id}/images"),
+            query_string: IMAGE_GALLERY_QUERY_STRING.to_owned(),
+            response,
+        });
+    }
+    let (video_raw, videos) = match client.fetch_tv_videos_with_raw(series_id).await {
+        Ok((response, videos)) => (Some(response), videos),
+        Err(TmdbClientError::NotFound) => (None, TmdbVideos::default()),
+        Err(error) => return Err(error),
+    };
+    series.videos = videos;
+    if let Some(response) = video_raw {
+        documents.push(CapturedDocument {
+            endpoint_path: format!("tv/{series_id}/videos"),
+            query_string: VIDEO_GALLERY_QUERY_STRING.to_owned(),
+            response,
+        });
+    }
+    documents.extend(
+        capture_optional_documents(
+            client,
+            [
+                "account_states",
+                "aggregate_credits",
+                "alternative_titles",
+                "changes",
+                "content_ratings",
+                "credits",
+                "episode_groups",
+                "external_ids",
+                "keywords",
+                "lists",
+                "recommendations",
+                "reviews",
+                "screened_theatrically",
+                "similar",
+                "translations",
+                "watch/providers",
+            ]
+            .into_iter()
+            .map(|suffix| format!("tv/{series_id}/{suffix}"))
+            .collect(),
+        )
+        .await?,
+    );
+    capture_linked_documents(client, &mut documents, &[("tv detail", detail_raw)]).await?;
     hydrate_credit_galleries(client, &mut series.credits).await?;
     for company in series
         .production_companies
@@ -541,7 +919,7 @@ async fn hydrate_tv_galleries(
         let network_id = upstream_id(network.id)?;
         network.images = optional_gallery(client.fetch_network_images(network_id).await)?;
     }
-    Ok(())
+    Ok(documents)
 }
 
 async fn hydrate_credit_galleries(
@@ -584,25 +962,134 @@ async fn hydrate_season_galleries(
     client: &TmdbClient,
     tv_id: u32,
     season: &mut tmdb_upstream::TmdbSeason,
-    allow_local_media: bool,
-) -> Result<(), TmdbClientError> {
-    if !allow_local_media {
-        return Ok(());
-    }
-    season.images = optional_gallery(
+) -> Result<Vec<CapturedDocument>, TmdbClientError> {
+    let mut documents = Vec::new();
+    let (season_raw, images) = optional_gallery_with_raw(
         client
-            .fetch_season_images(tv_id, season.season_number)
+            .fetch_season_images_with_raw(tv_id, season.season_number)
             .await,
     )?;
+    season.images = images;
+    if let Some(response) = season_raw {
+        documents.push(CapturedDocument {
+            endpoint_path: format!("tv/{tv_id}/season/{}/images", season.season_number),
+            query_string: IMAGE_GALLERY_QUERY_STRING.to_owned(),
+            response,
+        });
+    }
+    if season.id > 0 {
+        let season_id = upstream_id(season.id)?;
+        documents.extend(
+            capture_optional_documents(
+                client,
+                vec![format!("tv/season/{season_id}/changes")],
+            )
+            .await?,
+        );
+    }
+    documents.extend(
+        capture_optional_documents(
+            client,
+            [
+                "account_states",
+                "aggregate_credits",
+                "credits",
+                "external_ids",
+                "translations",
+                "videos",
+                "watch/providers",
+            ]
+            .into_iter()
+            .map(|suffix| format!("tv/{tv_id}/season/{}/{suffix}", season.season_number))
+            .collect(),
+        )
+        .await?,
+    );
     let mut person_cache = HashMap::<u64, TmdbImages>::new();
     for episode in &mut season.episodes {
-        episode.images = optional_gallery(
+        let episode_detail = match client
+            .fetch_episode_with_raw(tv_id, season.season_number, episode.episode_number)
+            .await
+        {
+            Ok((response, _)) => Some(response),
+            Err(TmdbClientError::NotFound) => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(response) = episode_detail {
+            documents.push(CapturedDocument {
+                endpoint_path: format!(
+                    "tv/{tv_id}/season/{}/episode/{}",
+                    season.season_number, episode.episode_number
+                ),
+                query_string: String::new(),
+                response,
+            });
+        }
+        if episode.id > 0 {
+            let episode_id = upstream_id(episode.id)?;
+            documents.extend(
+                capture_optional_documents(
+                    client,
+                    vec![format!("tv/episode/{episode_id}/changes")],
+                )
+                .await?,
+            );
+        }
+        let (episode_raw, images) = optional_gallery_with_raw(
             client
-                .fetch_episode_images(tv_id, season.season_number, episode.episode_number)
+                .fetch_episode_images_with_raw(tv_id, season.season_number, episode.episode_number)
                 .await,
         )?;
+        episode.images = images;
+        if let Some(response) = episode_raw {
+            documents.push(CapturedDocument {
+                endpoint_path: format!(
+                    "tv/{tv_id}/season/{}/episode/{}/images",
+                    season.season_number, episode.episode_number
+                ),
+                query_string: IMAGE_GALLERY_QUERY_STRING.to_owned(),
+                response,
+            });
+        }
+        documents.extend(
+            capture_optional_documents(
+                client,
+                [
+                    "account_states",
+                    "credits",
+                    "external_ids",
+                    "translations",
+                    "videos",
+                ]
+                .into_iter()
+                .map(|suffix| {
+                    format!(
+                        "tv/{tv_id}/season/{}/episode/{}/{}",
+                        season.season_number, episode.episode_number, suffix
+                    )
+                })
+                .collect(),
+            )
+            .await?,
+        );
         hydrate_credit_galleries_with_cache(client, &mut episode.credits, &mut person_cache)
             .await?;
+    }
+    Ok(documents)
+}
+
+async fn persist_documents(
+    database: &PgPool,
+    documents: &[CapturedDocument],
+) -> Result<(), JobExecutionError> {
+    for document in documents {
+        catalog_write::persist_tmdb_document(
+            database,
+            &document.endpoint_path,
+            &document.query_string,
+            &document.response,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -620,7 +1107,7 @@ impl JobExecutor for IngestExecutor {
         let dedup_key = parsed.dedup_key();
         match parsed {
             IngestJob::RefreshMovie { tmdb_id } => {
-                let mut movie = match self.client.fetch_movie(tmdb_id).await {
+                let (movie_raw, mut movie) = match self.client.fetch_movie_with_raw(tmdb_id).await {
                     Ok(movie) => {
                         self.record_upstream_state("ready").await;
                         movie
@@ -647,20 +1134,50 @@ impl JobExecutor for IngestExecutor {
                         return Err(map_upstream_error(&error));
                     }
                 };
-                if let Err(error) =
-                    hydrate_movie_galleries(&self.client, &mut movie, self.allow_local_media).await
+                let movie_documents = match hydrate_movie_galleries(
+                    &self.client,
+                    &mut movie,
+                    &movie_raw,
+                )
+                .await
                 {
-                    self.record_upstream_state("degraded").await;
-                    log_upstream_failure("movie_gallery", "movie", tmdb_id, None, &error);
-                    return Err(map_upstream_error(&error));
-                }
+                    Ok(documents) => documents,
+                    Err(error) => {
+                        self.record_upstream_state("degraded").await;
+                        log_upstream_failure("movie_gallery", "movie", tmdb_id, None, &error);
+                        return Err(map_upstream_error(&error));
+                    }
+                };
                 if let Some(database) = &self.database {
+                    let base_response = match self.client.fetch_movie_base(tmdb_id).await {
+                        Ok(response) => response,
+                        Err(error) => {
+                            self.record_upstream_state("degraded").await;
+                            log_upstream_failure("movie_base", "movie", tmdb_id, None, &error);
+                            return Err(map_upstream_error(&error));
+                        }
+                    };
                     catalog_write::persist_movie_with_options(
                         database,
                         &movie,
                         self.allow_local_media,
                     )
                     .await?;
+                    catalog_write::persist_tmdb_document(
+                        database,
+                        &format!("movie/{}", movie.id),
+                        MOVIE_DETAIL_QUERY_STRING,
+                        &movie_raw,
+                    )
+                    .await?;
+                    catalog_write::persist_tmdb_document(
+                        database,
+                        &format!("movie/{}", movie.id),
+                        "",
+                        &base_response,
+                    )
+                    .await?;
+                    persist_documents(database, &movie_documents).await?;
                 }
                 Ok(serde_json::json!({
                     "media_type":"movie",
@@ -669,7 +1186,7 @@ impl JobExecutor for IngestExecutor {
                 }))
             }
             IngestJob::RefreshTv { tmdb_id } => {
-                let mut series = match self.client.fetch_tv(tmdb_id).await {
+                let (series_raw, mut series) = match self.client.fetch_tv_with_raw(tmdb_id).await {
                     Ok(series) => {
                         self.record_upstream_state("ready").await;
                         series
@@ -696,20 +1213,50 @@ impl JobExecutor for IngestExecutor {
                         return Err(map_upstream_error(&error));
                     }
                 };
-                if let Err(error) =
-                    hydrate_tv_galleries(&self.client, &mut series, self.allow_local_media).await
+                let series_documents = match hydrate_tv_galleries(
+                    &self.client,
+                    &mut series,
+                    &series_raw,
+                )
+                .await
                 {
-                    self.record_upstream_state("degraded").await;
-                    log_upstream_failure("tv_gallery", "tv", tmdb_id, None, &error);
-                    return Err(map_upstream_error(&error));
-                }
+                    Ok(documents) => documents,
+                    Err(error) => {
+                        self.record_upstream_state("degraded").await;
+                        log_upstream_failure("tv_gallery", "tv", tmdb_id, None, &error);
+                        return Err(map_upstream_error(&error));
+                    }
+                };
                 if let Some(database) = &self.database {
+                    let base_response = match self.client.fetch_tv_base(tmdb_id).await {
+                        Ok(response) => response,
+                        Err(error) => {
+                            self.record_upstream_state("degraded").await;
+                            log_upstream_failure("tv_base", "tv", tmdb_id, None, &error);
+                            return Err(map_upstream_error(&error));
+                        }
+                    };
                     catalog_write::persist_tv_with_options(
                         database,
                         &series,
                         self.allow_local_media,
                     )
                     .await?;
+                    catalog_write::persist_tmdb_document(
+                        database,
+                        &format!("tv/{}", series.id),
+                        TV_DETAIL_QUERY_STRING,
+                        &series_raw,
+                    )
+                    .await?;
+                    catalog_write::persist_tmdb_document(
+                        database,
+                        &format!("tv/{}", series.id),
+                        "",
+                        &base_response,
+                    )
+                    .await?;
+                    persist_documents(database, &series_documents).await?;
                 }
                 Ok(serde_json::json!({
                     "media_type":"tv",
@@ -718,31 +1265,45 @@ impl JobExecutor for IngestExecutor {
                 }))
             }
             IngestJob::ChangesSync { media_type, page } => {
-                let change_page = match self.client.fetch_changes(media_type, page).await {
-                    Ok(change_page) => {
-                        self.record_upstream_state("ready").await;
-                        change_page
-                    }
-                    Err(error) => {
-                        self.record_upstream_state("degraded").await;
-                        tracing::warn!(
-                            event = "upstream_request_failed",
-                            operation = "changes_page",
-                            media_type = media_type_name(media_type),
-                            page,
-                            failure_reason = upstream_error_reason(&error),
-                            http_status = upstream_http_status(&error),
-                        );
-                        return Err(map_upstream_error(&error));
-                    }
-                };
+                let (change_raw, change_page) =
+                    match self.client.fetch_changes_with_raw(media_type, page).await {
+                        Ok(change_page) => {
+                            self.record_upstream_state("ready").await;
+                            change_page
+                        }
+                        Err(error) => {
+                            self.record_upstream_state("degraded").await;
+                            tracing::warn!(
+                                event = "upstream_request_failed",
+                                operation = "changes_page",
+                                media_type = media_type_name(media_type),
+                                page,
+                                failure_reason = upstream_error_reason(&error),
+                                http_status = upstream_http_status(&error),
+                            );
+                            return Err(map_upstream_error(&error));
+                        }
+                    };
                 let changed_ids: Vec<u64> = change_page
                     .results
                     .iter()
                     .map(|changed| changed.id)
                     .collect();
                 let detail_refresh_candidates = if let Some(database) = &self.database {
+                    ensure_refresh_queue_capacity(
+                        database,
+                        changed_ids.len(),
+                        "changes_queue_full",
+                    )
+                    .await?;
                     catalog_write::persist_changes(database, media_type, &change_page).await?;
+                    catalog_write::persist_tmdb_document(
+                        database,
+                        &format!("{media_type}/changes"),
+                        &format!("page={page}"),
+                        &change_raw,
+                    )
+                    .await?;
                     let detail_refresh_candidates =
                         enqueue_refresh_jobs(database, media_type, &changed_ids).await?;
                     if change_page.total_pages > page {
@@ -756,6 +1317,7 @@ impl JobExecutor for IngestExecutor {
                             }),
                             &format!("{CHANGES_SYNC_JOB}:{media_type}:{next_page}"),
                         )
+                        .and_then(|job| job.with_max_attempts(100))
                         .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
                         JobRepository::new(database.clone())
                             .submit(next_job)
@@ -785,7 +1347,11 @@ impl JobExecutor for IngestExecutor {
                 tv_id,
                 season_number,
             } => {
-                let mut season = match self.client.fetch_season(tv_id, season_number).await {
+                let (season_raw, mut season) = match self
+                    .client
+                    .fetch_season_with_raw(tv_id, season_number)
+                    .await
+                {
                     Ok(season) => {
                         self.record_upstream_state("ready").await;
                         season
@@ -820,24 +1386,21 @@ impl JobExecutor for IngestExecutor {
                         return Err(map_upstream_error(&error));
                     }
                 };
-                if let Err(error) = hydrate_season_galleries(
-                    &self.client,
-                    tv_id,
-                    &mut season,
-                    self.allow_local_media,
-                )
-                .await
-                {
-                    self.record_upstream_state("degraded").await;
-                    log_upstream_failure(
-                        "season_gallery",
-                        "tv",
-                        tv_id,
-                        Some(season_number),
-                        &error,
-                    );
-                    return Err(map_upstream_error(&error));
-                }
+                let season_documents =
+                    match hydrate_season_galleries(&self.client, tv_id, &mut season).await {
+                        Ok(documents) => documents,
+                        Err(error) => {
+                            self.record_upstream_state("degraded").await;
+                            log_upstream_failure(
+                                "season_gallery",
+                                "tv",
+                                tv_id,
+                                Some(season_number),
+                                &error,
+                            );
+                            return Err(map_upstream_error(&error));
+                        }
+                    };
                 if let Some(database) = &self.database {
                     catalog_write::persist_season_with_options(
                         database,
@@ -846,6 +1409,14 @@ impl JobExecutor for IngestExecutor {
                         self.allow_local_media,
                     )
                     .await?;
+                    catalog_write::persist_tmdb_document(
+                        database,
+                        &format!("tv/{tv_id}/season/{season_number}"),
+                        "",
+                        &season_raw,
+                    )
+                    .await?;
+                    persist_documents(database, &season_documents).await?;
                 }
                 Ok(serde_json::json!({
                     "media_type":"tv",
@@ -855,43 +1426,63 @@ impl JobExecutor for IngestExecutor {
                     "dedup_key":dedup_key
                 }))
             }
-            IngestJob::DailyExport { media_type, url } => {
+            IngestJob::DailyExport {
+                media_type,
+                url,
+                offset,
+                refresh_all,
+            } => {
                 let digest = Sha256::digest(url.as_bytes());
                 let destination = self
                     .export_root
                     .join(format!("{media_type}-{digest:x}.ndjson.gz"));
+                let ids_destination = destination.with_extension("ids");
                 tokio::fs::create_dir_all(&self.export_root)
                     .await
                     .map_err(|_| {
                         JobExecutionError::retry("export_storage", Duration::from_secs(30))
                     })?;
-                let download = match self
-                    .client
-                    .fetch_daily_export_to_file(&url, &destination, self.export_max_bytes)
-                    .await
-                {
-                    Ok(download) => {
-                        self.record_upstream_state("ready").await;
-                        download
-                    }
-                    Err(error) => {
-                        self.record_upstream_state("degraded").await;
-                        tracing::warn!(
-                            event = "upstream_request_failed",
-                            operation = "daily_export",
-                            media_type = media_type_name(media_type),
-                            failure_reason = upstream_error_reason(&error),
-                            http_status = upstream_http_status(&error),
-                        );
-                        return Err(map_upstream_error(&error));
+                let download = if tokio::fs::try_exists(&destination).await.map_err(|_| {
+                    JobExecutionError::retry("export_storage", Duration::from_secs(30))
+                })? {
+                    None
+                } else {
+                    match self
+                        .client
+                        .fetch_daily_export_to_file(&url, &destination, self.export_max_bytes)
+                        .await
+                    {
+                        Ok(download) => {
+                            self.record_upstream_state("ready").await;
+                            Some(download)
+                        }
+                        Err(error) => {
+                            self.record_upstream_state("degraded").await;
+                            tracing::warn!(
+                                event = "upstream_request_failed",
+                                operation = "daily_export",
+                                media_type = media_type_name(media_type),
+                                failure_reason = upstream_error_reason(&error),
+                                http_status = upstream_http_status(&error),
+                            );
+                            return Err(map_upstream_error(&error));
+                        }
                     }
                 };
                 let queue_summary = if let Some(database) = &self.database {
+                    ensure_export_id_file(
+                        self.export_parser,
+                        destination.clone(),
+                        ids_destination.clone(),
+                    )
+                    .await?;
                     enqueue_daily_export_refresh_jobs(
                         database,
                         media_type,
-                        self.export_parser,
-                        destination,
+                        ids_destination,
+                        &url,
+                        offset,
+                        refresh_all,
                     )
                     .await?
                 } else {
@@ -906,15 +1497,58 @@ impl JobExecutor for IngestExecutor {
                     ExportQueueSummary {
                         records,
                         detail_refresh_candidates: 0,
+                        continued: false,
+                        next_offset: None,
                     }
                 };
                 Ok(serde_json::json!({
                     "media_type": media_type,
                     "records": queue_summary.records,
                     "detail_refresh_candidates": queue_summary.detail_refresh_candidates,
+                    "continued": queue_summary.continued,
+                    "next_offset": queue_summary.next_offset,
                     "dedup_key": dedup_key,
-                    "bytes": download.bytes,
-                    "sha256": hex_digest(&download.sha256)
+                    "bytes": download.as_ref().map_or(0, |download| download.bytes),
+                    "sha256": download.as_ref().map(|download| hex_digest(&download.sha256))
+                }))
+            }
+            IngestJob::Configuration => {
+                let response = match self.client.fetch_configuration().await {
+                    Ok(response) => {
+                        self.record_upstream_state("ready").await;
+                        response
+                    }
+                    Err(error) => {
+                        self.record_upstream_state("degraded").await;
+                        log_upstream_failure("configuration", "configuration", 0, None, &error);
+                        return Err(map_upstream_error(&error));
+                    }
+                };
+                let related_documents = match capture_optional_documents(
+                    &self.client,
+                    GLOBAL_DOCUMENT_PATHS
+                        .iter()
+                        .map(|path| (*path).to_owned())
+                        .collect(),
+                )
+                .await
+                {
+                    Ok(documents) => documents,
+                    Err(error) => {
+                        self.record_upstream_state("degraded").await;
+                        log_upstream_failure("global_documents", "configuration", 0, None, &error);
+                        return Err(map_upstream_error(&error));
+                    }
+                };
+                if let Some(database) = &self.database {
+                    catalog_write::persist_tmdb_document(database, "configuration", "", &response)
+                        .await?;
+                    persist_documents(database, &related_documents).await?;
+                }
+                Ok(serde_json::json!({
+                    "endpoint": "configuration",
+                    "related_documents": related_documents.len(),
+                    "dedup_key": dedup_key
                 }))
             }
             IngestJob::Trending {
@@ -927,7 +1561,11 @@ impl JobExecutor for IngestExecutor {
                         Duration::from_secs(5),
                     ));
                 };
-                let trend_page = match self.client.fetch_trending(media_type, &trend_window).await {
+                let (trend_raw, trend_page) = match self
+                    .client
+                    .fetch_trending_with_raw(media_type, &trend_window)
+                    .await
+                {
                     Ok(page) => {
                         self.record_upstream_state("ready").await;
                         page
@@ -948,6 +1586,13 @@ impl JobExecutor for IngestExecutor {
                 let persisted =
                     persist_trending(database, media_type, &trend_window, &trend_page.results)
                         .await?;
+                catalog_write::persist_tmdb_document(
+                    database,
+                    &format!("trending/{media_type}/{trend_window}"),
+                    "",
+                    &trend_raw,
+                )
+                .await?;
                 Ok(serde_json::json!({
                     "media_type": media_type,
                     "trend_window": trend_window,
@@ -960,32 +1605,24 @@ impl JobExecutor for IngestExecutor {
                 entity_type,
                 tmdb_id,
             } => {
-                if !self.allow_local_media {
-                    return Ok(serde_json::json!({
-                        "entity_type": entity_type,
-                        "tmdb_id": tmdb_id,
-                        "skipped": "local_media_disabled",
-                        "dedup_key": dedup_key
-                    }));
-                }
-                let images = match fetch_reusable_gallery(&self.client, entity_type, tmdb_id).await
-                {
-                    Ok(images) => {
-                        self.record_upstream_state("ready").await;
-                        images
-                    }
-                    Err(error) => {
-                        self.record_upstream_state("degraded").await;
-                        log_upstream_failure(
-                            "reusable_gallery",
-                            entity_type.as_str(),
-                            tmdb_id,
-                            None,
-                            &error,
-                        );
-                        return Err(map_upstream_error(&error));
-                    }
-                };
+                let (images, documents) =
+                    match fetch_reusable_gallery(&self.client, entity_type, tmdb_id).await {
+                        Ok(images) => {
+                            self.record_upstream_state("ready").await;
+                            images
+                        }
+                        Err(error) => {
+                            self.record_upstream_state("degraded").await;
+                            log_upstream_failure(
+                                "reusable_gallery",
+                                entity_type.as_str(),
+                                tmdb_id,
+                                None,
+                                &error,
+                            );
+                            return Err(map_upstream_error(&error));
+                        }
+                    };
                 if let Some(database) = &self.database {
                     catalog_write::enqueue_reusable_gallery(
                         database,
@@ -995,6 +1632,7 @@ impl JobExecutor for IngestExecutor {
                         self.allow_local_media,
                     )
                     .await?;
+                    persist_documents(database, &documents).await?;
                 }
                 Ok(serde_json::json!({
                     "entity_type": entity_type,
@@ -1011,6 +1649,7 @@ impl JobExecutor for IngestExecutor {
                 mode,
                 repair,
                 step,
+                cursor,
             } => {
                 let Some(database) = &self.database else {
                     return Err(JobExecutionError::retry(
@@ -1018,24 +1657,85 @@ impl JobExecutor for IngestExecutor {
                         Duration::from_secs(5),
                     ));
                 };
-                execute_media_scan(database, run_id, mode, repair, step, self.allow_local_media)
-                    .await
+                execute_media_scan(
+                    database,
+                    run_id,
+                    mode,
+                    repair,
+                    step,
+                    cursor,
+                    self.allow_local_media,
+                )
+                .await
             }
-            IngestJob::AdminScan { mode, media_types } => {
+            IngestJob::AdminScan {
+                mode,
+                media_types,
+                cursor,
+            } => {
                 let Some(database) = &self.database else {
                     return Err(JobExecutionError::retry(
                         "database_unavailable",
                         Duration::from_secs(5),
                     ));
                 };
+                if !matches!(mode, AdminScanMode::MissingOnly) && cursor != 0 {
+                    return Err(JobExecutionError::dead_letter("invalid_payload"));
+                }
+                let mut jobs_pruned = 0_i32;
                 let queued = match mode {
-                    AdminScanMode::Full => {
+                    AdminScanMode::FullSweep => {
                         let export_date = Utc::now()
                             .date_naive()
                             .checked_sub_days(Days::new(1))
                             .ok_or_else(|| JobExecutionError::dead_letter("invalid_payload"))?;
                         let mut queued = 0_usize;
+                        let configuration = NewJob::new(
+                            CONFIGURATION_JOB,
+                            INGEST_PAYLOAD_VERSION,
+                            serde_json::json!({}),
+                            CONFIGURATION_JOB,
+                        )
+                        .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+                        if !JobRepository::new(database.clone())
+                            .submit(configuration)
+                            .await
+                            .map_err(|_| {
+                                JobExecutionError::retry(
+                                    "database_unavailable",
+                                    Duration::from_secs(5),
+                                )
+                            })?
+                            .was_duplicate()
+                        {
+                            queued = queued.saturating_add(1);
+                        }
                         for &media_type in &media_types {
+                            for trend_window in ["day", "week"] {
+                                let job = NewJob::new(
+                                    TRENDING_REFRESH_JOB,
+                                    INGEST_PAYLOAD_VERSION,
+                                    serde_json::json!({
+                                        "media_type": media_type,
+                                        "trend_window": trend_window
+                                    }),
+                                    &format!("{TRENDING_REFRESH_JOB}:{media_type}:{trend_window}"),
+                                )
+                                .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+                                if !JobRepository::new(database.clone())
+                                    .submit(job)
+                                    .await
+                                    .map_err(|_| {
+                                        JobExecutionError::retry(
+                                            "database_unavailable",
+                                            Duration::from_secs(5),
+                                        )
+                                    })?
+                                    .was_duplicate()
+                                {
+                                    queued = queued.saturating_add(1);
+                                }
+                            }
                             let job = full_export_job(media_type, export_date)?;
                             if !JobRepository::new(database.clone())
                                 .submit(job)
@@ -1053,7 +1753,7 @@ impl JobExecutor for IngestExecutor {
                         }
                         queued
                     }
-                    AdminScanMode::Changes => {
+                    AdminScanMode::DailySync => {
                         let mut queued = 0_usize;
                         for media_type in &media_types {
                             let job = NewJob::new(
@@ -1079,14 +1779,106 @@ impl JobExecutor for IngestExecutor {
                         }
                         queued
                     }
-                    AdminScanMode::Missing => {
-                        enqueue_missing_catalog_refresh_jobs(database, &media_types).await?
+                    AdminScanMode::PruneCleanup => {
+                        let export_date = Utc::now()
+                            .date_naive()
+                            .checked_sub_days(Days::new(1))
+                            .ok_or_else(|| JobExecutionError::dead_letter("invalid_payload"))?;
+                        let mut deleted = 0_usize;
+                        for &media_type in &media_types {
+                            let (media_type_name, file_prefix) = match media_type {
+                                MediaType::Movie => ("movie", "movie_ids"),
+                                MediaType::Tv => ("tv", "tv_series_ids"),
+                            };
+                            let date_text = export_date.format("%m_%d_%Y").to_string();
+                            let url = format!(
+                                "https://files.tmdb.org/p/exports/{file_prefix}_{date_text}.json.gz"
+                            );
+                            let digest = Sha256::digest(url.as_bytes());
+                            let destination = self
+                                .export_root
+                                .join(format!("{media_type}-{digest:x}.ndjson.gz"));
+                            let ids_destination = destination.with_extension("ids");
+                            tokio::fs::create_dir_all(&self.export_root)
+                                .await
+                                .map_err(|_| {
+                                    JobExecutionError::retry(
+                                        "export_storage",
+                                        Duration::from_secs(30),
+                                    )
+                                })?;
+                            if !tokio::fs::try_exists(&destination).await.map_err(|_| {
+                                JobExecutionError::retry("export_storage", Duration::from_secs(30))
+                            })? {
+                                match self
+                                    .client
+                                    .fetch_daily_export_to_file(
+                                        &url,
+                                        &destination,
+                                        self.export_max_bytes,
+                                    )
+                                    .await
+                                {
+                                    Ok(_) => self.record_upstream_state("ready").await,
+                                    Err(error) => {
+                                        self.record_upstream_state("degraded").await;
+                                        tracing::warn!(
+                                            event = "upstream_request_failed",
+                                            operation = "prune_export",
+                                            media_type = media_type_name,
+                                            failure_reason = upstream_error_reason(&error),
+                                            http_status = upstream_http_status(&error),
+                                        );
+                                        return Err(map_upstream_error(&error));
+                                    }
+                                }
+                            }
+                            ensure_export_id_file(
+                                self.export_parser,
+                                destination,
+                                ids_destination.clone(),
+                            )
+                            .await?;
+                            let removed =
+                                prune_catalog_titles(database, media_type, ids_destination).await?;
+                            deleted = deleted.saturating_add(removed);
+                        }
+                        jobs_pruned = sqlx::query_scalar("SELECT ops.prune_finished_jobs($1, $2)")
+                            .bind(Utc::now() - ChronoDuration::days(30))
+                            .bind(10_000_i32)
+                            .fetch_one(database)
+                            .await
+                            .map_err(|_| {
+                                JobExecutionError::retry(
+                                    "database_unavailable",
+                                    Duration::from_secs(5),
+                                )
+                            })?;
+                        deleted
+                    }
+                    AdminScanMode::MissingOnly => {
+                        let batch =
+                            enqueue_missing_catalog_refresh_batch(database, &media_types, cursor)
+                                .await?;
+                        if !batch.done {
+                            let continuation =
+                                admin_scan_job(mode, &media_types, batch.next_cursor)?;
+                            JobRepository::new(database.clone())
+                                .submit(continuation)
+                                .await
+                                .map_err(map_submission_error)?;
+                        }
+                        batch.queued
                     }
                 };
                 Ok(serde_json::json!({
                     "mode": mode,
                     "media_types": media_types,
                     "queued": queued,
+                    "deleted": (matches!(mode, AdminScanMode::PruneCleanup)).then_some(queued),
+                    "jobs_pruned": (matches!(mode, AdminScanMode::PruneCleanup))
+                        .then_some(jobs_pruned),
+                    "cursor": cursor,
                     "dedup_key": dedup_key
                 }))
             }
@@ -1127,10 +1919,13 @@ fn full_export_job(
         INGEST_PAYLOAD_VERSION,
         serde_json::json!({
             "media_type": media_type_name,
-            "url": format!("https://files.tmdb.org/p/exports/{file_prefix}_{date_text}.json.gz")
+            "url": format!("https://files.tmdb.org/p/exports/{file_prefix}_{date_text}.json.gz"),
+            "offset": 0,
+            "refresh_all": true
         }),
-        &format!("{DAILY_EXPORT_JOB}:{media_type_name}:{date_text}"),
+        &format!("{DAILY_EXPORT_JOB}:{media_type_name}:{date_text}:0"),
     )
+    .and_then(|job| job.with_max_attempts(100))
     .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))
 }
 
@@ -1151,6 +1946,7 @@ async fn execute_media_scan(
     mode: MediaScanMode,
     repair: bool,
     step: u32,
+    cursor: u64,
     allow_local_media: bool,
 ) -> Result<Value, JobExecutionError> {
     let Some(run) = sqlx::query_as::<_, MediaScanState>(
@@ -1188,46 +1984,70 @@ async fn execute_media_scan(
 
     match (mode, run.phase.as_str()) {
         (MediaScanMode::Full | MediaScanMode::Missing, "queued") => {
-            let catalog_mode = match mode {
-                MediaScanMode::Full => "full",
-                MediaScanMode::Missing => "missing",
-                MediaScanMode::Audit => unreachable!(),
-            };
-            let queued = enqueue_catalog_scan(database, run_id, catalog_mode).await?;
+            let queued = enqueue_catalog_scan(database, run_id, catalog_scan_mode(mode)).await?;
             add_scan_queued_count(database, run_id, queued).await?;
             set_media_scan_phase(database, run_id, "catalog").await?;
-            queue_media_scan_followup(database, run_id, mode, repair, step).await?;
+            queue_media_scan_followup(database, run_id, mode, repair, step, 0).await?;
         }
         (MediaScanMode::Audit, "queued") => {
             let queued = enqueue_media_audit(database, run_id, repair).await?;
             add_scan_queued_count(database, run_id, queued).await?;
             set_media_scan_phase(database, run_id, "audit").await?;
-            queue_media_scan_followup(database, run_id, mode, repair, step).await?;
+            queue_media_scan_followup(database, run_id, mode, repair, step, cursor).await?;
         }
         (MediaScanMode::Full | MediaScanMode::Missing, "catalog") => {
             if catalog_scan_pending(database, run_id, run.requested_at).await? {
-                queue_media_scan_followup(database, run_id, mode, repair, step).await?;
+                queue_media_scan_followup(database, run_id, mode, repair, step, cursor).await?;
             } else {
-                let queued = match mode {
-                    MediaScanMode::Full => enqueue_full_media_jobs(database, run_id).await?,
-                    MediaScanMode::Missing => enqueue_missing_media_jobs(database, run_id).await?,
-                    MediaScanMode::Audit => unreachable!(),
-                };
+                let mut queued = 0_usize;
+                if mode == MediaScanMode::Missing {
+                    queued =
+                        queued.saturating_add(enqueue_media_audit(database, run_id, true).await?);
+                }
+                let batch = enqueue_media_work_batch(
+                    database,
+                    run_id,
+                    cursor,
+                    mode == MediaScanMode::Missing,
+                )
+                .await?;
+                queued = queued.saturating_add(batch.queued);
                 add_scan_queued_count(database, run_id, queued).await?;
                 set_media_scan_phase(database, run_id, "media").await?;
-                queue_media_scan_followup(database, run_id, mode, repair, step).await?;
+                queue_media_scan_followup(database, run_id, mode, repair, step, batch.next_cursor)
+                    .await?;
             }
         }
         (MediaScanMode::Full | MediaScanMode::Missing, "media") => {
             if media_scan_pending(database, run_id, run.requested_at).await? {
-                queue_media_scan_followup(database, run_id, mode, repair, step).await?;
+                queue_media_scan_followup(database, run_id, mode, repair, step, cursor).await?;
             } else {
-                finish_media_scan(database, run_id, true, None).await?;
+                let batch = enqueue_media_work_batch(
+                    database,
+                    run_id,
+                    cursor,
+                    mode == MediaScanMode::Missing,
+                )
+                .await?;
+                add_scan_queued_count(database, run_id, batch.queued).await?;
+                if batch.done {
+                    finish_media_scan(database, run_id, true, None).await?;
+                } else {
+                    queue_media_scan_followup(
+                        database,
+                        run_id,
+                        mode,
+                        repair,
+                        step,
+                        batch.next_cursor,
+                    )
+                    .await?;
+                }
             }
         }
         (MediaScanMode::Audit, "audit") => {
             if audit_scan_pending(database, run_id).await? {
-                queue_media_scan_followup(database, run_id, mode, repair, step).await?;
+                queue_media_scan_followup(database, run_id, mode, repair, step, cursor).await?;
             } else {
                 finish_media_scan(database, run_id, true, None).await?;
             }
@@ -1250,10 +2070,18 @@ fn media_scan_mode_name(mode: MediaScanMode) -> &'static str {
     }
 }
 
+fn catalog_scan_mode(mode: MediaScanMode) -> AdminScanMode {
+    match mode {
+        MediaScanMode::Full => AdminScanMode::FullSweep,
+        MediaScanMode::Missing => AdminScanMode::MissingOnly,
+        MediaScanMode::Audit => unreachable!(),
+    }
+}
+
 async fn enqueue_catalog_scan(
     database: &PgPool,
     run_id: Uuid,
-    mode: &str,
+    mode: AdminScanMode,
 ) -> Result<usize, JobExecutionError> {
     let job = NewJob::new(
         ADMIN_SCAN_JOB,
@@ -1288,6 +2116,7 @@ async fn queue_media_scan_followup(
     mode: MediaScanMode,
     repair: bool,
     step: u32,
+    cursor: u64,
 ) -> Result<(), JobExecutionError> {
     let next_step = step
         .checked_add(1)
@@ -1299,7 +2128,8 @@ async fn queue_media_scan_followup(
             "runId": run_id,
             "mode": mode,
             "repair": repair,
-            "step": next_step
+            "step": next_step,
+            "cursor": cursor
         }),
         &format!("{ADMIN_MEDIA_SCAN_JOB}:{run_id}:{next_step}"),
     )
@@ -1559,300 +2389,413 @@ async fn finish_media_scan(
     Ok(())
 }
 
-async fn enqueue_full_media_jobs(
-    database: &PgPool,
-    run_id: Uuid,
-) -> Result<usize, JobExecutionError> {
-    let mut queued = 0_usize;
-    let titles: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT media_type, tmdb_id
-           FROM catalog.titles
-          WHERE active
-          ORDER BY id",
-    )
-    .fetch_all(database)
-    .await
-    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
-    for (media_type, tmdb_id) in titles {
-        let (job_type, payload_type) = match media_type.as_str() {
-            "movie" => (REFRESH_MOVIE_JOB, "movie"),
-            "tv" => (REFRESH_TV_JOB, "tv"),
-            _ => return Err(JobExecutionError::dead_letter("invalid_payload")),
-        };
-        let job = NewJob::new(
-            job_type,
-            INGEST_PAYLOAD_VERSION,
-            serde_json::json!({"tmdb_id": tmdb_id}),
-            &format!("media-scan:{run_id}:{payload_type}:{tmdb_id}"),
-        )
-        .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
-        if submit_and_link_scan_job(database, run_id, "media", job).await? {
-            queued = queued.saturating_add(1);
-        }
-    }
+const MEDIA_WORK_BATCH_SIZE: i64 = 500;
 
-    let seasons: Vec<(i64, i32)> = sqlx::query_as(
-        "SELECT title.tmdb_id, season.season_number
-           FROM catalog.seasons AS season
-           JOIN catalog.titles AS title ON title.id = season.title_id
-          WHERE title.active
-          ORDER BY season.id",
-    )
-    .fetch_all(database)
-    .await
-    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
-    for (tv_id, season_number) in seasons {
-        let season_number = u16::try_from(season_number)
-            .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
-        let job = NewJob::new(
-            REFRESH_SEASON_JOB,
-            INGEST_PAYLOAD_VERSION,
-            serde_json::json!({"tv_id": tv_id, "season_number": season_number}),
-            &format!("media-scan:{run_id}:season:{tv_id}:{season_number}"),
-        )
-        .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
-        if submit_and_link_scan_job(database, run_id, "media", job).await? {
-            queued = queued.saturating_add(1);
-        }
-    }
-    for (entity_type, query) in [
-        ("person", "SELECT id FROM catalog.people ORDER BY id"),
-        ("company", "SELECT id FROM catalog.companies ORDER BY id"),
-        ("network", "SELECT id FROM catalog.networks ORDER BY id"),
-        (
-            "collection",
-            "SELECT id FROM catalog.collections ORDER BY id",
-        ),
-    ] {
-        queued = queued
-            .saturating_add(enqueue_reusable_jobs(database, run_id, entity_type, query).await?);
-    }
-    Ok(queued)
+#[derive(Debug, FromRow)]
+struct MediaWorkRow {
+    kind: i16,
+    media_type: Option<String>,
+    tmdb_id: Option<i64>,
+    season_number: Option<i32>,
+    entity_type: Option<String>,
+    entity_id: Option<i64>,
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "missing-media discovery keeps the title, season, episode, and reusable-entity queries together"
-)]
-async fn enqueue_missing_media_jobs(
-    database: &PgPool,
-    run_id: Uuid,
-) -> Result<usize, JobExecutionError> {
-    let mut queued = enqueue_media_audit(database, run_id, true).await?;
-    let titles: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT title.media_type, title.tmdb_id
-           FROM catalog.titles AS title
-          WHERE title.active
-            AND NOT EXISTS (
-                SELECT 1
-                  FROM assets.image_assets AS asset
-                 WHERE asset.title_id = title.id
-                   AND asset.image_kind = 'poster'
-                   AND asset.status = 'ready'
-            )
-          ORDER BY title.id",
-    )
-    .fetch_all(database)
-    .await
-    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
-    for (media_type, tmdb_id) in titles {
-        let (job_type, payload_type) = match media_type.as_str() {
-            "movie" => (REFRESH_MOVIE_JOB, "movie"),
-            "tv" => (REFRESH_TV_JOB, "tv"),
-            _ => return Err(JobExecutionError::dead_letter("invalid_payload")),
-        };
-        let job = NewJob::new(
-            job_type,
-            INGEST_PAYLOAD_VERSION,
-            serde_json::json!({"tmdb_id": tmdb_id}),
-            &format!("media-scan:{run_id}:missing:{payload_type}:{tmdb_id}"),
-        )
-        .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
-        if submit_and_link_scan_job(database, run_id, "media", job).await? {
-            queued = queued.saturating_add(1);
-        }
-    }
-
-    let seasons: Vec<(i64, i32)> = sqlx::query_as(
-        "SELECT title.tmdb_id, season.season_number
-           FROM catalog.seasons AS season
-           JOIN catalog.titles AS title ON title.id = season.title_id
-          WHERE title.active
-            AND (
-                NOT EXISTS (
-                    SELECT 1
-                      FROM assets.image_assets AS asset
-                     WHERE asset.season_id = season.id
-                       AND asset.image_kind = 'poster'
-                       AND asset.status = 'ready'
-                )
-                OR EXISTS (
-                    SELECT 1
-                      FROM catalog.episodes AS episode
-                     WHERE episode.season_id = season.id
-                       AND NOT EXISTS (
-                           SELECT 1
-                             FROM assets.image_assets AS asset
-                            WHERE asset.episode_id = episode.id
-                              AND asset.image_kind = 'still'
-                              AND asset.status = 'ready'
-                       )
-                )
-            )
-          ORDER BY season.id",
-    )
-    .fetch_all(database)
-    .await
-    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
-    for (tv_id, season_number) in seasons {
-        let season_number = u16::try_from(season_number)
-            .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
-        let job = NewJob::new(
-            REFRESH_SEASON_JOB,
-            INGEST_PAYLOAD_VERSION,
-            serde_json::json!({"tv_id": tv_id, "season_number": season_number}),
-            &format!("media-scan:{run_id}:missing:season:{tv_id}:{season_number}"),
-        )
-        .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
-        if submit_and_link_scan_job(database, run_id, "media", job).await? {
-            queued = queued.saturating_add(1);
-        }
-    }
-    for (entity_type, query) in [
-        (
-            "person",
-            "SELECT person.id
-               FROM catalog.people AS person
-              WHERE NOT EXISTS (
-                  SELECT 1 FROM assets.image_assets AS asset
-                   WHERE asset.person_id = person.id
-                     AND asset.image_kind = 'profile'
-                     AND asset.status = 'ready'
-              )
-              ORDER BY person.id",
-        ),
-        (
-            "company",
-            "SELECT company.id
-               FROM catalog.companies AS company
-              WHERE NOT EXISTS (
-                  SELECT 1 FROM assets.image_assets AS asset
-                   WHERE asset.company_id = company.id
-                     AND asset.image_kind = 'logo'
-                     AND asset.status = 'ready'
-              )
-              ORDER BY company.id",
-        ),
-        (
-            "network",
-            "SELECT network.id
-               FROM catalog.networks AS network
-              WHERE NOT EXISTS (
-                  SELECT 1 FROM assets.image_assets AS asset
-                   WHERE asset.network_id = network.id
-                     AND asset.image_kind = 'logo'
-                     AND asset.status = 'ready'
-              )
-              ORDER BY network.id",
-        ),
-        (
-            "collection",
-            "SELECT collection.id
-               FROM catalog.collections AS collection
-              WHERE NOT EXISTS (
-                  SELECT 1 FROM assets.image_assets AS asset
-                   WHERE asset.collection_id = collection.id
-                     AND asset.image_kind IN ('poster', 'backdrop')
-                     AND asset.status = 'ready'
-              )
-              ORDER BY collection.id",
-        ),
-    ] {
-        queued = queued
-            .saturating_add(enqueue_reusable_jobs(database, run_id, entity_type, query).await?);
-    }
-    Ok(queued)
+struct MediaWorkBatch {
+    queued: usize,
+    next_cursor: u64,
+    done: bool,
 }
 
-async fn enqueue_reusable_jobs(
+async fn enqueue_media_work_batch(
     database: &PgPool,
     run_id: Uuid,
-    entity_type: &str,
-    query: &'static str,
-) -> Result<usize, JobExecutionError> {
-    let ids: Vec<i64> = sqlx::query_scalar(query)
+    cursor: u64,
+    missing_only: bool,
+) -> Result<MediaWorkBatch, JobExecutionError> {
+    let sql_cursor =
+        i64::try_from(cursor).map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+    let title_filter = if missing_only {
+        "AND NOT EXISTS (
+             SELECT 1 FROM assets.image_assets AS asset
+              WHERE asset.title_id = title.id
+                AND asset.image_kind = 'poster'
+                AND asset.status = 'ready'
+         )"
+    } else {
+        ""
+    };
+    let season_filter = if missing_only {
+        "AND (
+             NOT EXISTS (
+                 SELECT 1 FROM assets.image_assets AS asset
+                  WHERE asset.season_id = season.id
+                    AND asset.image_kind = 'poster'
+                    AND asset.status = 'ready'
+             )
+             OR EXISTS (
+                 SELECT 1 FROM catalog.episodes AS episode
+                  WHERE episode.season_id = season.id
+                    AND NOT EXISTS (
+                        SELECT 1 FROM assets.image_assets AS asset
+                         WHERE asset.episode_id = episode.id
+                           AND asset.image_kind = 'still'
+                           AND asset.status = 'ready'
+                    )
+             )
+         )"
+    } else {
+        ""
+    };
+    let reusable_filter = if missing_only {
+        "AND NOT EXISTS (
+             SELECT 1 FROM assets.image_assets AS asset
+              WHERE asset.person_id = person.id
+                AND asset.image_kind = 'profile'
+                AND asset.status = 'ready'
+         )"
+    } else {
+        ""
+    };
+    let company_filter = if missing_only {
+        "AND NOT EXISTS (
+             SELECT 1 FROM assets.image_assets AS asset
+              WHERE asset.company_id = company.id
+                AND asset.image_kind = 'logo'
+                AND asset.status = 'ready'
+         )"
+    } else {
+        ""
+    };
+    let network_filter = if missing_only {
+        "AND NOT EXISTS (
+             SELECT 1 FROM assets.image_assets AS asset
+              WHERE asset.network_id = network.id
+                AND asset.image_kind = 'logo'
+                AND asset.status = 'ready'
+         )"
+    } else {
+        ""
+    };
+    let collection_filter = if missing_only {
+        "AND NOT EXISTS (
+             SELECT 1 FROM assets.image_assets AS asset
+              WHERE asset.collection_id = collection.id
+                AND asset.image_kind IN ('poster', 'backdrop')
+                AND asset.status = 'ready'
+         )"
+    } else {
+        ""
+    };
+    let query = format!(
+        "SELECT kind, media_type, tmdb_id, season_number, entity_type, entity_id
+           FROM (
+                SELECT 0::smallint AS kind, title.media_type, title.tmdb_id,
+                       NULL::integer AS season_number, NULL::text AS entity_type,
+                       NULL::bigint AS entity_id, title.id AS sort_id
+                  FROM catalog.titles AS title
+                 WHERE title.active {title_filter}
+                UNION ALL
+                SELECT 1::smallint, 'tv', title.tmdb_id, season.season_number,
+                       NULL::text, NULL::bigint, season.id
+                  FROM catalog.seasons AS season
+                  JOIN catalog.titles AS title ON title.id = season.title_id
+                 WHERE title.active {season_filter}
+                UNION ALL
+                SELECT 2::smallint, NULL::text, NULL::bigint, NULL::integer,
+                       'person', person.id, person.id
+                  FROM catalog.people AS person
+                 WHERE true {reusable_filter}
+                UNION ALL
+                SELECT 3::smallint, NULL::text, NULL::bigint, NULL::integer,
+                       'company', company.id, company.id
+                  FROM catalog.companies AS company
+                 WHERE true {company_filter}
+                UNION ALL
+                SELECT 4::smallint, NULL::text, NULL::bigint, NULL::integer,
+                       'network', network.id, network.id
+                  FROM catalog.networks AS network
+                 WHERE true {network_filter}
+                UNION ALL
+                SELECT 5::smallint, NULL::text, NULL::bigint, NULL::integer,
+                       'collection', collection.id, collection.id
+                  FROM catalog.collections AS collection
+                 WHERE true {collection_filter}
+           ) AS work
+          ORDER BY kind, sort_id
+          OFFSET $1 LIMIT $2"
+    );
+    let rows: Vec<MediaWorkRow> = sqlx::query_as(sqlx::AssertSqlSafe(query.as_str()))
+        .bind(sql_cursor)
+        .bind(MEDIA_WORK_BATCH_SIZE + 1)
         .fetch_all(database)
         .await
         .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    let done = rows.len() <= usize::try_from(MEDIA_WORK_BATCH_SIZE).unwrap_or(usize::MAX);
+    let rows = rows
+        .into_iter()
+        .take(usize::try_from(MEDIA_WORK_BATCH_SIZE).unwrap_or(usize::MAX))
+        .collect::<Vec<_>>();
     let mut queued = 0_usize;
-    for tmdb_id in ids {
-        if tmdb_id <= 0 {
+    for row in &rows {
+        let (job_type, payload, dedup_key) = match row.kind {
+            0 => {
+                let media_type = row
+                    .media_type
+                    .as_deref()
+                    .ok_or_else(|| JobExecutionError::dead_letter("invalid_payload"))?;
+                let tmdb_id = row
+                    .tmdb_id
+                    .ok_or_else(|| JobExecutionError::dead_letter("invalid_payload"))?;
+                let job_type = match media_type {
+                    "movie" => REFRESH_MOVIE_JOB,
+                    "tv" => REFRESH_TV_JOB,
+                    _ => return Err(JobExecutionError::dead_letter("invalid_payload")),
+                };
+                (
+                    job_type,
+                    serde_json::json!({"tmdb_id": tmdb_id}),
+                    format!("{job_type}:{tmdb_id}"),
+                )
+            }
+            1 => {
+                let tmdb_id = row
+                    .tmdb_id
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| JobExecutionError::dead_letter("invalid_payload"))?;
+                let season_number = row
+                    .season_number
+                    .and_then(|value| u16::try_from(value).ok())
+                    .ok_or_else(|| JobExecutionError::dead_letter("invalid_payload"))?;
+                (
+                    REFRESH_SEASON_JOB,
+                    serde_json::json!({"tv_id": tmdb_id, "season_number": season_number}),
+                    format!("{REFRESH_SEASON_JOB}:{tmdb_id}:{season_number}"),
+                )
+            }
+            2..=5 => {
+                let entity_type = row
+                    .entity_type
+                    .as_deref()
+                    .ok_or_else(|| JobExecutionError::dead_letter("invalid_payload"))?;
+                let tmdb_id = row
+                    .entity_id
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| JobExecutionError::dead_letter("invalid_payload"))?;
+                (
+                    REFRESH_REUSABLE_GALLERY_JOB,
+                    serde_json::json!({"entityType": entity_type, "tmdbId": tmdb_id}),
+                    format!("{REFRESH_REUSABLE_GALLERY_JOB}:{entity_type}:{tmdb_id}"),
+                )
+            }
+            _ => return Err(JobExecutionError::dead_letter("invalid_payload")),
+        };
+        let job = NewJob::new(job_type, INGEST_PAYLOAD_VERSION, payload, &dedup_key)
+            .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+        if submit_and_link_scan_job(database, run_id, "media", job).await? {
+            queued = queued.saturating_add(1);
+        }
+    }
+    let processed =
+        u64::try_from(rows.len()).map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+    Ok(MediaWorkBatch {
+        queued,
+        next_cursor: cursor
+            .checked_add(processed)
+            .ok_or_else(|| JobExecutionError::dead_letter("invalid_payload"))?,
+        done,
+    })
+}
+
+async fn prune_catalog_titles(
+    database: &PgPool,
+    media_type: MediaType,
+    ids_path: PathBuf,
+) -> Result<usize, JobExecutionError> {
+    let mut transaction = database
+        .begin()
+        .await
+        .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    sqlx::query(
+        "CREATE TEMP TABLE tmdb_prune_ids (
+             tmdb_id bigint PRIMARY KEY
+         ) ON COMMIT DROP",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+
+    let file = tokio::fs::File::open(ids_path)
+        .await
+        .map_err(|_| JobExecutionError::retry("export_storage", Duration::from_secs(30)))?;
+    let mut lines = TokioBufReader::new(file).lines();
+    let mut ids = Vec::with_capacity(500);
+    loop {
+        let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|_| JobExecutionError::retry("export_storage", Duration::from_secs(30)))?
+        else {
+            break;
+        };
+        let tmdb_id = line
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+        if tmdb_id == 0 {
             return Err(JobExecutionError::dead_letter("invalid_payload"));
         }
-        let job = NewJob::new(
-            REFRESH_REUSABLE_GALLERY_JOB,
-            INGEST_PAYLOAD_VERSION,
-            serde_json::json!({"entityType": entity_type, "tmdbId": tmdb_id}),
-            &format!("media-scan:{run_id}:{entity_type}:{tmdb_id}"),
-        )
-        .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
-        if submit_and_link_scan_job(database, run_id, "media", job).await? {
-            queued = queued.saturating_add(1);
+        ids.push(i64::from(tmdb_id));
+        if ids.len() == 500 {
+            insert_prune_ids(&mut transaction, &ids).await?;
+            ids.clear();
         }
     }
-    Ok(queued)
-}
-
-async fn enqueue_missing_catalog_refresh_jobs(
-    database: &PgPool,
-    media_types: &[MediaType],
-) -> Result<usize, JobExecutionError> {
-    const MAX_MISSING_REFRESHES: i64 = 10_000;
-    let repository = JobRepository::new(database.clone());
-    let mut queued = 0_usize;
-    for media_type in media_types {
-        let media_type_name = media_type_name(*media_type);
-        let ids: Vec<i64> = sqlx::query_scalar(
-            "SELECT tmdb_id
-               FROM catalog.titles
-              WHERE media_type = $1
-                AND active
-                AND (source_updated_at IS NULL OR display_title IS NULL)
-              ORDER BY id
-              LIMIT $2",
-        )
-        .bind(media_type_name)
-        .bind(MAX_MISSING_REFRESHES)
-        .fetch_all(database)
+    if !ids.is_empty() {
+        insert_prune_ids(&mut transaction, &ids).await?;
+    }
+    let deleted = sqlx::query(
+        "DELETE FROM catalog.titles AS title
+          WHERE title.media_type = $1
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM tmdb_prune_ids AS keep
+                 WHERE keep.tmdb_id = title.tmdb_id
+            )",
+    )
+    .bind(media_type_name(media_type))
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?
+    .rows_affected();
+    transaction
+        .commit()
         .await
         .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
-        for tmdb_id in ids {
-            let tmdb_id = u32::try_from(tmdb_id)
+    usize::try_from(deleted).map_err(|_| JobExecutionError::dead_letter("invalid_payload"))
+}
+
+async fn insert_prune_ids(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ids: &[i64],
+) -> Result<(), JobExecutionError> {
+    sqlx::query(
+        "INSERT INTO tmdb_prune_ids (tmdb_id)
+         SELECT id FROM unnest($1::bigint[]) AS values(id)
+         ON CONFLICT (tmdb_id) DO NOTHING",
+    )
+    .bind(ids)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    Ok(())
+}
+
+const CATALOG_REFRESH_BATCH_SIZE: i64 = 500;
+
+#[derive(Debug, FromRow)]
+struct MissingCatalogRow {
+    id: i64,
+    tmdb_id: i64,
+    media_type: String,
+}
+
+struct MissingCatalogBatch {
+    queued: usize,
+    next_cursor: u64,
+    done: bool,
+}
+
+async fn enqueue_missing_catalog_refresh_batch(
+    database: &PgPool,
+    media_types: &[MediaType],
+    cursor: u64,
+) -> Result<MissingCatalogBatch, JobExecutionError> {
+    let cursor =
+        i64::try_from(cursor).map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+    let media_type_names = media_types
+        .iter()
+        .copied()
+        .map(media_type_name)
+        .collect::<Vec<_>>();
+    let mut rows: Vec<MissingCatalogRow> = sqlx::query_as(
+        "SELECT id, tmdb_id, media_type
+           FROM catalog.titles
+          WHERE active
+            AND media_type = ANY($1)
+            AND id > $2
+            AND (source_updated_at IS NULL OR display_title IS NULL)
+          ORDER BY id
+          LIMIT $3",
+    )
+    .bind(&media_type_names)
+    .bind(cursor)
+    .bind(CATALOG_REFRESH_BATCH_SIZE + 1)
+    .fetch_all(database)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+
+    let batch_size = usize::try_from(CATALOG_REFRESH_BATCH_SIZE).unwrap_or(usize::MAX);
+    let done = rows.len() <= batch_size;
+    rows.truncate(batch_size);
+    let jobs = rows
+        .iter()
+        .map(|row| {
+            let tmdb_id = u32::try_from(row.tmdb_id)
                 .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
-            let job_type = match media_type {
-                MediaType::Movie => REFRESH_MOVIE_JOB,
-                MediaType::Tv => REFRESH_TV_JOB,
+            let job_type = match row.media_type.as_str() {
+                "movie" => REFRESH_MOVIE_JOB,
+                "tv" => REFRESH_TV_JOB,
+                _ => return Err(JobExecutionError::dead_letter("invalid_payload")),
             };
-            let job = NewJob::new(
+            NewJob::new(
                 job_type,
                 INGEST_PAYLOAD_VERSION,
                 serde_json::json!({"tmdb_id": tmdb_id}),
                 &format!("{job_type}:{tmdb_id}"),
             )
-            .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
-            if !repository
-                .submit(job)
-                .await
-                .map_err(|_| {
-                    JobExecutionError::retry("database_unavailable", Duration::from_secs(5))
-                })?
-                .was_duplicate()
-            {
-                queued = queued.saturating_add(1);
-            }
-        }
-    }
-    Ok(queued)
+            .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ensure_refresh_queue_capacity(database, jobs.len(), "missing_queue_full").await?;
+    let outcomes = JobRepository::new(database.clone())
+        .submit_many(&jobs)
+        .await
+        .map_err(map_submission_error)?;
+    let next_cursor = rows
+        .last()
+        .map(|row| u64::try_from(row.id))
+        .transpose()
+        .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?
+        .unwrap_or(cursor as u64);
+    Ok(MissingCatalogBatch {
+        queued: outcomes
+            .iter()
+            .filter(|outcome| !outcome.was_duplicate())
+            .count(),
+        next_cursor,
+        done,
+    })
+}
+
+fn admin_scan_job(
+    mode: AdminScanMode,
+    media_types: &[MediaType],
+    cursor: u64,
+) -> Result<NewJob, JobExecutionError> {
+    NewJob::new(
+        ADMIN_SCAN_JOB,
+        INGEST_PAYLOAD_VERSION,
+        serde_json::json!({
+            "mode": mode,
+            "mediaTypes": media_types,
+            "cursor": cursor
+        }),
+        &format!("{ADMIN_SCAN_JOB}:{mode:?}:{media_types:?}:{cursor}"),
+    )
+    .and_then(|job| job.with_max_attempts(100))
+    .and_then(|job| job.with_available_at(Utc::now() + ChronoDuration::seconds(1)))
+    .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))
 }
 
 async fn analyze_catalog(database: &PgPool) -> Result<(), JobExecutionError> {
@@ -2112,6 +3055,56 @@ mod tests {
     }
 
     #[test]
+    fn linked_tmdb_documents_are_bounded_and_deduplicated() {
+        let detail = serde_json::json!({
+            "credits": {
+                "cast": [
+                    {"id": 10, "credit_id": "credit-b"},
+                    {"id": 11, "credit_id": "credit-a"},
+                    {"id": 12, "credit_id": "credit-b"}
+                ],
+                "crew": [{"id": 13, "credit_id": "credit-c"}]
+            },
+            "keywords": {"keywords": [{"id": 20}, {"id": 20}]},
+            "episode_groups": {"results": [{"id": "group-1"}]}
+        });
+        let reviews = serde_json::json!({
+            "results": [{"id": "review-1"}, {"id": "review-1"}]
+        });
+        let documents = vec![CapturedDocument {
+            endpoint_path: "movie/42/reviews".to_owned(),
+            query_string: String::new(),
+            response: reviews,
+        }];
+
+        let paths = linked_document_paths(&documents, &[("movie/42", &detail)]);
+
+        assert_eq!(
+            paths,
+            vec![
+                "credit/credit-a",
+                "credit/credit-b",
+                "credit/credit-c",
+                "keyword/20",
+                "keyword/20/movies",
+                "review/review-1",
+                "tv/episode_group/group-1"
+            ]
+        );
+    }
+
+    #[test]
+    fn linked_tmdb_documents_ignore_unsafe_identifiers() {
+        let detail = serde_json::json!({
+            "credits": {"cast": [{"credit_id": "../secret"}]},
+            "keywords": {"keywords": [{"id": 0}, {"id": -1}]},
+            "episode_groups": {"results": [{"id": "group/unsafe"}]}
+        });
+
+        assert!(linked_document_paths(&[], &[("tv/1", &detail)]).is_empty());
+    }
+
+    #[test]
     fn reusable_gallery_payloads_are_strict_and_use_tmdb_ids()
     -> Result<(), Box<dyn std::error::Error>> {
         let job = parse_job(
@@ -2145,6 +3138,14 @@ mod tests {
     fn media_scan_payloads_cover_each_mode_and_reject_unknown_fields()
     -> Result<(), Box<dyn std::error::Error>> {
         let run_id = Uuid::now_v7();
+        assert_eq!(
+            catalog_scan_mode(MediaScanMode::Full),
+            AdminScanMode::FullSweep
+        );
+        assert_eq!(
+            catalog_scan_mode(MediaScanMode::Missing),
+            AdminScanMode::MissingOnly
+        );
         for (mode, expected) in [
             ("full", MediaScanMode::Full),
             ("missing", MediaScanMode::Missing),
@@ -2246,6 +3247,34 @@ mod tests {
     }
 
     #[test]
+    fn catalog_scan_modes_are_explicit_and_missing_scan_has_a_cursor() {
+        for mode in ["full_sweep", "missing_only", "prune_cleanup", "daily_sync"] {
+            let job = parse_job(
+                ADMIN_SCAN_JOB,
+                INGEST_PAYLOAD_VERSION,
+                &serde_json::json!({
+                    "mode": mode,
+                    "mediaTypes": ["movie"],
+                    "cursor": 0
+                }),
+            );
+            assert!(job.is_ok(), "mode {mode} was rejected");
+        }
+        assert!(matches!(
+            parse_job(
+                ADMIN_SCAN_JOB,
+                INGEST_PAYLOAD_VERSION,
+                &serde_json::json!({
+                    "mode": "missing_only",
+                    "mediaTypes": ["movie"],
+                    "cursor": i64::MAX as u64 + 1
+                }),
+            ),
+            Err(JobPayloadError::InvalidValue)
+        ));
+    }
+
+    #[test]
     fn unknown_and_non_object_payloads_are_rejected() {
         assert!(matches!(
             parse_job("ingest.unknown", 1, &serde_json::json!({})),
@@ -2300,20 +3329,15 @@ mod tests {
     #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
     async fn daily_export_enqueues_detail_refresh_jobs(pool: PgPool) -> sqlx::Result<()> {
         let export = tempfile::NamedTempFile::new()?;
-        std::fs::write(
-            export.path(),
-            concat!(
-                "{\"id\":51,\"adult\":false,\"video\":false}\n",
-                "{\"id\":52,\"adult\":false,\"video\":false}\n",
-                "{\"id\":51,\"adult\":false,\"video\":false}\n"
-            ),
-        )?;
+        std::fs::write(export.path(), "51\n52\n51\n")?;
 
         let summary = enqueue_daily_export_refresh_jobs(
             &pool,
             MediaType::Movie,
-            DailyExportParser::default(),
             export.path().to_path_buf(),
+            "https://files.tmdb.org/movie.json.gz",
+            0,
+            false,
         )
         .await
         .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
@@ -2353,19 +3377,15 @@ mod tests {
         .execute(&pool)
         .await?;
         let export = tempfile::NamedTempFile::new()?;
-        std::fs::write(
-            export.path(),
-            concat!(
-                "{\"id\":51,\"adult\":false,\"video\":false}\n",
-                "{\"id\":52,\"adult\":false,\"video\":false}\n"
-            ),
-        )?;
+        std::fs::write(export.path(), "51\n52\n")?;
 
         let summary = enqueue_daily_export_refresh_jobs(
             &pool,
             MediaType::Movie,
-            DailyExportParser::default(),
             export.path().to_path_buf(),
+            "https://files.tmdb.org/movie.json.gz",
+            0,
+            false,
         )
         .await
         .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
@@ -2381,6 +3401,194 @@ mod tests {
         .fetch_all(&pool)
         .await?;
         assert_eq!(ids, [52]);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn full_export_requeues_loaded_catalog_titles(pool: PgPool) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO catalog.titles (media_type, tmdb_id, display_title)
+             VALUES ('movie', 51, 'Already loaded')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO catalog.movie_details (title_id)
+             SELECT id
+               FROM catalog.titles
+              WHERE media_type = 'movie' AND tmdb_id = 51",
+        )
+        .execute(&pool)
+        .await?;
+        let export = tempfile::NamedTempFile::new()?;
+        std::fs::write(export.path(), "51\n52\n")?;
+
+        let summary = enqueue_daily_export_refresh_jobs(
+            &pool,
+            MediaType::Movie,
+            export.path().to_path_buf(),
+            "https://files.tmdb.org/movie.json.gz",
+            0,
+            true,
+        )
+        .await
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+
+        assert_eq!(summary.detail_refresh_candidates, 2);
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT (payload ->> 'tmdb_id')::bigint
+               FROM ops.jobs
+              WHERE job_type = 'ingest.refresh_movie'
+              ORDER BY 1",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(ids, [51, 52]);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn daily_export_continuation_keeps_refresh_queue_bounded(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let export = tempfile::NamedTempFile::new()?;
+        let contents = (1..=501).map(|id| format!("{id}\n")).collect::<String>();
+        std::fs::write(export.path(), contents)?;
+
+        let summary = enqueue_daily_export_refresh_jobs(
+            &pool,
+            MediaType::Movie,
+            export.path().to_path_buf(),
+            "https://files.tmdb.org/movie.json.gz",
+            0,
+            false,
+        )
+        .await
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+
+        assert_eq!(summary.records, DAILY_EXPORT_BATCH_SIZE);
+        assert_eq!(summary.detail_refresh_candidates, DAILY_EXPORT_BATCH_SIZE);
+        assert!(summary.continued);
+        let refresh_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM ops.jobs WHERE job_type = 'ingest.refresh_movie'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        let continuation_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM ops.jobs WHERE job_type = 'ingest.daily_export'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(refresh_count, 500);
+        assert_eq!(continuation_count, 1);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn daily_export_waits_when_the_refresh_queue_is_full(pool: PgPool) -> sqlx::Result<()> {
+        let repository = JobRepository::new(pool.clone());
+        let jobs = (1..=MAX_PENDING_REFRESH_JOBS)
+            .map(|tmdb_id| {
+                NewJob::new(
+                    REFRESH_MOVIE_JOB,
+                    INGEST_PAYLOAD_VERSION,
+                    serde_json::json!({"tmdb_id": tmdb_id}),
+                    &format!("{REFRESH_MOVIE_JOB}:{tmdb_id}"),
+                )
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for batch in jobs.chunks(500) {
+            repository
+                .submit_many(batch)
+                .await
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        }
+
+        let export = tempfile::NamedTempFile::new()?;
+        std::fs::write(export.path(), "1001\n")?;
+        let result = enqueue_daily_export_refresh_jobs(
+            &pool,
+            MediaType::Movie,
+            export.path().to_path_buf(),
+            "https://files.tmdb.org/movie.json.gz",
+            0,
+            false,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(error) if error.failure_code() == "export_queue_incomplete"
+        ));
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn missing_catalog_refreshes_are_batched_and_resumable(pool: PgPool) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO catalog.titles (media_type, tmdb_id)
+             SELECT 'movie', generate_series(1, 501)",
+        )
+        .execute(&pool)
+        .await?;
+
+        let first = enqueue_missing_catalog_refresh_batch(&pool, &[MediaType::Movie], 0)
+            .await
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        assert_eq!(first.queued, 500);
+        assert!(!first.done);
+        let queued: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM ops.jobs WHERE job_type = 'ingest.refresh_movie'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(queued, 500);
+
+        let second =
+            enqueue_missing_catalog_refresh_batch(&pool, &[MediaType::Movie], first.next_cursor)
+                .await
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        assert_eq!(second.queued, 1);
+        assert!(second.done);
+        let queued: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM ops.jobs WHERE job_type = 'ingest.refresh_movie'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(queued, 501);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn prune_cleanup_deletes_only_ids_absent_from_the_export(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO catalog.titles (media_type, tmdb_id, display_title)
+             VALUES ('movie', 1, 'keep'), ('movie', 2, 'remove'), ('tv', 2, 'keep-tv')",
+        )
+        .execute(&pool)
+        .await?;
+        let ids = tempfile::NamedTempFile::new()?;
+        std::fs::write(ids.path(), "1\n")?;
+
+        let deleted = prune_catalog_titles(&pool, MediaType::Movie, ids.path().to_path_buf())
+            .await
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        assert_eq!(deleted, 1);
+        let movies: Vec<i64> = sqlx::query_scalar(
+            "SELECT tmdb_id FROM catalog.titles WHERE media_type = 'movie' ORDER BY tmdb_id",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(movies, [1]);
+        let tvs: Vec<i64> = sqlx::query_scalar(
+            "SELECT tmdb_id FROM catalog.titles WHERE media_type = 'tv' ORDER BY tmdb_id",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(tvs, [2]);
         Ok(())
     }
 
@@ -2435,6 +3643,86 @@ mod tests {
 struct ExportQueueSummary {
     records: usize,
     detail_refresh_candidates: usize,
+    continued: bool,
+    next_offset: Option<u64>,
+}
+
+const DAILY_EXPORT_BATCH_SIZE: usize = 500;
+
+async fn ensure_export_id_file(
+    parser: DailyExportParser,
+    source: PathBuf,
+    destination: PathBuf,
+) -> Result<(), JobExecutionError> {
+    if tokio::fs::try_exists(&destination)
+        .await
+        .map_err(|_| JobExecutionError::retry("export_storage", Duration::from_secs(30)))?
+    {
+        return Ok(());
+    }
+    tokio::task::spawn_blocking(move || parser.write_id_file(source, destination))
+        .await
+        .map_err(|_| JobExecutionError::retry("export_storage", Duration::from_secs(30)))?
+        .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExportIdBatch {
+    ids: Vec<u64>,
+    next_offset: u64,
+    finished: bool,
+}
+
+fn read_export_id_batch(path: PathBuf, offset: u64) -> Result<ExportIdBatch, JobExecutionError> {
+    let file = File::open(path)
+        .map_err(|_| JobExecutionError::retry("export_storage", Duration::from_secs(30)))?;
+    let file_length = file
+        .metadata()
+        .map_err(|_| JobExecutionError::retry("export_storage", Duration::from_secs(30)))?
+        .len();
+    if offset > file_length {
+        return Err(JobExecutionError::dead_letter("invalid_payload"));
+    }
+    let mut reader = BufReader::new(file);
+    reader
+        .seek(SeekFrom::Start(offset))
+        .map_err(|_| JobExecutionError::retry("export_storage", Duration::from_secs(30)))?;
+    let mut ids = Vec::with_capacity(DAILY_EXPORT_BATCH_SIZE);
+    let mut line = String::new();
+    while ids.len() < DAILY_EXPORT_BATCH_SIZE {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|_| JobExecutionError::retry("export_storage", Duration::from_secs(30)))?;
+        if read == 0 {
+            break;
+        }
+        let id = line
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| JobExecutionError::dead_letter("invalid_payload"))?;
+        ids.push(id);
+    }
+    let next_offset = reader
+        .stream_position()
+        .map_err(|_| JobExecutionError::retry("export_storage", Duration::from_secs(30)))?;
+    let finished = reader
+        .fill_buf()
+        .map_err(|_| JobExecutionError::retry("export_storage", Duration::from_secs(30)))?
+        .is_empty();
+    Ok(ExportIdBatch {
+        ids,
+        next_offset,
+        finished,
+    })
+}
+
+fn export_dedup_key(media_type: MediaType, url: &str, offset: u64) -> String {
+    let digest = Sha256::digest(url.as_bytes());
+    format!("{DAILY_EXPORT_JOB}:{media_type}:{digest:x}:{offset}")
 }
 
 async fn enqueue_refresh_jobs(
@@ -2527,74 +3815,82 @@ async fn enqueue_missing_refresh_jobs(
 async fn enqueue_daily_export_refresh_jobs(
     pool: &PgPool,
     media_type: MediaType,
-    parser: DailyExportParser,
     path: PathBuf,
+    url: &str,
+    offset: u64,
+    refresh_all: bool,
 ) -> Result<ExportQueueSummary, JobExecutionError> {
-    const SUBMISSION_BATCH_SIZE: usize = 500;
-    const CHANNEL_CAPACITY: usize = 2;
-
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u64>>(CHANNEL_CAPACITY);
-    let parser_task = tokio::task::spawn_blocking(move || {
-        let mut sender = Some(sender);
-        let mut batch = Vec::with_capacity(SUBMISSION_BATCH_SIZE);
-        let result = parser.scan_file(path, |record| {
-            if sender.is_none() {
-                return;
-            }
-            batch.push(record.id);
-            if batch.len() == SUBMISSION_BATCH_SIZE {
-                let next = std::mem::replace(&mut batch, Vec::with_capacity(SUBMISSION_BATCH_SIZE));
-                if sender
-                    .as_ref()
-                    .is_some_and(|sender| sender.blocking_send(next).is_err())
-                {
-                    sender = None;
-                }
-            }
-        });
-        if !batch.is_empty()
-            && let Some(sender) = sender
-        {
-            let _ = sender.blocking_send(batch);
-        }
-        result
-    });
-
-    let mut received_records = 0_usize;
-    let mut detail_refresh_candidates = 0_usize;
-    let mut submission_error = None;
-    while let Some(ids) = receiver.recv().await {
-        received_records = received_records.saturating_add(ids.len());
-        match enqueue_missing_refresh_jobs(pool, media_type, &ids).await {
-            Ok(submitted) => {
-                detail_refresh_candidates = detail_refresh_candidates.saturating_add(submitted);
-            }
-            Err(error) => {
-                submission_error = Some(error);
-                receiver.close();
-                break;
-            }
-        }
-    }
-    drop(receiver);
-
-    let parsed_records = parser_task
+    ensure_refresh_queue_capacity(pool, DAILY_EXPORT_BATCH_SIZE, "export_queue_incomplete").await?;
+    let batch = tokio::task::spawn_blocking(move || read_export_id_batch(path, offset))
         .await
         .map_err(|_| JobExecutionError::retry("export_storage", Duration::from_secs(30)))?
+        .map_err(|error| error)?;
+    let detail_refresh_candidates = if refresh_all {
+        enqueue_refresh_jobs_with_priority(
+            pool,
+            media_type,
+            &batch.ids,
+            DAILY_EXPORT_REFRESH_PRIORITY,
+        )
+        .await?
+    } else {
+        enqueue_missing_refresh_jobs(pool, media_type, &batch.ids).await?
+    };
+    if !batch.finished {
+        let continuation = NewJob::new(
+            DAILY_EXPORT_JOB,
+            INGEST_PAYLOAD_VERSION,
+            serde_json::json!({
+                "media_type": media_type,
+                "url": url,
+                "offset": batch.next_offset,
+                "refresh_all": refresh_all
+            }),
+            &export_dedup_key(media_type, url, batch.next_offset),
+        )
+        .and_then(|job| job.with_max_attempts(100))
+        .and_then(|job| job.with_priority(DAILY_EXPORT_REFRESH_PRIORITY))
+        .and_then(|job| job.with_available_at(Utc::now() + ChronoDuration::seconds(1)))
         .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
-    if let Some(error) = submission_error {
-        return Err(error);
-    }
-    if parsed_records != received_records {
-        return Err(JobExecutionError::retry(
-            "export_queue_incomplete",
-            Duration::from_secs(5),
-        ));
+        JobRepository::new(pool.clone())
+            .submit(continuation)
+            .await
+            .map_err(map_submission_error)?;
     }
     Ok(ExportQueueSummary {
-        records: received_records,
+        records: batch.ids.len(),
         detail_refresh_candidates,
+        continued: !batch.finished,
+        next_offset: (!batch.finished).then_some(batch.next_offset),
     })
+}
+
+async fn ensure_refresh_queue_capacity(
+    pool: &PgPool,
+    reserve: usize,
+    failure_code: &'static str,
+) -> Result<(), JobExecutionError> {
+    let reserve =
+        i64::try_from(reserve).map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
+    let pending_refreshes: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM ops.media_scan_job_status
+          WHERE job_type IN (
+                    'ingest.refresh_movie', 'ingest.refresh_tv',
+                    'ingest.refresh_season', 'ingest.refresh_reusable_gallery'
+                )
+            AND status IN ('queued', 'running', 'retry_wait')",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
+    if pending_refreshes.saturating_add(reserve) > MAX_PENDING_REFRESH_JOBS {
+        return Err(JobExecutionError::retry(
+            failure_code,
+            Duration::from_secs(10),
+        ));
+    }
+    Ok(())
 }
 
 fn refresh_job(

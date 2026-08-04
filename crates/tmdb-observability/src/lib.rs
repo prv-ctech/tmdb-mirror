@@ -255,8 +255,6 @@ impl QueueState {
 pub enum CatalogScope {
     Movies,
     Tv,
-    AnimeMovies,
-    AnimeTv,
 }
 
 impl CatalogScope {
@@ -265,8 +263,6 @@ impl CatalogScope {
         match self {
             Self::Movies => "movies",
             Self::Tv => "tv",
-            Self::AnimeMovies => "anime_movies",
-            Self::AnimeTv => "anime_tv",
         }
     }
 }
@@ -340,66 +336,19 @@ struct BuildLabels {
 }
 
 fn normalize_route(route: &str) -> String {
-    let unversioned = route.strip_prefix("/v1").unwrap_or(route);
+    if route.starts_with("/3/")
+        && route.len() <= 512
+        && !route.chars().any(char::is_control)
+        && !route.contains(['?', '#', '\\'])
+    {
+        return "/3/{endpoint_path}".to_owned();
+    }
     if matches!(
-        unversioned,
+        route,
         "/health/live"
             | "/health/ready"
             | "/metrics"
             | "/openapi.json"
-            | "/movies"
-            | "/movies/popular"
-            | "/movies/recent"
-            | "/movies/top-rated"
-            | "/movies/{tmdb_id}"
-            | "/movies/{tmdb_id}/translations"
-            | "/movies/{tmdb_id}/alternate-titles"
-            | "/movies/{tmdb_id}/external-ids"
-            | "/movies/{tmdb_id}/videos"
-            | "/movies/{tmdb_id}/release-dates"
-            | "/movies/{tmdb_id}/credits"
-            | "/movies/{tmdb_id}/images"
-            | "/tv"
-            | "/tv/popular"
-            | "/tv/recent"
-            | "/tv/top-rated"
-            | "/tv/{tmdb_id}"
-            | "/tv/{tmdb_id}/translations"
-            | "/tv/{tmdb_id}/alternate-titles"
-            | "/tv/{tmdb_id}/external-ids"
-            | "/tv/{tmdb_id}/videos"
-            | "/tv/{tmdb_id}/certifications"
-            | "/tv/{tmdb_id}/credits"
-            | "/tv/{tmdb_id}/images"
-            | "/tv/{tmdb_id}/seasons"
-            | "/tv/{tmdb_id}/seasons/{season_number}"
-            | "/tv/{tmdb_id}/seasons/{season_number}/episodes"
-            | "/tv/{tmdb_id}/seasons/{season_number}/episodes/{episode_number}"
-            | "/anime"
-            | "/anime/popular"
-            | "/anime/recent"
-            | "/anime/top-rated"
-            | "/anime/{media_type}/{tmdb_id}"
-            | "/anime/{media_type}/{tmdb_id}/translations"
-            | "/anime/{media_type}/{tmdb_id}/alternate-titles"
-            | "/anime/{media_type}/{tmdb_id}/external-ids"
-            | "/anime/{media_type}/{tmdb_id}/videos"
-            | "/anime/{media_type}/{tmdb_id}/release-dates"
-            | "/anime/{media_type}/{tmdb_id}/credits"
-            | "/anime/{media_type}/{tmdb_id}/images"
-            | "/trending/{trend_window}"
-            | "/anime/trending/{trend_window}"
-            | "/calendar/movies"
-            | "/calendar/tv"
-            | "/search"
-            | "/genres"
-            | "/languages"
-            | "/keywords"
-            | "/tags"
-            | "/people"
-            | "/companies"
-            | "/networks"
-            | "/collections"
             | "/admin/v1/openapi.json"
             | "/admin/v1/status"
             | "/admin/v1/jobs"
@@ -408,6 +357,7 @@ fn normalize_route(route: &str) -> String {
             | "/admin/v1/media/scans"
             | "/admin/v1/media/scans/{run_id}"
             | "/admin/v1/media/worker"
+            | "/admin/v1/worker"
             | "/admin/v1/jobs/{job_id}/cancel"
             | "/admin/v1/jobs/{job_id}/retry"
             | "/admin/v1/media/audits"

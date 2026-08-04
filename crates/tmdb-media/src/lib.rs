@@ -36,7 +36,7 @@ pub const BACKUP_ROOT: &str = "/config/backups";
 /// Fixed service role whose writable directories must be ready before startup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeStorageRole {
-    /// The main worker, which owns migrations, ingest, exports, and schedules.
+    /// The main worker, which owns migrations, metadata ingest, and exports.
     Worker,
     /// The media worker, which owns image scratch data and final media publication.
     Media,
@@ -71,12 +71,6 @@ pub enum RuntimeStoragePath {
     MediaMovies,
     /// `/media/tv`
     MediaTv,
-    /// `/media/anime`
-    MediaAnime,
-    /// `/media/anime/movie`
-    MediaAnimeMovie,
-    /// `/media/anime/tv`
-    MediaAnimeTv,
     /// `/media/people`
     MediaPeople,
     /// `/media/networks`
@@ -99,9 +93,6 @@ impl RuntimeStoragePath {
             Self::ConfigMedia => MEDIA_WORK_ROOT,
             Self::MediaMovies => "/media/movies",
             Self::MediaTv => "/media/tv",
-            Self::MediaAnime => "/media/anime",
-            Self::MediaAnimeMovie => "/media/anime/movie",
-            Self::MediaAnimeTv => "/media/anime/tv",
             Self::MediaPeople => "/media/people",
             Self::MediaNetworks => "/media/networks",
             Self::MediaCompanies => "/media/companies",
@@ -118,9 +109,6 @@ impl RuntimeStoragePath {
             Self::ConfigMedia => config_root.join("media"),
             Self::MediaMovies => media_root.join("movies"),
             Self::MediaTv => media_root.join("tv"),
-            Self::MediaAnime => media_root.join("anime"),
-            Self::MediaAnimeMovie => media_root.join("anime").join("movie"),
-            Self::MediaAnimeTv => media_root.join("anime").join("tv"),
             Self::MediaPeople => media_root.join("people"),
             Self::MediaNetworks => media_root.join("networks"),
             Self::MediaCompanies => media_root.join("companies"),
@@ -220,9 +208,6 @@ const MEDIA_RUNTIME_PATHS: &[RuntimeStoragePath] = &[
     RuntimeStoragePath::ConfigLogs,
     RuntimeStoragePath::MediaMovies,
     RuntimeStoragePath::MediaTv,
-    RuntimeStoragePath::MediaAnime,
-    RuntimeStoragePath::MediaAnimeMovie,
-    RuntimeStoragePath::MediaAnimeTv,
     RuntimeStoragePath::MediaPeople,
     RuntimeStoragePath::MediaNetworks,
     RuntimeStoragePath::MediaCompanies,
@@ -330,10 +315,6 @@ pub enum TitleScope {
     Movie,
     /// A regular TV show.
     Tv,
-    /// A movie explicitly classified as anime.
-    AnimeMovie,
-    /// A TV show explicitly classified as anime.
-    AnimeTv,
 }
 
 /// Reusable catalog entity whose image is not copied per title.
@@ -420,8 +401,6 @@ pub fn title_dir(scope: TitleScope, tmdb_id: i64) -> Result<PathBuf, MediaPathEr
     let path = match scope {
         TitleScope::Movie => format!("movies/{id}"),
         TitleScope::Tv => format!("tv/{id}"),
-        TitleScope::AnimeMovie => format!("anime/movie/{id}"),
-        TitleScope::AnimeTv => format!("anime/tv/{id}"),
     };
     Ok(PathBuf::from(path))
 }
@@ -710,8 +689,6 @@ mod tests {
         for child in [
             "movies",
             "tv",
-            "anime/movie",
-            "anime/tv",
             "people",
             "networks",
             "companies",
@@ -745,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn title_paths_cover_regular_and_anime_scopes() {
+    fn title_paths_cover_movie_tv_and_specials() {
         assert_eq!(
             title_asset(
                 TitleScope::Movie,
@@ -758,7 +735,7 @@ mod tests {
         );
         assert_eq!(
             optimized_title_asset(
-                TitleScope::AnimeTv,
+                TitleScope::Tv,
                 12,
                 AssetVariant::EpisodeThumbnail {
                     season: 0,
@@ -770,7 +747,7 @@ mod tests {
             )
             .ok(),
             Some(PathBuf::from(
-                "anime/tv/12/optimized/thumbnails/season-specials-episode01-thumbnails-w640.jpg",
+                "tv/12/optimized/thumbnails/season-specials-episode01-thumbnails-w640.jpg",
             ))
         );
         assert_eq!(

@@ -61,6 +61,8 @@ pub struct AppConfig {
     pub storage_roots: StorageRoots,
     /// Optional private Trawl service endpoint.
     pub trawl_base_url: Option<Uri>,
+    /// Optional public base URL used for local media fields in v3 responses.
+    pub media_base_url: Option<Uri>,
     /// Optional API key used to protect the private administrative listener.
     /// Production configuration must provide this through `TMDB_ADMIN_API_KEY`.
     pub admin_api_key: Option<SecretString>,
@@ -95,6 +97,7 @@ impl AppConfig {
         let database = load_shared_database(source, environment)?;
         let storage_roots = StorageRoots::fixed();
         let trawl_base_url = optional_uri(source, "TMDB_TRAWL_BASE_URL")?;
+        let media_base_url = optional_uri(source, "TMDB_MEDIA_BASE_URL")?;
         let admin_key_name = if has_secret_source(source, "TMDB_ADMIN_API_KEY") {
             "TMDB_ADMIN_API_KEY"
         } else {
@@ -112,6 +115,7 @@ impl AppConfig {
             database,
             storage_roots,
             trawl_base_url,
+            media_base_url,
             admin_api_key,
         })
     }

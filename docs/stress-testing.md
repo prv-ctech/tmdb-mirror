@@ -29,8 +29,8 @@ The bootstrap builds the pinned Rust image and the local PostgreSQL/pgBackRest
 image, applies migrations, starts the four-container stack, waits for health,
 verifies UID 10001, and checks that the fixed `/config` and `/media`
 subdirectories are writable by the runtime user. The PostgreSQL stress volume
-is initialized with WAL archiving enabled so the durable backup API can be
-exercised by the built-in pgBackRest scheduler. Use a fresh project name when
+is initialized with WAL archiving enabled so the explicit backup API and
+pgBackRest checks can be exercised. Use a fresh project name when
 converting an older stock-PostgreSQL stress volume because `archive_mode` is a
 cluster initialization setting. The generated runtime files are under ignored
 `.stress-runtime/<project>/`.
@@ -47,38 +47,47 @@ Run the bounded checks in this order:
 ./scripts/stress-http.sh --project-name tmdb_stress_test --concurrency 100 --requests-per-worker 100
 ./scripts/stress-trawl.sh --project-name tmdb_stress_test
 ./scripts/stress-resilience.sh --project-name tmdb_stress_test
-./scripts/stress-scan.sh --project-name tmdb_stress_test --queue-limit 10
+./scripts/stress-scan.sh --project-name tmdb_stress_test --max-active 1000
 ./scripts/stress-collect.sh --project-name tmdb_stress_test
 ```
 
 The seed creates a large synthetic catalog for indexed list/search/filter
 tests. Artwork uses real TMDB requests for a multi-image movie, TV `119495`
 (posters, backdrops, logos, seasons, and trailers), TV `4586` (Trailer and
-Opening Credits), anime/live-adaptation classification fixtures, reusable
+Opening Credits), movie/TV live fixtures, reusable
 people, companies, networks, and collections. Run artwork before HTTP so the
 gallery and video routes have live rows. The Trawl check is skipped when no
 Trawl URL is configured. When configured, `stress-trawl.sh` uses Trawl's
 documented JSON `/scrape` endpoint and verifies its status/metadata response;
 the native endpoint does not provide a binary image body for this worker.
-The export scan downloads the latest matching public movie and TV exports,
-counts their records, and bounds queued detail work with `--queue-limit`.
+The catalog-scan check submits a bounded `missing_only` scan through the
+authenticated admin API, starts both workers through that API, drains the
+resulting catalog/media children, and reports active-queue peak separately
+from retained terminal history. It does not submit jobs with a container CLI
+or launch a bulk export scan by default. The export parser and daily-sync
+paths are covered by focused Rust tests and the explicit admin scan contract.
 
 The HTTP result records request count, failures, throughput, p50/p95/p99
-latency, gallery URL/path redaction checks, season/episode image routes, and
-video-type/YouTube URL checks. The artwork and media-asset results also report
+latency, TMDB v3 document routes, season/episode image routes, and
+video-type checks. The artwork and media-asset results also report
 gallery counts, original and optimized rows, episode optimized-only rows,
 variant MIME/path violations, video counts by type/provider, HTTP status,
 permissions, worker IDs, and failures. Results and redacted diagnostics remain
 under the ignored runtime directory.
 
-`stress-media-scans.sh` uses the disposable admin key from the generated stress
-environment and never prints it. The real TMDB credentials are read from
-ignored `secrets.txt` for the upstream requests. It verifies authentication,
-scan idempotency, audit counters, pause/resume/start/cancel actions, and that a
-paused state survives a media-container restart. It leaves the durable media
-worker running. Full and missing scans are submitted only in bounded
-unit/database tests; do not launch an unbounded full scan against a live
-catalog during a stress run.
+`stress-artwork.sh`, `stress-scan.sh`, and `stress-media-assets.sh` start
+workers through the authenticated admin API before draining work; this is
+required because workers are idle after startup. `stress-media-scans.sh` uses
+the disposable admin key from
+the generated stress environment and never prints it. The real TMDB
+credentials are read from ignored `secrets.txt` for the upstream requests. It
+verifies authentication, scan idempotency, audit counters,
+pause/resume/start/cancel actions, and that a paused state survives a
+media-container restart. It leaves the durable media worker running. Catalog
+modes are `full_sweep`, `missing_only`,
+`prune_cleanup`, and `daily_sync`; every mode is bounded by durable
+continuations. Do not launch a large full sweep against a live catalog until
+queue depth and rate limits are being monitored.
 
 The private backup API accepts `{"type":"full"}` or
 `{"type":"differential"}` and requires an idempotency key. It returns a durable

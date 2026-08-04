@@ -1,143 +1,105 @@
 # TMDB Mirror Agent Rules
 
-These rules apply to every agent working in this repository. Keep the
-repository understandable, reproducible, and safe to publish.
+Read this file and the relevant `.agents/skills/*/SKILL.md` files before
+changing code. This repository is Linux-first; use Bash, Docker Desktop, and
+`docker compose`. Never use PowerShell or `.ps1` scripts.
 
-## Scope and working tree
+## Product contract
 
-- Read this file, `README.md`, the relevant `docs/` pages, and the current
-  `tasks/` plan before changing behavior.
-- The worktree may already contain user changes. Run `git status --short`
-  before and after work, preserve unrelated changes, and do not reset, clean,
-  or overwrite files merely to get a clean baseline.
-- Make the smallest change that proves the requested behavior. Do not add
-  speculative features, compatibility layers, duplicate abstractions, or
-  drive-by formatting.
-- Keep behavior changes, refactors, tests, and documentation separable. Use a
-  regression test for every fixed bug or changed behavior.
+- The main worker copies TMDB metadata into PostgreSQL.
+- The media worker downloads TMDB images and serves local media.
+- Neither worker starts work automatically after restart. Database migration
+  and health checks may run; catalog and media work require the admin API.
+  A previously `running` state is reset to `stopped` during startup; a
+  `paused` state remains paused for emergency persistence.
+- Both workers are controlled by the authenticated admin API: `start`,
+  `pause`, `resume`, and `cancel`.
+- Production job submission and scan control use the authenticated admin API;
+  do not ship or invoke a direct database job-submission CLI.
+- Catalog scans are explicit and durable: `full_sweep`, `missing_only`,
+  `prune_cleanup`, and `daily_sync`.
+- Scan fan-out is bounded. A scan may submit only bounded batches and one
+  cursor continuation. Never enqueue an entire TMDB export at once.
+- Queue status must distinguish live work from retained history: `active` is
+  `queued + running + retry_wait`; `retained` also includes terminal rows and
+  is not backlog. Use `active` for backlog alarms and prune old terminal
+  history explicitly.
+  Completed-scan child links are released after the retention window so they
+  do not pin terminal job history forever; scan root records remain auditable.
+  Terminal cleanup is index-backed and remains an explicit operator action.
+- The public API mirrors the TMDB v3 path and JSON shape. Do not create anime
+  partitions or custom public catalog routes.
 
-## Secrets and private data
+## Simplicity rule
 
-- Never commit, push, print, log, screenshot, or place in test artifacts a
-  token, password, private key, cookie, or other private value.
-- The local stress secret source is `secrets.txt`. Keep both `secrets.txt` and
-  `.secrets.txt` ignored by Git and Docker as a defensive guard. Read secret
-  values only into a mode-600 ignored runtime env file or process environment
-  at execution time.
-- Never put a real TMDB token in `.env`, Compose YAML, source, fixtures,
-  generated reports, Docker build args, or shell history. Do not run commands
-  that echo the token or expose it through `docker compose config` output.
-- Before any commit or push, inspect the staged diff and confirm that
-  `.gitignore` and `.dockerignore` cover secrets, environment files, local
-  databases, downloaded media, backups, logs, and runtime artifacts. A secret
-  that reaches a remote is compromised: stop and rotate it.
+Make the smallest direct change that proves the behavior. Do not add dead
+code, duplicate implementations, compatibility aliases, speculative layers,
+or abstractions used by one call site. Remove obsolete paths completely after
+checking their callers and tests. Add a regression test for every behavior
+change.
 
-## Docker Desktop and Compose
+## Data and media
 
-- Use Docker Desktop through `docker`/`docker compose`. Prefer the isolated
-  stress Compose file and an explicit unique project name and loopback-only
-  host ports.
-- This repository is exercised from Linux/WSL. Use Bash and standard Linux
-  tools; never invoke PowerShell, `pwsh`, `powershell.exe`, or `.ps1` scripts
-  as part of the active workflow.
-- Never stop, remove, prune, or recreate an unrelated container, volume,
-  network, image, or database. Never use `down -v` outside the named disposable
-  stress project. Keep production bind mounts out of stress tests.
-- Validate Compose interpolation before startup. Verify container health,
-  process identity, read-only roots, dropped capabilities, fixed `/config` and
-  `/media` mounts, runtime-created folders, and published ports.
-- Keep credentials out of image layers and build context. Inspect the build
-  context ignore rules before every local image build.
+- Store TMDB response documents as the source for the local v3 read surface.
+- Use dedicated TMDB image endpoints for titles, seasons, episodes, people,
+  companies, networks, and collections.
+- Request `language=en-US` and `include_image_language=en,null` for image
+  galleries.
+- Use TMDB IDs for reusable entities. Keep original bytes outside `optimized/`.
+- Optimized derivatives are JPEG quality 85, never upscaled: width 640 for
+  posters, seasons, profiles, and thumbnails; 1280 for backdrops; PNG width
+  500 for logos. Never create WebP derivatives, `full` variants, or `.masters`.
+- Episode stills are optimized-only under `optimized/thumbnails/`.
+- Videos are metadata only. Do not download video files or create a videos
+  folder. Build recognized provider URLs from provider metadata; unknown
+  providers return `null`.
 
-### Compose and environment contract
+## Secrets and local state
 
-- Compose files define deployment topology. Keep host bind sources under
-  `volumes.source` and published host ports under `ports`; do not move those
-  values into `.env` or pass them to containers through `env_file`.
-- The portable production and standalone examples use relative bind sources:
-  `./data/postgres18`, `./data/config`, and `./data/media`. Operators may edit
-  those `source:` lines for an existing host layout. Never commit Unraid,
-  workstation, LAN-IP, or other host-specific paths to a tracked Compose file.
-- Keep host port mappings explicit in Compose: `9001:8080` for the API and
-  `9002:8090` for media. The admin listener remains container-only on `8081`.
-  A host address or alternate port is a Compose edit, not an application env
-  setting.
-- `.env` and service `env_file` contain application configuration and runtime
-  secrets only. `env_file` injects variables into containers; Compose
-  interpolation is a separate mechanism. The standalone example expects a
-  `.env` beside the file. The checkout production file may use
-  `TMDB_ENV_FILE` only to select an external, ignored runtime env file; never
-  use it for host paths or ports.
-- Database role names are fixed in the PostgreSQL bootstrap. All six internal
-  roles use `POSTGRES_PASSWORD`; never add per-role `*_USER` or `*_PASSWORD`
-  entries to the runtime template.
-- Listener addresses, `PGDATA`, and PostgreSQL init arguments have fixed image
-  defaults. Do not make users enter them unless the application contract
-  changes.
-- `docker-compose-example.yaml` must remain a complete standalone Compose
-  document. Do not replace it with `include`, `extends`, or a wrapper that
-  requires another Compose file to run.
-- Before changing this contract, verify behavior in the official Docker docs:
-  [Compose environment variables](https://docs.docker.com/compose/how-tos/environment-variables/),
-  [Compose variable interpolation](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/),
-  and [Docker bind mounts](https://docs.docker.com/engine/storage/bind-mounts/).
+- Never print, commit, push, log, or store credentials in fixtures or reports.
+- Real stress credentials come only from ignored `secrets.txt` and are loaded
+  into a mode-600 runtime environment at execution time. Ignore both
+  `secrets.txt` and `.secrets.txt` defensively.
+- Never place real credentials in `.env`, Compose YAML, source, image layers,
+  build arguments, generated reports, or shell history.
+- Before commit or push, inspect the staged diff and confirm secrets,
+  environment files, databases, media, backups, logs, and runtime artifacts
+  are ignored by Git and Docker.
 
-### TMDB gallery and media contract
+## Compose contract
 
-- Fetch title, season, episode, person, company, network, and collection
-  galleries through their dedicated TMDB image endpoints. Request only
-  `language=en-US` with `include_image_language=en,null`.
-- Keep the primary detail image at gallery index 1. Number additional unique
-  source paths deterministically. Use `backdrop`, never the old `banner` kind.
-- Store original source bytes in the title/entity root folders. Store one
-  optimized derivative under the matching `optimized/` folder: JPEG quality
-  85 at max widths 640 for posters/seasons/thumbnails/profiles, 1280 for
-  backdrops, and PNG width 500 for logos. Never upscale or generate WebP,
-  `full`, or responsive variants.
-- Episode thumbnails are optimized-only under `optimized/thumbnails/`; no
-  original episode still is published. No `.masters` directory or old media
-  layout is created or retained.
-- Use TMDB IDs in reusable entity paths. Do not introduce local IDs for people,
-  companies, networks, or collections.
-- Videos are normalized metadata only. Do not download video files or create a
-  `/videos` folder. Build a YouTube watch URL from `site` and `key`; unknown
-  providers return a null URL.
-- Public API image fields must use local media URLs. Do not expose TMDB source
-  paths or filesystem paths; retain source paths only as internal sync keys.
-- The development schema may be recreated for this redesign. Do not add
-  compatibility paths or fallback media layouts.
+- Keep `docker-compose-example.yaml` a complete standalone document.
+- Put host bind sources and published ports in Compose, not `.env`.
+- Portable sources are `./data/postgres18`, `./data/config`, and
+  `./data/media`; operators may edit those Compose lines for their host.
+- Keep the default mappings `9001:8080` for the public API and `9002:8090`
+  for media. The admin listener stays container-only on `8081`.
+- Use explicit unique project names and loopback ports for disposable stress
+  stacks. Never touch unrelated containers, volumes, networks, or databases.
+- Never use `down -v` except for a named disposable stress project.
+- Validate interpolation, health, read-only roots, capability drops, mounts,
+  runtime-created folders, and port bindings before declaring a stack healthy.
 
-## Testing and debugging
+## Testing
 
-- Establish a read-only baseline first. When something fails, preserve the
-  exact command and output, reproduce it, localize the failing layer, fix the
-  root cause, add a guard, and rerun the full affected matrix.
-- Prefer unit tests for pure logic, integration tests for database/filesystem
-  boundaries, and bounded end-to-end tests for critical flows.
-- Exercise the API contract, health/readiness transitions, authorization and
-  idempotency, database migrations/roles/indexes, image downloads and HTTP
-  serving, path traversal and permissions, folder creation, worker retries
-  and restarts, backups, restore/PITR, and duplicate prevention.
-- Stress tests must be bounded and report request count, errors, throughput,
-  latency percentiles, resource usage, and container/log failures. External
-  TMDB and Trawl limits must be reported, never hidden or worked around by an
-  unbounded scan.
-- A test result is not valid if credentials appear in output or artifacts.
-  Redact first, then collect diagnostics.
-
-## Simplicity and maintenance
-
-- Do not keep dead code, commented-out implementations, duplicate paths, or a
-  wrapper/strategy/factory used by only one case. Confirm call sites, tests,
-  and history before removal.
-- Prefer direct, explicit code over clever generic infrastructure. Refactor
-  only after behavior is covered and keep each simplification reviewable.
-- Do not weaken validation, authorization, error handling, isolation, or
-  least-privilege settings in the name of simplicity.
+- Establish a read-only baseline and preserve unrelated user changes.
+- Use unit tests for pure logic, PostgreSQL/filesystem integration tests for
+  boundaries, and bounded Docker end-to-end tests for worker/API/media flows.
+- Verify migrations, roles, queue bounds, deduplication, pause/resume/cancel,
+  retries, restart persistence, API authorization, image paths and MIME types,
+  local HTTP serving, permissions, backups, and restore/PITR.
+- Stress tests must report bounded request counts, failures, latency, queue
+  depth, downloaded files, database rows, and container errors without
+  revealing credentials. TMDB/Trawl rate limits must be reported, never
+  bypassed with an unbounded scan.
+- When a test fails, reproduce it, identify the failing layer, fix the root
+  cause, add a guard, and rerun the affected matrix.
 
 ## Git and handoff
 
-- Use descriptive, atomic changes and verify before committing. Do not commit
-  or push unless the user explicitly asks for publication.
-- Final handoff must list changed files, commands run, measured results,
-  failures fixed, intentionally untouched user files, and remaining limits.
+- Run `git status --short` before and after work. Preserve unrelated edits;
+  never reset or clean the worktree to hide them.
+- Keep behavior, refactors, tests, and docs reviewable and separable.
+- Commit or push only when the user explicitly requests publication.
+- Handoff must state changed files, commands and measured results, fixed
+  failures, untouched user files, and remaining limits.

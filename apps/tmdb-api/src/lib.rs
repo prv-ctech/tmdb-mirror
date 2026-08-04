@@ -2,7 +2,7 @@
 
 mod admin_api;
 mod app;
-mod catalog_api;
+mod tmdb_v3_api;
 pub mod health;
 pub mod problem;
 
@@ -12,6 +12,7 @@ pub use admin_api::{
     AdminJobEvent, AdminJobListRequest, AdminJobPage, AdminMediaScanJobSummary, AdminMediaScanMode,
     AdminMediaScanStatus, AdminMediaScanSubmission, AdminMediaWorkerAction, AdminMediaWorkerStatus,
     AdminOperation, AdminPoolStatus, AdminQueueSummary, AdminStatus, AdminSubmission,
+    AdminWorkerAction, AdminWorkerStatus,
     DatabaseAdminStore,
 };
 pub use app::{
@@ -21,7 +22,5 @@ pub use app::{
     build_admin_router_with_timeout, build_router, build_router_with_timeout, build_test_router,
     shutdown_signal, supervise_shutdown,
 };
-pub use catalog_api::{
-    CatalogApiError, CatalogApiStore, build_catalog_router, build_catalog_router_with_media,
-};
+pub use tmdb_v3_api::build_tmdb_v3_router;
 pub use tmdb_db::ReadinessReport;

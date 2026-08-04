@@ -90,14 +90,12 @@ pub struct AdminPoolStatus {
     pub read_write_idle: usize,
 }
 
-/// Catalog totals split by public isolation boundary.
+/// Catalog totals by TMDB media namespace.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdminCatalogCounts {
     pub movies: i64,
     pub tv: i64,
-    pub anime_movies: i64,
-    pub anime_tv: i64,
 }
 
 /// One durable queue count group.
@@ -105,10 +103,16 @@ pub struct AdminCatalogCounts {
 #[serde(rename_all = "camelCase")]
 pub struct AdminQueueSummary {
     pub job_type: String,
+    /// Jobs that can still be claimed or are currently executing.
+    pub active: i64,
+    /// Retained rows for this job type, including terminal history.
+    pub retained: i64,
     pub queued: i64,
     pub running: i64,
     pub retry_wait: i64,
+    pub succeeded: i64,
     pub dead_letter: i64,
+    pub cancelled: i64,
 }
 
 /// Health state intentionally kept independent from secret upstream details.
@@ -165,8 +169,6 @@ impl AdminBackupStatus {
 pub(crate) fn record_status_metrics(metrics: &Metrics, status: &AdminStatus) {
     metrics.set_catalog_count(CatalogScope::Movies, status.catalog.movies);
     metrics.set_catalog_count(CatalogScope::Tv, status.catalog.tv);
-    metrics.set_catalog_count(CatalogScope::AnimeMovies, status.catalog.anime_movies);
-    metrics.set_catalog_count(CatalogScope::AnimeTv, status.catalog.anime_tv);
 
     for queue in &status.queues {
         metrics.set_queue_depth(&queue.job_type, QueueState::Queued, queue.queued);
@@ -291,9 +293,10 @@ impl AdminOperation {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminScanMode {
-    Full,
-    Missing,
-    Changes,
+    FullSweep,
+    MissingOnly,
+    PruneCleanup,
+    DailySync,
 }
 
 /// A catalog media namespace targeted by an explicit scan.
@@ -392,6 +395,11 @@ pub struct AdminMediaWorkerStatus {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Main ingest-worker control uses the same durable state contract as media.
+pub type AdminWorkerAction = AdminMediaWorkerAction;
+/// Main ingest-worker status uses the same durable state shape as media.
+pub type AdminWorkerStatus = AdminMediaWorkerStatus;
+
 /// Object-safe private administrative storage boundary.
 #[async_trait]
 pub trait AdminApiStore: Send + Sync + 'static {
@@ -429,6 +437,15 @@ pub trait AdminApiStore: Send + Sync + 'static {
     ) -> Result<AdminMediaWorkerStatus, AdminApiError>;
 
     async fn media_worker(&self) -> Result<AdminMediaWorkerStatus, AdminApiError>;
+
+    async fn set_worker(
+        &self,
+        action: AdminWorkerAction,
+        idempotency_key: &str,
+        request_id: &str,
+    ) -> Result<AdminWorkerStatus, AdminApiError>;
+
+    async fn worker(&self) -> Result<AdminWorkerStatus, AdminApiError>;
 
     async fn cancel(
         &self,
@@ -483,26 +500,26 @@ impl AdminApiStore for DatabaseAdminStore {
                   WHERE datname = pg_catalog.current_database())::bigint AS active_connections,
                 (SELECT pg_catalog.count(*)
                    FROM catalog.titles
-                  WHERE active AND media_type = 'movie' AND NOT is_anime)::bigint AS movies,
+                  WHERE active AND media_type = 'movie')::bigint AS movies,
                 (SELECT pg_catalog.count(*)
                    FROM catalog.titles
-                  WHERE active AND media_type = 'tv' AND NOT is_anime)::bigint AS tv,
-                (SELECT pg_catalog.count(*)
-                   FROM catalog.titles
-                  WHERE active AND media_type = 'movie' AND is_anime)::bigint AS anime_movies,
-                (SELECT pg_catalog.count(*)
-                   FROM catalog.titles
-                  WHERE active AND media_type = 'tv' AND is_anime)::bigint AS anime_tv",
+                  WHERE active AND media_type = 'tv')::bigint AS tv",
         )
         .fetch_one(&self.read_pool)
         .await
         .map_err(|error| map_database_error(&error))?;
         let queues = sqlx::query_as::<_, QueueRow>(
             "SELECT job_type,
+                    pg_catalog.count(*)::bigint AS retained,
+                    pg_catalog.count(*) FILTER (
+                        WHERE status IN ('queued', 'running', 'retry_wait')
+                    )::bigint AS active,
                     pg_catalog.count(*) FILTER (WHERE status = 'queued')::bigint AS queued,
                     pg_catalog.count(*) FILTER (WHERE status = 'running')::bigint AS running,
                     pg_catalog.count(*) FILTER (WHERE status = 'retry_wait')::bigint AS retry_wait,
-                    pg_catalog.count(*) FILTER (WHERE status = 'dead_letter')::bigint AS dead_letter
+                    pg_catalog.count(*) FILTER (WHERE status = 'succeeded')::bigint AS succeeded,
+                    pg_catalog.count(*) FILTER (WHERE status = 'dead_letter')::bigint AS dead_letter,
+                    pg_catalog.count(*) FILTER (WHERE status = 'cancelled')::bigint AS cancelled
                FROM ops.jobs
               GROUP BY job_type
               ORDER BY job_type
@@ -573,8 +590,6 @@ impl AdminApiStore for DatabaseAdminStore {
             catalog: AdminCatalogCounts {
                 movies: status.movies,
                 tv: status.tv,
-                anime_movies: status.anime_movies,
-                anime_tv: status.anime_tv,
             },
             queues: queues.into_iter().map(QueueRow::into_model).collect(),
             ingest: component_health
@@ -784,7 +799,7 @@ impl AdminApiStore for DatabaseAdminStore {
         let request_id = parse_request_id(request_id)?;
         let row: MediaWorkerStateRow = sqlx::query_as(
             "SELECT state
-               FROM ops.set_media_worker_state($1, $2, $3)",
+               FROM ops.set_worker_state('media', $1, $2, $3)",
         )
         .bind(media_worker_action_name(action))
         .bind(idempotency_key)
@@ -801,8 +816,44 @@ impl AdminApiStore for DatabaseAdminStore {
     async fn media_worker(&self) -> Result<AdminMediaWorkerStatus, AdminApiError> {
         sqlx::query_as::<_, MediaWorkerStatusRow>(
             "SELECT state, updated_at
-               FROM ops.media_worker_control
-              WHERE singleton",
+               FROM ops.worker_control
+              WHERE worker_kind = 'media'",
+        )
+        .fetch_optional(&self.read_pool)
+        .await
+        .map_err(|error| map_database_error(&error))?
+        .map(MediaWorkerStatusRow::into_model)
+        .ok_or(AdminApiError::Unavailable)
+    }
+
+    async fn set_worker(
+        &self,
+        action: AdminWorkerAction,
+        idempotency_key: &str,
+        request_id: &str,
+    ) -> Result<AdminWorkerStatus, AdminApiError> {
+        let request_id = parse_request_id(request_id)?;
+        let row: MediaWorkerStateRow = sqlx::query_as(
+            "SELECT state
+               FROM ops.set_worker_state('ingest', $1, $2, $3)",
+        )
+        .bind(media_worker_action_name(action))
+        .bind(idempotency_key)
+        .bind(request_id)
+        .fetch_one(&self.write_pool)
+        .await
+        .map_err(|error| map_database_error(&error))?;
+        self.worker().await.map(|mut status| {
+            status.state = row.state;
+            status
+        })
+    }
+
+    async fn worker(&self) -> Result<AdminWorkerStatus, AdminApiError> {
+        sqlx::query_as::<_, MediaWorkerStatusRow>(
+            "SELECT state, updated_at
+               FROM ops.worker_control
+              WHERE worker_kind = 'ingest'",
         )
         .fetch_optional(&self.read_pool)
         .await
@@ -860,27 +911,33 @@ struct StatusRow {
     active_connections: i64,
     movies: i64,
     tv: i64,
-    anime_movies: i64,
-    anime_tv: i64,
 }
 
 #[derive(FromRow)]
 struct QueueRow {
     job_type: String,
+    retained: i64,
+    active: i64,
     queued: i64,
     running: i64,
     retry_wait: i64,
+    succeeded: i64,
     dead_letter: i64,
+    cancelled: i64,
 }
 
 impl QueueRow {
     fn into_model(self) -> AdminQueueSummary {
         AdminQueueSummary {
             job_type: self.job_type,
+            active: self.active,
+            retained: self.retained,
             queued: self.queued,
             running: self.running,
             retry_wait: self.retry_wait,
+            succeeded: self.succeeded,
             dead_letter: self.dead_letter,
+            cancelled: self.cancelled,
         }
     }
 }
@@ -1170,6 +1227,7 @@ pub(crate) fn register_routes(router: Router<AdminState>) -> Router<AdminState> 
             "/admin/v1/media/worker",
             get(get_media_worker).post(set_media_worker),
         )
+        .route("/admin/v1/worker", get(get_worker).post(set_worker))
         .route("/admin/v1/jobs/{job_id}/cancel", post(cancel_job))
         .route("/admin/v1/jobs/{job_id}/retry", post(retry_job))
         .route("/admin/v1/media/audits", post(start_media_audit))
@@ -1218,7 +1276,7 @@ async fn openapi() -> Json<serde_json::Value> {
             },
             "/admin/v1/scans": {
                 "post": {
-                    "summary": "Queue an explicit catalog scan; never runs automatically on restart",
+                    "summary": "Queue an explicit full_sweep, missing_only, prune_cleanup, or daily_sync catalog scan; never runs automatically on restart",
                     "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}],
                     "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ScanRequest"}}}},
                     "responses": {"202": {"$ref": "#/components/responses/Accepted"}, "400": {"$ref": "#/components/responses/BadRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "409": {"$ref": "#/components/responses/IdempotencyConflict"}, "422": {"$ref": "#/components/responses/Rejected"}, "503": {"$ref": "#/components/responses/Unavailable"}}
@@ -1246,6 +1304,18 @@ async fn openapi() -> Json<serde_json::Value> {
                 },
                 "post": {
                     "summary": "Start, pause, resume, or cancel media work",
+                    "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}],
+                    "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MediaWorkerRequest"}}}},
+                    "responses": {"200": {"description": "Updated persistent worker state"}, "400": {"$ref": "#/components/responses/BadRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "409": {"$ref": "#/components/responses/IdempotencyConflict"}, "422": {"$ref": "#/components/responses/Rejected"}, "503": {"$ref": "#/components/responses/Unavailable"}}
+                }
+            },
+            "/admin/v1/worker": {
+                "get": {
+                    "summary": "Read persistent main ingest-worker control state",
+                    "responses": {"200": {"description": "Running, paused, or stopped"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "503": {"$ref": "#/components/responses/Unavailable"}}
+                },
+                "post": {
+                    "summary": "Start, pause, resume, or cancel main ingest work",
                     "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}],
                     "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MediaWorkerRequest"}}}},
                     "responses": {"200": {"description": "Updated persistent worker state"}, "400": {"$ref": "#/components/responses/BadRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "409": {"$ref": "#/components/responses/IdempotencyConflict"}, "422": {"$ref": "#/components/responses/Rejected"}, "503": {"$ref": "#/components/responses/Unavailable"}}
@@ -1304,7 +1374,7 @@ async fn openapi() -> Json<serde_json::Value> {
                 "RunId": {"name": "run_id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
             },
             "schemas": {
-                "ScanRequest": {"type": "object", "additionalProperties": false, "required": ["mode", "mediaTypes"], "properties": {"mode": {"type": "string", "enum": ["full", "missing", "changes"]}, "mediaTypes": {"type": "array", "minItems": 1, "maxItems": 2, "uniqueItems": true, "items": {"type": "string", "enum": ["movie", "tv"]}}}},
+                "ScanRequest": {"type": "object", "additionalProperties": false, "required": ["mode", "mediaTypes"], "properties": {"mode": {"type": "string", "enum": ["full_sweep", "missing_only", "prune_cleanup", "daily_sync"]}, "mediaTypes": {"type": "array", "minItems": 1, "maxItems": 2, "uniqueItems": true, "items": {"type": "string", "enum": ["movie", "tv"]}}}},
                 "MediaScanRequest": {"type": "object", "additionalProperties": false, "required": ["mode"], "properties": {"mode": {"type": "string", "enum": ["full", "missing", "audit"]}, "repair": {"type": "boolean", "default": false}}},
                 "MediaWorkerRequest": {"type": "object", "additionalProperties": false, "required": ["action"], "properties": {"action": {"type": "string", "enum": ["start", "pause", "resume", "cancel"]}}},
                 "MediaAuditRequest": {"type": "object", "additionalProperties": false, "properties": {"repair": {"type": "boolean", "default": false}}},
@@ -1486,6 +1556,45 @@ async fn get_media_worker(
         return failure(AdminApiError::Unavailable, &request_id.0);
     };
     match store.media_worker().await {
+        Ok(status) => Json(Data { data: status }).into_response(),
+        Err(error) => failure(error, &request_id.0),
+    }
+}
+
+async fn set_worker(
+    State(state): State<AdminState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+    payload: Result<Json<MediaWorkerRequest>, JsonRejection>,
+) -> Response {
+    let idempotency_key = match idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(error) => return failure(error, &request_id.0),
+    };
+    let payload = match bounded_json(payload) {
+        Ok(payload) => payload,
+        Err(error) => return failure(error, &request_id.0),
+    };
+    let Some(store) = state.operations.as_deref() else {
+        return failure(AdminApiError::Unavailable, &request_id.0);
+    };
+    match store
+        .set_worker(payload.action, idempotency_key, &request_id.0)
+        .await
+    {
+        Ok(status) => Json(Data { data: status }).into_response(),
+        Err(error) => failure(error, &request_id.0),
+    }
+}
+
+async fn get_worker(
+    State(state): State<AdminState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Response {
+    let Some(store) = state.operations.as_deref() else {
+        return failure(AdminApiError::Unavailable, &request_id.0);
+    };
+    match store.worker().await {
         Ok(status) => Json(Data { data: status }).into_response(),
         Err(error) => failure(error, &request_id.0),
     }

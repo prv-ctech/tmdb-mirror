@@ -10,7 +10,7 @@ use tmdb_api::{
     build_admin_router_with_operations_and_auth, build_router, shutdown_signal, supervise_shutdown,
 };
 use tmdb_config::{AppConfig, EnvSource, Environment, load_database_for_role};
-use tmdb_db::{CatalogRepository, PoolPolicy, connect_direct};
+use tmdb_db::{PoolPolicy, connect_direct};
 use tmdb_observability::{Metrics, init_tracing_from_env};
 use tokio_util::sync::CancellationToken;
 
@@ -19,9 +19,6 @@ async fn main() -> anyhow::Result<()> {
     init_tracing_from_env(env!("CARGO_PKG_NAME")).map_err(|error| anyhow::anyhow!(error))?;
     tracing::info!(event = "api_starting");
     let config = AppConfig::load(&EnvSource).context("load API configuration")?;
-    let allow_local_media = load_bool("ALLOW_LOCAL_MEDIA")?;
-    let media_base_url = load_optional_string("TMDB_MEDIA_BASE_URL")?;
-    let local_media_url_configured = media_base_url.is_some();
     let database_pools = connect_api_database_pools(config.environment).await?;
 
     let metrics = Metrics::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"), "unknown");
@@ -32,10 +29,10 @@ async fn main() -> anyhow::Result<()> {
         )),
         metrics.clone(),
     );
-    let catalog_router = tmdb_api::build_catalog_router_with_media(
-        Arc::new(CatalogRepository::new(database_pools.read_pool.clone())),
-        allow_local_media,
-        media_base_url,
+    let tmdb_v3_router = tmdb_api::build_tmdb_v3_router(
+        database_pools.read_pool.clone(),
+        database_pools.write_pool.clone(),
+        config.media_base_url.clone(),
     );
     let public_listener = tokio::net::TcpListener::bind(config.api_bind)
         .await
@@ -47,8 +44,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(event = "listener_started", listener = "admin");
     tracing::info!(
         event = "api_ready",
-        local_media_enabled = allow_local_media,
-        local_media_url_configured,
+        public_surface = "tmdb_v3",
     );
 
     let cancellation = CancellationToken::new();
@@ -69,7 +65,10 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let public_server = axum::serve(public_listener, build_router(state).merge(catalog_router))
+    let public_server = axum::serve(
+        public_listener,
+        build_router(state).merge(tmdb_v3_router),
+    )
         .with_graceful_shutdown(cancellation.clone().cancelled_owned())
         .into_future();
     let admin_server = axum::serve(
@@ -140,27 +139,4 @@ async fn connect_api_database_pools(environment: Environment) -> anyhow::Result<
         admin_read_pool,
         reader_username: reader_database.username,
     })
-}
-
-fn load_bool(name: &str) -> anyhow::Result<bool> {
-    match std::env::var(name) {
-        Ok(value) => value
-            .parse()
-            .map_err(|_| anyhow::anyhow!("configuration field {name} is invalid")),
-        Err(std::env::VarError::NotPresent) => Ok(false),
-        Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!(
-            "configuration field {name} is not valid Unicode"
-        )),
-    }
-}
-
-fn load_optional_string(name: &str) -> anyhow::Result<Option<String>> {
-    match std::env::var(name) {
-        Ok(value) if !value.trim().is_empty() => Ok(Some(value)),
-        Ok(_) => Err(anyhow::anyhow!("configuration field {name} is invalid")),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!(
-            "configuration field {name} is not valid Unicode"
-        )),
-    }
 }

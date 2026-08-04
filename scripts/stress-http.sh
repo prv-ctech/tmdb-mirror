@@ -38,16 +38,15 @@ base_url="http://127.0.0.1:$api_port"
 image_url="http://127.0.0.1:$image_port"
 urls=(
     "$base_url/health/live"
-    "$base_url/v1/movies?limit=20"
-    "$base_url/v1/tv?limit=20"
-    "$base_url/v1/search?q=Cafe&limit=20"
-    "$base_url/v1/anime?q=One%20Piece&limit=20"
-    "$base_url/v1/movies/550/images"
-    "$base_url/v1/tv/4586/images"
-    "$base_url/v1/tv/4586/videos"
-    "$base_url/v1/tv/4586/seasons/1/images"
-    "$base_url/v1/tv/4586/seasons/1/episodes/1/images"
-    "$base_url/v1/movies?genreId=900000002&language=en&runtimeMin=40&runtimeMax=120&personId=900000002&companyId=900000002&limit=20"
+    "$base_url/3/configuration"
+    "$base_url/3/movie/550"
+    "$base_url/3/movie/550/images?language=en-US&include_image_language=en,null"
+    "$base_url/3/tv/4586"
+    "$base_url/3/tv/4586/images?language=en-US&include_image_language=en,null"
+    "$base_url/3/tv/4586/videos?language=en-US&include_video_language=en,null"
+    "$base_url/3/tv/4586/season/1/images?language=en-US&include_image_language=en,null"
+    "$base_url/3/tv/4586/season/1/episode/1/images?language=en-US&include_image_language=en,null"
+    "$base_url/3/movie/550/videos?language=en-US&include_video_language=en,null"
 )
 
 request_one() {
@@ -115,9 +114,6 @@ check_body() {
     if ! curl --silent --show-error --fail --connect-timeout 5 --max-time 30 "$url" -o "$body"; then
         printf '%s\tFAIL\n' "$name" >>"$semantic_file"
         semantic_failures=$((semantic_failures + 1))
-    elif [[ "$pattern" == absent-anime && $(grep -ci '"isAnime"[[:space:]]*:[[:space:]]*true' "$body" || true) -ne 0 ]]; then
-        printf '%s\tFAIL\n' "$name" >>"$semantic_file"
-        semantic_failures=$((semantic_failures + 1))
     elif [[ "$pattern" == present && ! -s "$body" ]]; then
         printf '%s\tFAIL\n' "$name" >>"$semantic_file"
         semantic_failures=$((semantic_failures + 1))
@@ -139,16 +135,14 @@ check_status() {
 }
 
 : >"$semantic_file"
-check_body ordinary_routes_exclude_anime "$base_url/v1/movies?limit=100" absent-anime
-check_body anime_route_returns_data "$base_url/v1/anime?q=One%20Piece&limit=20" present
-check_body accent_search "$base_url/v1/search?q=Caf%C3%A9&limit=20" present
-check_body multi_facet_filter "$base_url/v1/movies?genreId=900000002&language=en&runtimeMin=40&runtimeMax=120&personId=900000002&companyId=900000002&limit=20" present
-check_status anime_tv_detail_accepts_live_fixture "$base_url/v1/anime/tv/37854" 200
-check_status ordinary_movie_detail_accepts_live_fixture "$base_url/v1/movies/1132850" 200
-check_status anime_movie_detail_rejects_skye_hoshi "$base_url/v1/anime/movie/1132850" 404
-check_status ordinary_tv_detail_accepts_death_note "$base_url/v1/tv/63648" 200
-check_status anime_tv_detail_rejects_death_note "$base_url/v1/anime/tv/63648" 404
-check_status ordinary_tv_detail_rejects_one_piece "$base_url/v1/tv/37854" 404
+check_body configuration_document "$base_url/3/configuration" present
+check_body movie_document "$base_url/3/movie/550" present
+check_body tv_document "$base_url/3/tv/4586" present
+check_body movie_videos "$base_url/3/movie/550/videos?language=en-US&include_video_language=en,null" present
+check_body tv_gallery "$base_url/3/tv/4586/images?language=en-US&include_image_language=en,null" present
+check_body tv_videos "$base_url/3/tv/4586/videos?language=en-US&include_video_language=en,null" present
+check_body season_gallery "$base_url/3/tv/4586/season/1/images?language=en-US&include_image_language=en,null" present
+check_body episode_gallery "$base_url/3/tv/4586/season/1/episode/1/images?language=en-US&include_image_language=en,null" present
 if curl --silent --show-error --fail --connect-timeout 5 --max-time 30 "$image_url/healthz" >/dev/null; then
     printf '%s\tPASS\n' media_health >>"$semantic_file"
 else
@@ -158,10 +152,9 @@ fi
 
 videos_body="$work_dir/videos.json"
 if curl --silent --show-error --fail --connect-timeout 5 --max-time 30 \
-    "$base_url/v1/tv/4586/videos" -o "$videos_body" \
+    "$base_url/3/tv/4586/videos?language=en-US&include_video_language=en,null" -o "$videos_body" \
     && grep -q 'Opening Credits' "$videos_body" \
-    && grep -q 'Trailer' "$videos_body" \
-    && grep -q 'https://www.youtube.com/watch?v=' "$videos_body"; then
+    && grep -q 'Trailer' "$videos_body"; then
     printf '%s\tPASS\n' video_types_and_youtube_url >>"$semantic_file"
 else
     printf '%s\tFAIL\n' video_types_and_youtube_url >>"$semantic_file"
@@ -170,9 +163,9 @@ fi
 
 gallery_body="$work_dir/gallery.json"
 if curl --silent --show-error --fail --connect-timeout 5 --max-time 30 \
-    "$base_url/v1/tv/4586/images" -o "$gallery_body" \
-    && grep -q 'galleryIndex' "$gallery_body" \
-    && ! grep -q 'sourceKey\|storagePath\|sourceStoragePath' "$gallery_body"; then
+    "$base_url/3/tv/4586/images?language=en-US&include_image_language=en,null" -o "$gallery_body" \
+    && grep -q 'backdrops' "$gallery_body" \
+    && grep -q 'posters' "$gallery_body"; then
     printf '%s\tPASS\n' gallery_metadata_is_localized >>"$semantic_file"
 else
     printf '%s\tFAIL\n' gallery_metadata_is_localized >>"$semantic_file"

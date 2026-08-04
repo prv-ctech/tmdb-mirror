@@ -11,8 +11,10 @@ mod parser;
 mod policy;
 
 pub use client::{
-    DailyExportDownload, MAX_DAILY_EXPORT_BYTES, ResponseClass, TmdbClient, TmdbClientError,
-    TrawlDecision, classify_response, trawl_decision,
+    DailyExportDownload, IMAGE_GALLERY_QUERY_STRING, MAX_DAILY_EXPORT_BYTES,
+    MOVIE_DETAIL_QUERY_STRING, ResponseClass, TV_DETAIL_QUERY_STRING, TmdbClient, TmdbClientError,
+    TrawlDecision, VIDEO_GALLERY_QUERY_STRING, classify_response,
+    trawl_decision,
 };
 pub use model::{
     ChangeGroup, ChangeHistory, ChangeItem, ChangePage, ChangedId, DailyExportRecord,

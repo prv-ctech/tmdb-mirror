@@ -15,7 +15,7 @@
 ## Load and search
 
 - [x] Add synthetic high-cardinality seed data and `ANALYZE`.
-- [x] Verify anime exclusion/inclusion and representative filters through the API.
+- [x] Verify TMDB v3 document routes and representative filters through the API.
 - [x] Add concurrent HTTP load runner with percentile latency and error reporting.
 - [x] Capture PostgreSQL activity/statistics and Docker resource samples.
 
@@ -32,9 +32,11 @@
 - [x] Run full verification matrix and collect final artifacts.
 - [x] Document exact measured results and remaining limits; commit or push only after explicit user authorization.
 
-## Anime classification follow-up
+## Scan controls
 
-- [x] Use the strict `anime` keyword `210024` plus `Animation` genre `16` predicate in movie and TV ingest.
-- [x] Add regression and API/media tests for keyword-only, genre-only, live-action, and English-language titles.
-- [x] Reset the disposable development database/media state and reseed consistent relationships.
-- [x] Run the full affected stress matrix before enabling the new rule.
+- [x] Keep worker startup idle until an authenticated admin action starts it.
+- [x] Bound export and missing-catalog fan-out with cursor continuations.
+- [x] Add explicit `full_sweep`, `missing_only`, `prune_cleanup`, and
+  `daily_sync` catalog modes.
+- [x] Run the Docker Desktop stress matrix against the current local image.
+- [x] Verify the live catalog queue remains bounded during a real TMDB scan.

@@ -84,13 +84,14 @@ async fn migrate_while_locked(connection: &mut PgConnection) -> Result<Migration
 /// keeps those databases least-privilege compatible while the next migration
 /// still runs under the correct role.
 async fn repair_application_role_grants(connection: &mut PgConnection) -> Result<(), DbError> {
-    const STATEMENTS: [&str; 17] = [
-        "GRANT USAGE ON SCHEMA catalog, search, assets, ops TO api_reader",
-        "GRANT SELECT ON ALL TABLES IN SCHEMA catalog, search, assets TO api_reader",
-        "GRANT USAGE ON SCHEMA catalog, source, search, ops TO ingest_writer",
+    const STATEMENTS: [&str; 18] = [
+        "GRANT USAGE ON SCHEMA catalog, source, search, assets, ops TO api_reader",
+        "GRANT SELECT ON ALL TABLES IN SCHEMA catalog, source, search, assets TO api_reader",
+        "GRANT USAGE ON SCHEMA catalog, source, search, assets, ops TO ingest_writer",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA catalog, source TO ingest_writer",
         "GRANT SELECT ON ALL TABLES IN SCHEMA search TO ingest_writer",
         "GRANT SELECT ON TABLE assets.image_assets TO ingest_writer",
+        "GRANT SELECT ON TABLE ops.jobs TO ingest_writer",
         "REVOKE INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA search FROM ingest_writer",
         "GRANT USAGE ON SCHEMA assets, ops TO image_writer",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA assets TO image_writer",
@@ -101,7 +102,7 @@ async fn repair_application_role_grants(connection: &mut PgConnection) -> Result
         "ALTER DEFAULT PRIVILEGES FOR ROLE migrator IN SCHEMA catalog, search, assets GRANT SELECT ON TABLES TO api_reader",
         "ALTER DEFAULT PRIVILEGES FOR ROLE migrator IN SCHEMA catalog, source, search GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ingest_writer",
         "GRANT USAGE ON SCHEMA catalog, ops TO monitor",
-        "GRANT SELECT ON TABLE catalog.titles, ops.jobs, ops.job_events, ops.backup_requests, ops.component_heartbeats, ops.readiness, ops.media_scan_runs, ops.media_scan_job_links, ops.media_worker_control TO monitor",
+        "GRANT SELECT ON TABLE catalog.titles, ops.jobs, ops.job_events, ops.backup_requests, ops.component_heartbeats, ops.readiness, ops.media_scan_runs, ops.media_scan_job_links, ops.worker_control, ops.worker_requests TO monitor",
     ];
     for statement in STATEMENTS {
         sqlx::query(statement)
