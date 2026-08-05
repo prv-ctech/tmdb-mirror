@@ -9,21 +9,35 @@
 .stress-runtime/
 .runtime/
 /data/
+/config/
+/media/
+/backups/
 /artifacts/
 /coverage/
 exports/
 results/
 logs/
+tmp/
 temp/
 temp_dir/
 scraps/
+.cache/
 *.log
 *.tmp
 *.bak
 *.dump
+*.db
 *.sql.gz
 *.sqlite
 *.sqlite3
+*.pid
+*.sock
+
+# Local credentials and private key material
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Rust
 /target/
@@ -41,6 +55,7 @@ __pycache__/
 .idea/
 .worktrees/
 .superpowers/
+superpowers/
 .agents/
 skills-lock.json
 

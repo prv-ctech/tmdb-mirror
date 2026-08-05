@@ -12,6 +12,8 @@ changing code. This repository is Linux-first; use Bash, Docker Desktop, and
   and health checks may run; catalog and media work require the admin API.
   A previously `running` state is reset to `stopped` during startup; a
   `paused` state remains paused for emergency persistence.
+- PostgreSQL's built-in pgBackRest schedule is independent of both worker
+  controls and remains the stack's only automatic scheduled work.
 - Both workers are controlled by the authenticated admin API: `start`,
   `pause`, `resume`, and `cancel`.
 - Catalog and media controls are independent. For an emergency stop, cancel
@@ -87,8 +89,9 @@ change.
   500 for logos. Never create WebP derivatives, `full` variants, or `.masters`.
 - Episode stills are optimized-only under `optimized/thumbnails/`.
 - Videos are metadata only. Do not download video files or create a videos
-  folder. Build recognized provider URLs from provider metadata; unknown
-  providers return `null`.
+  folder. The current public `/3/.../videos` response preserves TMDB's `site`
+  and `key` and does not synthesize a provider URL. If URL derivation is added,
+  it requires an API contract change and regression tests.
 
 ## Secrets and local state
 
@@ -108,8 +111,9 @@ change.
 - Put host bind sources and published ports in Compose, not `.env`.
 - Portable sources are `./data/postgres18`, `./data/config`, and
   `./data/media`; operators may edit those Compose lines for their host.
-- Keep the default mappings `9001:8080` for the public API and `9002:8090`
-  for media. The admin listener stays container-only on `8081`.
+- Keep the default mappings `9001:8080` for the public API, `8081:8081` for
+  the authenticated admin API, and `9002:8090` for media. Treat host port
+  `8081` as private operational access and protect it with the host firewall.
 - Use explicit unique project names and loopback ports for disposable stress
   stacks. Never touch unrelated containers, volumes, networks, or databases.
 - Never use `down -v` except for a named disposable stress project.

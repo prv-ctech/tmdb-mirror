@@ -1,8 +1,8 @@
 # TMDB Mirror
 
-Rust + PostgreSQL 18 mirror of TMDB metadata with the TMDB v3 read surface,
-local image storage, durable worker jobs, and four
-runtime services: PostgreSQL, API, main worker, and media worker.
+Rust + PostgreSQL 18 mirror of TMDB metadata with a local TMDB v3-compatible
+API, local image storage, durable jobs, and four runtime services: PostgreSQL,
+API, main worker, and media worker.
 
 ## Run with Docker Compose
 
@@ -58,13 +58,15 @@ does not use Compose `include`; place it beside the `.env` file.
 New checkout deployments can use the canonical file above. See
 [production deployment](docs/deployment-production.md) for bind mounts,
 permissions, media policy, and validation.
+The [documentation map](docs/README.md) separates current operator contracts
+from historical design records.
 
 These files replace the older deployment contract. The four services and host
 ports remain the same, but the current files use the `tmdb-runtime` startup
 wrapper for worker/media storage preparation, relative Compose bind sources,
-and publish the authenticated admin listener on host port `8081`. The root standalone file reads `.env` beside it;
-the production file reads `../.env` by default or the file selected by
-`TMDB_ENV_FILE`.
+and publish the authenticated admin listener on host port `8081`. The root
+standalone file reads `.env` beside it; the production file reads `../.env` by
+default or the file selected by `TMDB_ENV_FILE`.
 
 The current `.env.example` is intentionally minimal. Enter database owner
 credentials, the TMDB read token, admin key, API base URL, media settings, and
@@ -75,7 +77,7 @@ Compose.
 
 ## API
 
-Public catalog routes require no client key and mirror TMDB's `/3` paths:
+Public catalog routes require no client key and use TMDB's `/3` paths:
 
 ```text
 GET /health/live
@@ -85,6 +87,11 @@ GET /3/movie/{movie_id}/images
 GET /3/tv/{tv_id}/season/{season_number}/episode/{episode_number}
 GET /3/search/movie?query=matrix
 ```
+
+Stored metadata reads never call TMDB on demand. Search, discover, find,
+authentication/session, list, favorite/watchlist, and rating operations are
+implemented locally in PostgreSQL; other supported reads return documents
+captured by worker scans.
 
 The private admin API supports status, durable job history, explicit
 `full_sweep`, `missing_only`, `prune_cleanup`, and `daily_sync` scans,
@@ -103,10 +110,11 @@ collection galleries remain part of explicit media scans.
 change feeds, refreshes changed titles, and discovers newly added seasons and
 episodes through the refreshed TV and season documents.
 
-Neither worker runs a catalog scheduler or starts queued work automatically
-after a restart. A previously running worker is reset to stopped; a paused
-worker remains paused. Use the authenticated admin worker controls and scan
-routes to start work deliberately.
+Neither worker starts queue processing automatically after a restart. A
+previously running worker is reset to stopped; a paused worker remains paused.
+Start the main worker before submitting a catalog scan. Start the media worker
+only when image downloads should run; a catalog scan may create image jobs when
+`ALLOW_LOCAL_MEDIA=true`, but it does not start the media worker.
 
 See the complete [API reference](docs/api.md) and the private OpenAPI document
 at `/admin/v1/openapi.json`.
@@ -117,7 +125,9 @@ TMDB posters, backdrops, logos, season images, episode thumbnails, and
 reusable-entity galleries are downloaded from the dedicated TMDB image
 endpoints. Originals stay in TMDB-ID folders; one JPEG or PNG derivative is
 stored below `optimized/`. Episode thumbnails are optimized-only. Videos are
-database metadata with derived provider URLs; no video files are downloaded.
+stored as metadata (`site`, `key`, type, name, official/language/publication
+fields); no video files are downloaded. The current `/3/.../videos` response
+preserves TMDB's document and does not add a synthesized provider URL.
 
 ## Development and stress testing
 
@@ -138,7 +148,7 @@ test artifacts.
 
 ## Operations
 
-`TZ=America/New_York` controls schedule interpretation and readable log
+`TZ=America/New_York` controls the pgBackRest schedule and readable log
 timestamps; persisted API and database timestamps remain UTC. pgBackRest stores
 its same-host recovery repository at `/config/backups/pgbackrest`. See
 [backup and recovery](docs/backup-recovery.md).

@@ -5,17 +5,30 @@
 .gitignore
 .gitattributes
 .agents/
+.idea/
+**/.superpowers/
+**/superpowers/
 skills-lock.json
-secrets.txt
-.secrets.txt
+secrets*.txt
+.secrets*.txt
 *.pem
 *.key
+*.p12
+*.pfx
 
 # folders
 .venv/
 .vscode/
 .worktrees/
+.cache/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 data/
+config/
+media/
+backups/
 .stress-runtime/
 .runtime/
 artifacts/
@@ -23,10 +36,25 @@ coverage/
 exports/
 results/
 logs/
+tmp/
+temp/
+temp_dir/
+scraps/
 
 # files
 .env
 .env.*
+*.log
+*.tmp
+*.bak
+*.dump
+*.db
+*.sqlite
+*.sqlite3
+*.pid
+*.sock
+.DS_Store
+Thumbs.db
 gitignore
 docker-*.yml
 Dockerfile

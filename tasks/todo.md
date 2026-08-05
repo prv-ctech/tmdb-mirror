@@ -1,5 +1,8 @@
 # TMDB clone stress-test checklist
 
+Status: archived implementation checklist. Checked items describe completed
+repository work, not the current health of a running deployment.
+
 ## Harness
 
 - [x] Add ignored runtime directory and secret-safe bootstrap.
@@ -8,7 +11,8 @@
 
 ## Smoke checks
 
-- [x] Migrate and verify PostgreSQL 18 extensions, grants, indexes, and PgBouncer.
+- [x] Migrate and verify PostgreSQL 18 extensions, grants, indexes, and bounded
+  direct connection pools.
 - [x] Verify API liveness/readiness and all worker containers.
 - [x] Submit and complete a deterministic no-op job.
 

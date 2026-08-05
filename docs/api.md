@@ -1,14 +1,15 @@
-# API reference
+ # API reference
 
-The public listener is a local, read-only TMDB v3 document mirror. It returns
-the JSON document captured from the upstream endpoint; it does not invent a
-second catalog schema or an anime namespace.
+The public listener is a local TMDB v3-compatible API. Most metadata reads
+return JSON documents captured from TMDB; selected query and user-state routes
+are generated from local PostgreSQL data. It does not invent a second catalog
+schema or an anime namespace, and it never proxies a request to TMDB on demand.
 
 | Listener | Port | Contract |
 | --- | ---: | --- |
 | Public API | `9001` | Health and `/3/...` TMDB documents |
 | Admin API | `8081` | Authenticated worker, scan, job, and backup control |
-| Media | `9002` | Verified local image files |
+| Media | `9002` | Safe regular files below the local `/media` mount |
 
 ## Public routes
 
@@ -18,10 +19,19 @@ GET /health/ready
 GET /3/{tmdb_v3_endpoint_path}
 ```
 
-Implemented search, discovery, account, and write routes query the local
-database directly. Other `/3/{tmdb_v3_endpoint_path}` reads return the exact
-document captured by a worker scan. The public API never fetches TMDB on
-demand. A missing local document returns the TMDB not-found shape:
+These routes are generated locally rather than loaded from the document store:
+
+- `search/movie`, `search/tv`, `search/multi`, `search/person`,
+  `search/collection`, `search/company`, and `search/keyword`;
+- `discover/movie`, `discover/tv`, and `find/{external_id}`;
+- authentication tokens, guest sessions, sessions, account lists,
+  favorite/watchlist state, local lists, and movie/TV/episode ratings.
+
+Other `/3/{tmdb_v3_endpoint_path}` reads return the matching document captured
+by a worker scan. Query strings are canonicalized; a stored default page or
+language document can satisfy the equivalent request without those defaults.
+A missing generated resource or captured document returns the TMDB not-found
+shape:
 
 ```json
 {
@@ -31,10 +41,10 @@ demand. A missing local document returns the TMDB not-found shape:
 }
 ```
 
-The route accepts the TMDB v3 read surface, including:
+Worker enrichment currently captures these TMDB v3 document families:
 
-- configuration, certifications, changes, discover, find, genres, keywords,
-  search, trending, and watch providers;
+- configuration, certifications, changes, genres, keywords, trending, and
+  watch providers;
 - movie lists and movie details, including account states, alternative titles,
   changes, credits, external IDs, images, keywords, lists, recommendations,
   release dates, reviews, similar, translations, videos, and watch providers;
@@ -47,7 +57,9 @@ The route accepts the TMDB v3 read surface, including:
 - collections, companies, networks, reviews, and their detail/image/name
   endpoints.
 
-Use the official TMDB v3 path and query names unchanged. For example:
+Availability is local-data dependent: an official TMDB route that has not been
+generated locally or captured by a scan returns local `404`, not an upstream
+request. Use the official TMDB v3 path and query names unchanged. For example:
 
 ```bash
 curl -sS 'http://127.0.0.1:9001/3/configuration'
@@ -56,9 +68,10 @@ curl -sS 'http://127.0.0.1:9001/3/tv/4586/images?language=en-US&include_image_la
 curl -sS 'http://127.0.0.1:9001/3/tv/4586/season/1/episode/1/images?language=en-US&include_image_language=en,null'
 ```
 
-The worker captures title, season, episode, reusable-entity, and configuration
-documents during explicit scans. An endpoint is not fetched on demand by the
-public API. TMDB image paths are preserved and an additive local field contains
+The worker captures title, season, episode, linked credit/review/keyword,
+reusable-entity, list/trending, and configuration documents during explicit
+scans. An endpoint is not fetched on demand by the public API. TMDB image paths
+are preserved and an additive local field contains
 the matching full media URL when the asset is ready, or `null` when it is not.
 Set `TMDB_MEDIA_BASE_URL` to the public base URL of the media listener.
 
@@ -86,15 +99,29 @@ The media worker records ready local assets in PostgreSQL. The API resolves
 the additive fields from those records; the workers do not communicate
 directly and the stored upstream TMDB document is not modified.
 
+## Video metadata
+
+Title video rows are normalized in PostgreSQL by `site`, `video_key`,
+`video_type`, name, official flag, language, country, publication time, and
+size. `/3/movie/{id}/videos` and `/3/tv/{id}/videos` return the captured TMDB
+document, including its provider `site` and `key`. The current API does not add
+a provider `url` field. No video files are downloaded or served by the media
+listener.
+
 ## Media files
 
-The media listener exposes only verified local files:
+The media listener exposes safe regular files below `/media`:
 
 ```text
 GET /health/live
 GET /healthz
 GET /media/{relative_path}
 ```
+
+Hidden paths, traversal, symlink escapes, missing files, and directories return
+`404`. Successful files include a content type derived from the extension, an
+immutable one-year cache policy, and a weak ETag; matching `If-None-Match`
+requests return `304`.
 
 Files are stored under TMDB-ID paths. Originals are outside `optimized/`;
 optimized files use JPEG quality 85 at width 640 for posters, seasons,
@@ -116,6 +143,7 @@ reusing it with a different request returns `409`.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/admin/v1/openapi.json` | Private OpenAPI document |
+| `GET` | `/metrics` | Prometheus metrics for the bounded status projection |
 | `GET` | `/admin/v1/status` | Bounded operational status |
 | `GET` | `/admin/v1/jobs` | Bounded durable-job page |
 | `GET` | `/admin/v1/jobs/{job_id}` | Job and immutable events |
@@ -135,11 +163,18 @@ reusing it with a different request returns `409`.
 
 Queue counts in `/admin/v1/status` are split deliberately. `active` is the
 live backlog (`queued`, `running`, and `retry_wait`); `retained` includes
-terminal history and is not backlog. Use `active` for queue alarms. `prune_cleanup` removes old,
-unreferenced terminal job history in bounded batches. Once a completed scan is
-past the retention window, its child-job links are released; the scan root and
-its aggregate counters remain available for audit. Terminal cleanup uses
-retention indexes and remains an explicit operator action.
+terminal history and is not backlog. Use `active` for queue alarms.
+`prune_cleanup` removes old, unreferenced terminal job history in bounded
+batches. Once a completed scan is past the retention window, its child-job
+links are released; the scan root and its aggregate counters remain available
+for audit. Terminal cleanup uses retention indexes and remains an explicit
+operator action.
+
+`GET /admin/v1/jobs` accepts `limit` (`1..=100`, default `50`), an opaque
+`cursor`, `status`, and `jobType`. Job responses omit raw payloads and
+idempotency keys. `/admin/v1/status` reports build/schema identity, database
+size and connections, API pool state, movie/TV totals, bounded queue groups,
+component heartbeats, and backup state; all API timestamps are UTC.
 
 `full_sweep` imports TMDB's daily movie and TV ID exports in uninterrupted
 500-title scheduling batches. Durable 100-title enrichment batches begin only
@@ -159,7 +194,8 @@ curl -sS -X POST http://127.0.0.1:8081/admin/v1/scans \
   -d '{"mode":"full_sweep","mediaTypes":["movie","tv"]}'
 ```
 
-Example worker control:
+Start the worker before submitting a scan. A scan submission can remain queued
+while the worker is stopped:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8081/admin/v1/worker \
@@ -167,6 +203,29 @@ curl -sS -X POST http://127.0.0.1:8081/admin/v1/worker \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: worker-start-20260803' \
   -d '{"action":"start"}'
+
+curl -sS -X POST http://127.0.0.1:8081/admin/v1/scans \
+  -H "X-API-Key: $TMDB_ADMIN_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: daily-sync-20260803' \
+  -d '{"mode":"daily_sync","mediaTypes":["movie","tv"]}'
+```
+
+The media worker is independent. Starting it drains eligible image/audit jobs;
+submitting a media scan does not bypass its stopped state:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8081/admin/v1/media/worker \
+  -H "X-API-Key: $TMDB_ADMIN_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: media-start-20260803' \
+  -d '{"action":"start"}'
+
+curl -sS -X POST http://127.0.0.1:8081/admin/v1/media/scans \
+  -H "X-API-Key: $TMDB_ADMIN_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: media-missing-20260803' \
+  -d '{"mode":"missing","repair":false}'
 ```
 
 `pause` stops new claims and lets the active job finish. `cancel` stops the

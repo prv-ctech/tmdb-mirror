@@ -1,9 +1,10 @@
 # Releases
 
-GitHub Actions only builds and publishes images. A push to `main` publishes the
-rolling `main` tags. Create an immutable semantic tag such as `v1.2.3` to
-publish matching immutable image tags and a GitHub release asset named
-`tmdb-mirror-v1.2.3.compose.yaml`.
+The publish workflow builds and publishes images; it does not run the local
+integration, stress, backup, or restore matrix. A push to `main` publishes the
+rolling `main` and commit-SHA tags. Create an immutable semantic tag such as
+`v1.2.3` to publish matching immutable image and SHA tags plus a GitHub release
+asset named `tmdb-mirror-v1.2.3.compose.yaml`.
 
 That release Compose file has no `build:` section and pins both images by
 digest. It starts the same four production containers with named volumes by
@@ -31,9 +32,15 @@ docker compose --env-file "$TMDB_ENV_FILE" \
   -f <release-compose-file> up -d
 ```
 
-The release template defaults to `./.env` for compatibility when
-`TMDB_ENV_FILE` is not set. The production checkout Compose file and the
-release artifact use the same four-service contract.
+The release template defaults to `./.env` when `TMDB_ENV_FILE` is not set. It
+publishes host ports `8080`, `8081`, and `8090` directly, while the checkout
+production example publishes `9001`, `8081`, and `9002`. Both use the same
+container ports and four-service topology; edit only the Compose `ports:` lines
+when different host ports are required.
+
+The release artifact uses the same neutral external network key
+`"your.network"`. Replace every occurrence with an existing Docker network
+name before startup; Compose does not create that external network.
 
 For Unraid, replace the named-volume entries once with dedicated bind mounts.
 The right-hand container paths stay fixed:

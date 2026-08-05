@@ -1,7 +1,8 @@
 # TMDB Gallery, Media, Video, and Controlled Scan Redesign
 
-Status: implemented and verified in unit, database, API, and bounded Docker
-stress tests. The development database and media directory may be recreated.
+Status: implemented except for synthesized provider URLs. This file records
+the as-built media contract and the remaining video-response gap; current
+runtime operation is documented in `README.md` and `docs/api.md`.
 
 ## Goal
 
@@ -12,10 +13,9 @@ admin control over media scans and the media queue.
 
 ## Research findings
 
-The current client has dedicated methods for title, season, episode, person,
-company, network, and collection image galleries. Reusable people and network
-assets are currently enqueued only as a side effect of title or season refresh.
-There is no independent backfill for reusable entities.
+The client has dedicated methods for title, season, episode, person, company,
+network, and collection image galleries. Full and missing media scans provide
+the independent bounded backfill for reusable entities.
 
 Official TMDB endpoints:
 
@@ -24,7 +24,7 @@ Official TMDB endpoints:
 - Collection details: `/collection/{collection_id}` ([reference](https://developer.themoviedb.org/reference/collection-details)).
 - Collection posters/backdrops: `/collection/{collection_id}/images` ([reference](https://developer.themoviedb.org/reference/collection-images)).
 
-Live checks confirmed:
+Historical live checks performed during the 2026-08-03 redesign confirmed:
 
 - Person `1373074` returns 4 profiles.
 - Network `614` returns 2 logos.
@@ -52,8 +52,9 @@ Title video requests use dedicated movie/TV video endpoints and retain every
 returned TMDB video type.
 
 Gallery records contain `file_path`, dimensions, aspect ratio, language, vote
-metadata, and optional `file_type`. YouTube URLs are derived from `site` and
-`key`; no redundant URL column is stored.
+metadata, and optional `file_type`. Video `site` and `key` are normalized with
+no redundant URL column. The current public response does not yet synthesize a
+provider URL.
 
 Optional gallery 404 responses are nonfatal after a successful detail response.
 The detail poster/backdrop remains eligible for download. Other upstream
@@ -135,10 +136,11 @@ documents the SVG/PNG behavior in its [image basics](https://developer.themovied
 
 ## Ingest and reusable-entity backfill
 
-- Keep the existing title/season enqueue path for immediate downloads.
-- Add one bounded reusable-gallery refresh job supporting `person`,
+- Title and season persistence can enqueue immediate downloads.
+- One bounded reusable-gallery refresh job supports `person`,
   `company`, `network`, and `collection` entities.
-- A media full scan enumerates every local title, season, episode, person,
+- A media full scan first runs a catalog `full_sweep`, then enumerates every
+  local title, season, episode, person,
   company, network, and collection and refreshes their dedicated galleries.
 - Include every `catalog.people` record, covering cast and crew.
 - Use TMDB IDs as the source key and existing deduplication to prevent duplicate
@@ -158,16 +160,19 @@ Enforce:
 - Thumbnail variants under `optimized/thumbnails/` and no wider than 640.
 - No duplicate primary, `jpeg_full`, or WebP variants.
 
-Public image responses return local media URLs, not raw TMDB paths. This applies
-to titles, seasons, episodes, people, companies, networks, and collections.
+Public responses preserve TMDB's `file_path`, `poster_path`, `backdrop_path`,
+`profile_path`, `logo_path`, and `still_path`. The API adds the corresponding
+`local_*` field as a full media URL when a ready database asset exists, or
+`null` otherwise. The stored upstream document is never rewritten.
 
-Add durable media scan state containing the run ID, mode, phase, status,
-timestamps, counts, and linked jobs. Add persistent media queue control state;
-do not use the Docker socket or container lifecycle as the control mechanism.
+Durable media scan state contains the run ID, mode, phase, status, timestamps,
+counts, and linked jobs. Persistent media queue control state is stored in
+PostgreSQL; the Docker socket and container lifecycle are not control
+mechanisms.
 
 ## Media workflow and admin API
 
-Add one durable media-scan workflow:
+The durable media-scan workflow is:
 
 - `full`: refresh the catalog first, then refresh all title, season, episode,
   person, company, network, and collection galleries.
@@ -175,7 +180,7 @@ Add one durable media-scan workflow:
 - `audit`: report local file/database problems; `repair: true` explicitly
   queues verified repairs.
 
-Add these private admin endpoints:
+The private admin endpoints are:
 
 ```text
 POST /admin/v1/media/scans
@@ -189,15 +194,16 @@ Worker actions are `start`, `pause`, `resume`, and `cancel`.
 - `pause` stops new media claims and lets active downloads finish.
 - `resume` re-enables claims from the paused state.
 - `start` re-enables claims after a stopped/cancelled state.
-- `cancel` immediately aborts active media work, cancels queued media jobs,
-  leaves catalog-ingest jobs untouched, and puts the media queue in stopped
-  state.
+- `cancel` cancels queued media work, requests cooperative cancellation of
+  active media jobs, leaves catalog-ingest jobs untouched, and puts the media
+  queue in stopped state.
 - Cancelled work remains stopped until explicitly started or resumed.
 - Compose continues starting the container; the API controls only durable
   media queue behavior.
 - Scan status reports phase, timestamps, queued/completed/failed counts, audit
   counts, and linked job summaries.
-- Full scans wait for both catalog and media phases before completing.
+- Full and missing scans wait for their catalog and media phases before
+  completing. Audit scans run only the audit phase.
 
 ## Videos
 
@@ -217,18 +223,20 @@ published_at
 size
 ```
 
-Build YouTube URLs as:
+The planned YouTube URL shape is:
 
 ```text
 https://www.youtube.com/watch?v=<key>
 ```
 
-Unknown providers retain `site` and `key` but return `url: null`. Videos
-are metadata references and are never downloaded.
+This API transformation is not implemented: `/3/.../videos` currently returns
+the captured TMDB document with `site` and `key` and no added `url`. Unknown
+providers likewise have no synthesized URL field. Videos are metadata
+references and are never downloaded.
 
 ## Tests and stress verification
 
-Add coverage for:
+Coverage includes:
 
 - Person `1373074` and network `614` gallery parsing.
 - Network `file_type=.svg` with PNG download handling.
@@ -253,9 +261,9 @@ collection `4246`.
 
 ## Documentation and agent rules
 
-Update `README.md`, `docs/api.md`, `docs/deployment-production.md`,
-`docs/stress-testing.md`, `AGENTS.md`, runtime directory preparation, media
-layout code, and stress scripts.
+The implementation updates `README.md`, `docs/api.md`,
+`docs/deployment-production.md`, `docs/stress-testing.md`, `AGENTS.md`, runtime
+directory preparation, media layout code, and stress scripts.
 
 Agent rules must state:
 

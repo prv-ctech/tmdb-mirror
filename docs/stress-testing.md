@@ -109,6 +109,13 @@ creation, and isolated PITR restore. When stopping both workflows under load,
 cancel catalog ingest first, let active catalog jobs settle, then cancel media
 to clear image jobs committed by work that was already in flight.
 
+The commands above automate Unicode search, worker/media controls, local media
+fields, HTTP concurrency, and the gallery filesystem/database checks. Local
+account/list/rating writes are covered by the Rust PostgreSQL API tests;
+pgBackRest runner/PITR behavior is covered by the two explicit scripts below.
+The repository does not claim that one stress script covers every item in this
+qualification list.
+
 The private backup API accepts `{"type":"full"}` or
 `{"type":"differential"}` and requires an idempotency key. It returns a durable
 job ID; poll that job through the admin API, then verify the paired request and

@@ -18,9 +18,12 @@
 - A daily export is read in 500-ID batches.
 - A continuation is scheduled only after the current batch finishes.
 - Active title/season/reusable refresh work is capped at 1,000 jobs.
+- Active image-download work is capped at 10,000 jobs.
 - Missing-catalog scans use 500-row keyset batches and cursor continuations.
 - Idempotency keys prevent duplicate refresh jobs.
 - A restart does not enqueue catalog or media work.
+- Main-worker concurrency follows `TMDB_MAX_CONNECTIONS` and is clamped to 64;
+  request starts remain capped by `TMDB_RATE_LIMIT` at 40 per second.
 
 ## Media contract
 
@@ -30,8 +33,8 @@
   derivative in `optimized/`; episode stills are optimized-only thumbnails.
 - Use TMDB IDs for reusable entities. Do not create `.masters`, WebP
   derivatives, video files, or compatibility paths.
-- Store video metadata only. Build a provider URL from `site` and `key` only
-  for recognized providers.
+- Store video metadata only. The current public response preserves `site` and
+  `key` but does not synthesize a provider URL.
 
 ## Verification
 

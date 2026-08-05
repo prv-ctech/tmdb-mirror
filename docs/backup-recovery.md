@@ -54,9 +54,10 @@ repository with `tmdb-pgbackrest info` inside PostgreSQL.
 
 A backup runs `check` after every backup and `verify` after a new full backup.
 It creates the backup with expiration deferred, then expires the old recovery
-chain only after those checks succeed. Retention is one full and its five
-weekday differentials plus their required WAL. A failed backup or verification
-leaves the prior chain intact.
+chain only after those checks succeed. The generated pgBackRest configuration
+sets `repo1-retention-full=1`, `repo1-retention-diff=6`, and archive retention
+by differential chain. A failed backup or verification leaves the prior chain
+intact.
 
 Read backup state with `GET /admin/v1/backups` or the bounded backup metrics on
 the private `/metrics` listener. For a shell-only inspection from the running

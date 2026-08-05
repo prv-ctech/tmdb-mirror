@@ -10,6 +10,12 @@ while IFS= read -r -d '' file; do
 done < <(git -C "$REPO_ROOT" ls-files -z)
 (( ${#tracked_files[@]} > 0 )) || die 'could not enumerate tracked files'
 
+for relative_path in "${tracked_files[@]}"; do
+    if [[ "$relative_path" =~ (^|/)superpowers/ ]] && [[ -e "$REPO_ROOT/$relative_path" ]]; then
+        die "Superpowers artifact is tracked: $relative_path"
+    fi
+done
+
 rules=(
     'TMDB/JWT credential|(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?![A-Za-z0-9_-])'
     'URI credentials|(?i)\bhttps?://[^/\s:@]+:[^@\s/]{16,}@'
@@ -39,8 +45,10 @@ done
 
 ignored_probes=(
     .env .secrets.txt secrets.txt
+    local.key local.p12 docs/superpowers/example.md superpowers/example.md
     .stress-runtime/example/token target/debug/example example.log
     data/media/example.jpg data/config/example.json
+    media/example.jpg config/example.json backups/example.dump
 )
 for probe in "${ignored_probes[@]}"; do
     git -C "$REPO_ROOT" check-ignore --no-index --quiet -- "$probe" \

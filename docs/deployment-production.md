@@ -9,7 +9,8 @@ pulls two GitHub-built Linux AMD64 images:
 The stack is deliberately only four services:
 
 1. PostgreSQL 18, including `pg_trgm`, `unaccent`, and `pg_stat_statements`.
-2. API, with the TMDB v3 read surface and bounded read connections.
+2. API, with the local TMDB v3-compatible surface and bounded read/write
+   connection pools.
 3. Main worker, which migrates and runs explicitly submitted ingest jobs.
 4. Media worker, which downloads/verifies images and serves `/media` directly
    through its embedded read-only HTTP server.
@@ -20,6 +21,8 @@ in-process catalog scheduler: restarts do not submit changes, trending, or
 daily-export jobs. A running worker is reset to stopped on restart, while a
 paused worker remains paused. The disposable stress
 Compose file uses the same four-service shape with isolated named volumes.
+PostgreSQL does run its built-in pgBackRest backup scheduler; that is the only
+automatic scheduled work in the stack.
 The PostgreSQL service also declares a 2 GiB `/dev/shm`; Docker's 64 MiB
 default is too small for parallel query workers during a 100-client burst.
 
@@ -176,16 +179,18 @@ docker compose --env-file "$TMDB_ENV_FILE" \
   -f deploy/compose.production.yaml up -d
 ```
 
-The main worker applies migrations under the existing PostgreSQL advisory lock;
+The main worker applies all embedded SQLx migrations under the PostgreSQL
+advisory lock;
 restarts are safe and reset a running worker to stopped, so they do not start
 catalog or media work. Operators request
 `full_sweep`, `missing_only`, `prune_cleanup`, or `daily_sync` through the
 private admin API. The same API can start, pause, resume, or cancel either
-worker; pausing blocks new claims and does not stop the container. The worker
-runs up to eight ingestion loops, bounded by
-`TMDB_MAX_CONNECTIONS` and `TMDB_RATE_LIMIT`. The media worker waits for the
-durable queue schema before claiming image jobs, so first-boot migrations do
-not cause an image-worker crash.
+worker; pausing blocks new claims and does not stop the container. The main
+worker creates one ingest loop per configured `TMDB_MAX_CONNECTIONS`, clamped
+to `1..=64`; the shared upstream request-start limiter remains bounded by
+`TMDB_RATE_LIMIT` at `40` requests per second or less. The media worker waits
+for the durable queue schema before claiming image jobs, so first-boot
+migrations do not cause an image-worker crash.
 
 Use `daily_sync` for incremental production updates. It reads TMDB's movie and
 TV change feeds, refreshes changed titles, and discovers new seasons and
@@ -196,10 +201,12 @@ image jobs behind.
 
 ## Media policy
 
-`ALLOW_LOCAL_MEDIA=true` causes the worker to create gallery image jobs in the
-same transaction as a committed title/entity and the API returns local URLs
-based on `TMDB_MEDIA_BASE_URL`. When false, no new image jobs are created and
-image responses have no local URL.
+`ALLOW_LOCAL_MEDIA=true` causes the main worker to create gallery image jobs in
+the same transaction as committed catalog data. The media worker later records
+verified files in PostgreSQL. The API preserves each upstream TMDB image field
+and adds the corresponding `local_*` URL using `TMDB_MEDIA_BASE_URL`; the local
+field is `null` until an asset is ready. When local media is disabled, no new
+image jobs are created.
 
 Public paths are deterministic and use TMDB IDs:
 
