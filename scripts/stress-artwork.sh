@@ -21,7 +21,10 @@ while (($#)); do
     esac
 done
 
-configure_runtime "$project" "$api_port" "$admin_port" "$image_port" "${TMDB_STRESS_PG_PORT:-55433}"
+configure_existing_runtime "$project" "$api_port" "$admin_port" "$image_port" "${TMDB_STRESS_PG_PORT:-55433}"
+api_port="$API_PORT"
+admin_port="$ADMIN_PORT"
+image_port="$IMAGE_PORT"
 load_runtime
 require_command curl
 require_command python3

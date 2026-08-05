@@ -13,11 +13,13 @@ if [[ "${1:-}" == '--self-test' ]]; then
         '# local only' \
         'TMDB_STRESS_READ_TOKEN=unit-read-token' \
         'TMDB_STRESS_API_KEY=unit-v3-api-key' \
-        'TMDB_STRESS_TRAWL_BASE_URL=http://trawl.example:8191' >"$test_file"
+        'TMDB_STRESS_TRAWL_BASE_URL=http://trawl.example:8191' \
+        'TMDB_ADMIN_API_KEY=local-admin-key' >"$test_file"
     read_stress_secrets "$test_file"
     [[ "$STRESS_READ_TOKEN" == 'unit-read-token' ]] || die 'read token parser test failed'
     [[ "$STRESS_API_KEY" == 'unit-v3-api-key' ]] || die 'API key parser test failed'
     [[ "$STRESS_TRAWL_URL" == 'http://trawl.example:8191' ]] || die 'Trawl parser test failed'
+    [[ -z "${STRESS_SECRETS[TMDB_ADMIN_API_KEY]+present}" ]] || die 'admin key must remain outside stress credentials'
 
     printf '%s' 'TMDB_STRESS_READ_TOKEN="quoted-value"' >"$test_file"
     if (read_stress_secrets "$test_file") 2>/dev/null; then

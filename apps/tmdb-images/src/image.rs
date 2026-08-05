@@ -110,7 +110,7 @@ pub struct ImageJobPayload {
     pub source_revision: Option<String>,
     /// Season number for season/episode assets.
     #[serde(default)]
-    pub season_number: Option<u16>,
+    pub season_number: Option<u32>,
     /// Episode number for episode assets.
     #[serde(default)]
     pub episode_number: Option<u16>,
@@ -181,7 +181,7 @@ impl ImageJobPayload {
     pub fn with_tv_position(
         mut self,
         title_tmdb_id: i64,
-        season_number: u16,
+        season_number: u32,
         episode_number: Option<u16>,
     ) -> Result<Self, ImagePayloadError> {
         self.title_tmdb_id = Some(title_tmdb_id);
@@ -1384,20 +1384,12 @@ fn semantic_path(payload: &ImageJobPayload, mime_type: &str) -> Result<PathBuf, 
         },
     };
     match payload.entity_type {
-        ImageEntityType::Movie => title_asset(
-            TitleScope::Movie,
-            payload.entity_id,
-            variant,
-            format,
-        )
-        .map_err(|_| ()),
-        ImageEntityType::Tv => title_asset(
-            TitleScope::Tv,
-            payload.entity_id,
-            variant,
-            format,
-        )
-        .map_err(|_| ()),
+        ImageEntityType::Movie => {
+            title_asset(TitleScope::Movie, payload.entity_id, variant, format).map_err(|_| ())
+        }
+        ImageEntityType::Tv => {
+            title_asset(TitleScope::Tv, payload.entity_id, variant, format).map_err(|_| ())
+        }
         ImageEntityType::Season | ImageEntityType::Episode => title_asset(
             TitleScope::Tv,
             payload.title_tmdb_id.ok_or(())?,
@@ -1471,22 +1463,14 @@ fn semantic_derivative_path(payload: &ImageJobPayload, width_hint: u32) -> Resul
         },
     };
     match payload.entity_type {
-        ImageEntityType::Movie => optimized_title_asset(
-            TitleScope::Movie,
-            payload.entity_id,
-            variant,
-            format,
-            width,
-        )
-        .map_err(|_| ()),
-        ImageEntityType::Tv => optimized_title_asset(
-            TitleScope::Tv,
-            payload.entity_id,
-            variant,
-            format,
-            width,
-        )
-        .map_err(|_| ()),
+        ImageEntityType::Movie => {
+            optimized_title_asset(TitleScope::Movie, payload.entity_id, variant, format, width)
+                .map_err(|_| ())
+        }
+        ImageEntityType::Tv => {
+            optimized_title_asset(TitleScope::Tv, payload.entity_id, variant, format, width)
+                .map_err(|_| ())
+        }
         ImageEntityType::Season | ImageEntityType::Episode => optimized_title_asset(
             TitleScope::Tv,
             payload.title_tmdb_id.ok_or(())?,
@@ -2471,6 +2455,22 @@ mod tests {
         .with_tv_position(100, 0, None)?;
         assert_eq!(payload.season_number, Some(0));
         assert!(payload.to_json().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn large_season_number_payload_is_preserved() -> Result<(), Box<dyn std::error::Error>> {
+        let payload = ImageJobPayload::new(
+            ImageEntityType::Season,
+            212_865,
+            ImageKind::Poster,
+            "/season.jpg",
+            "https://image.tmdb.org/t/p/original/season.jpg",
+            None,
+            None,
+        )?
+        .with_tv_position(134_819, 120_120_224, None)?;
+        assert_eq!(payload.season_number, Some(120_120_224));
         Ok(())
     }
 

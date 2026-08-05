@@ -24,7 +24,7 @@ services:
       - -c
       - archive_timeout=300s
       - -c
-      - max_connections=${TMDB_STRESS_PG_MAX_CONNECTIONS:-120}
+      - max_connections=${TMDB_STRESS_PG_MAX_CONNECTIONS:-200}
       - -c
       - shared_buffers=${TMDB_STRESS_PG_SHARED_BUFFERS:-2GB}
       - -c

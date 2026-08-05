@@ -92,13 +92,15 @@ grep -Fq '$$POSTGRES_DB' "$compose_file" || die 'health check must use POSTGRES_
 for setting in wal_level=replica archive_mode=on 'archive_command=pgbackrest --stanza=tmdb archive-push %p'; do
     grep -Fq -- "$setting" "$compose_file" || die "PITR setting is missing: $setting"
 done
-! grep -Eq '^[[:space:]]*-[[:space:]]*[^[:space:]]*:8081' "$compose_file" \
-    || die 'private admin listener must not be published'
-grep -Fq 'app-network:' "$compose_file" || die 'external application network is missing'
+grep -Eq '^[[:space:]]*-[[:space:]]*"9001:8080"[[:space:]]*$' "$compose_file" \
+    || die 'public API port mapping is missing'
+grep -Eq '^[[:space:]]*-[[:space:]]*"8081:8081"[[:space:]]*$' "$compose_file" \
+    || die 'admin API port mapping is missing'
+grep -Fq '"your.network":' "$compose_file" || die 'neutral external network placeholder is missing'
 grep -Eq '^[[:space:]]{4}external:[[:space:]]+true[[:space:]]*$' "$compose_file" \
     || die 'application network must be external'
-grep -Eq '^[[:space:]]{4}name:[[:space:]]+[A-Za-z0-9_.-]+[[:space:]]*$' "$compose_file" \
-    || die 'external application network name is missing'
+! grep -Eq '^[[:space:]]{4}name:[[:space:]]+' "$compose_file" \
+    || die 'external network must use its top-level Compose key directly'
 grep -Fq 'tmdb-mirror-api' "$compose_file" || die 'private API alias is missing'
 for role in worker media; do
     grep -Eq "entrypoint:[[:space:]]*\[/usr/local/bin/tmdb-runtime,[[:space:]]*${role}\]" "$compose_file" \

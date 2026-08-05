@@ -43,14 +43,14 @@ existing host data layout must be retained:
 ./data/media      -> /media
 ```
 
-The API and media services publish host ports `9001` and `9002` to container
-ports `8080` and `8090`. Host mount paths are Compose deployment settings, not
-application environment variables.
+The API and media services publish host ports `9001`, `8081`, and `9002` to
+container ports `8080`, `8081`, and `8090`. Host mount paths are Compose
+deployment settings, not application environment variables.
 
 All four services use one external Docker network. The tracked Compose files
-use `your.network` as a neutral placeholder; replace the root network
-`name:` value with an existing network name before starting the stack. No
-`tmdb-private` network is created.
+use `your.network` as a neutral placeholder; replace every
+`"your.network"` service and top-level network reference with an existing
+network name before starting the stack. No `tmdb-private` network is created.
 
 The API runs as UID/GID `10001`. The worker and media services begin with a
 tiny built-in startup preparer: it creates their fixed child folders, gives
@@ -187,6 +187,13 @@ runs up to eight ingestion loops, bounded by
 durable queue schema before claiming image jobs, so first-boot migrations do
 not cause an image-worker crash.
 
+Use `daily_sync` for incremental production updates. It reads TMDB's movie and
+TV change feeds, refreshes changed titles, and discovers new seasons and
+episodes from refreshed TV and season documents. For an emergency stop,
+cancel the main worker, wait for active catalog jobs to settle, and then cancel
+the media worker so already in-flight catalog work cannot leave newly queued
+image jobs behind.
+
 ## Media policy
 
 `ALLOW_LOCAL_MEDIA=true` causes the worker to create gallery image jobs in the
@@ -238,15 +245,18 @@ The database remains MVCC/concurrent: independent API requests use separate
 bounded PostgreSQL connections, so one user's metadata read does not hold
 another user's request behind it. Measure the 100-client target with the
 repository's stress scripts on the actual SSD and host network before calling
-capacity production-ready.
+capacity production-ready. The supplied production and disposable stress
+definitions set PostgreSQL `max_connections=200`, leaving room for the four
+application pools and a measured 100-client burst; tune memory and connection
+limits together for the deployment host.
 
 The existing Trawl instance is used only as the challenge fallback:
 `TMDB_TRAWL_BASE_URL=http://<trawl-host>:8191`.
 
 The API service shares the configured external network with PostgreSQL, the
-worker, and media. Port 8081 is never published to the host. A trusted
-container on that network can call
-`http://tmdb-mirror-api:8081/admin/v1/status` or `/metrics` using the admin
-key.
+worker, and media. The Compose file publishes host port `8081` for the
+authenticated admin listener. It can also be reached by a trusted container
+on the network at `http://tmdb-mirror-api:8081/admin/v1/status` or `/metrics`
+using the admin key.
 
 Backup and offline recovery steps are in [backup-recovery.md](backup-recovery.md).

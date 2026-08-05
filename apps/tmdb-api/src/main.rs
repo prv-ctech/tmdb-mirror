@@ -42,10 +42,7 @@ async fn main() -> anyhow::Result<()> {
         .context("bind admin API listener")?;
     tracing::info!(event = "listener_started", listener = "public");
     tracing::info!(event = "listener_started", listener = "admin");
-    tracing::info!(
-        event = "api_ready",
-        public_surface = "tmdb_v3",
-    );
+    tracing::info!(event = "api_ready", public_surface = "tmdb_v3",);
 
     let cancellation = CancellationToken::new();
     let signal_cancellation = cancellation.clone();
@@ -65,10 +62,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let public_server = axum::serve(
-        public_listener,
-        build_router(state).merge(tmdb_v3_router),
-    )
+    let public_server = axum::serve(public_listener, build_router(state).merge(tmdb_v3_router))
         .with_graceful_shutdown(cancellation.clone().cancelled_owned())
         .into_future();
     let admin_server = axum::serve(

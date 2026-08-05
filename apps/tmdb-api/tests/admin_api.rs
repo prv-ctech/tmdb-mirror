@@ -38,7 +38,7 @@ impl AdminApiStore for FakeAdminStore {
         Ok(AdminStatus {
             build: AdminBuildStatus {
                 version: "test".to_owned(),
-                schema_revision: Some("0041".to_owned()),
+                schema_revision: Some("0050".to_owned()),
             },
             database: AdminDatabaseStatus {
                 reachable: true,
@@ -51,10 +51,7 @@ impl AdminApiStore for FakeAdminStore {
                 read_write_size: 1,
                 read_write_idle: 1,
             },
-            catalog: AdminCatalogCounts {
-                movies: 3,
-                tv: 4,
-            },
+            catalog: AdminCatalogCounts { movies: 3, tv: 4 },
             queues: Vec::new(),
             ingest: AdminComponentHealth::ready(),
             media: AdminComponentHealth::ready(),
@@ -310,7 +307,7 @@ async fn status_and_bounded_job_history_are_available_to_an_admin()
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 4096).await?)?;
-    assert_eq!(body["data"]["build"]["schemaRevision"], "0041");
+    assert_eq!(body["data"]["build"]["schemaRevision"], "0050");
 
     let response = app
         .clone()
@@ -362,7 +359,9 @@ async fn state_changing_operations_require_idempotency_and_return_durable_jobs()
     };
     let response = app
         .clone()
-        .oneshot(request().body(Body::from(r#"{"mode":"full_sweep","mediaTypes":["movie","tv"]}"#))?)
+        .oneshot(request().body(Body::from(
+            r#"{"mode":"full_sweep","mediaTypes":["movie","tv"]}"#,
+        ))?)
         .await?;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
@@ -371,7 +370,9 @@ async fn state_changing_operations_require_idempotency_and_return_durable_jobs()
         .oneshot(
             request()
                 .header("idempotency-key", "scan-1")
-                .body(Body::from(r#"{"mode":"full_sweep","mediaTypes":["movie","tv"]}"#))?,
+                .body(Body::from(
+                    r#"{"mode":"full_sweep","mediaTypes":["movie","tv"]}"#,
+                ))?,
         )
         .await?;
     assert_eq!(response.status(), StatusCode::ACCEPTED);

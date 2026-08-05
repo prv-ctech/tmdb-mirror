@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use http::{header::RETRY_AFTER, HeaderMap, StatusCode};
+use http::{HeaderMap, StatusCode, header::RETRY_AFTER};
 use reqwest::{Client, Url};
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
@@ -23,10 +23,21 @@ use crate::{
 /// Hard upper bound for one streamed daily export download.
 pub const MAX_DAILY_EXPORT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
+const MOVIE_DETAIL_APPEND_TO_RESPONSE: &str =
+    "keywords,credits,translations,alternative_titles,external_ids,videos,release_dates,images";
+const TV_DETAIL_APPEND_TO_RESPONSE: &str =
+    "keywords,credits,translations,alternative_titles,external_ids,videos,content_ratings,images";
+const SEASON_DETAIL_APPEND_TO_RESPONSE: &str = "account_states,aggregate_credits,credits,external_ids,translations,videos,watch/providers,images";
+const EPISODE_DETAIL_APPEND_TO_RESPONSE: &str =
+    "account_states,credits,external_ids,translations,videos,images";
 /// Query used by the movie detail ingest request.
-pub const MOVIE_DETAIL_QUERY_STRING: &str = "append_to_response=keywords,credits,translations,alternative_titles,external_ids,videos,release_dates";
+pub const MOVIE_DETAIL_QUERY_STRING: &str = "append_to_response=keywords,credits,translations,alternative_titles,external_ids,videos,release_dates,images&language=en-US&include_image_language=en,null&include_video_language=en,null";
 /// Query used by the TV detail ingest request.
-pub const TV_DETAIL_QUERY_STRING: &str = "append_to_response=keywords,credits,translations,alternative_titles,external_ids,videos,content_ratings";
+pub const TV_DETAIL_QUERY_STRING: &str = "append_to_response=keywords,credits,translations,alternative_titles,external_ids,videos,content_ratings,images&language=en-US&include_image_language=en,null&include_video_language=en,null";
+/// Query used by the TV season detail ingest request.
+pub const SEASON_DETAIL_QUERY_STRING: &str = "append_to_response=account_states,aggregate_credits,credits,external_ids,translations,videos,watch/providers,images&language=en-US&include_image_language=en,null&include_video_language=en,null";
+/// Query used by the TV episode detail ingest request.
+pub const EPISODE_DETAIL_QUERY_STRING: &str = "append_to_response=account_states,credits,external_ids,translations,videos,images&language=en-US&include_image_language=en,null&include_video_language=en,null";
 /// Query used by TMDB image-gallery endpoints.
 pub const IMAGE_GALLERY_QUERY_STRING: &str = "language=en-US&include_image_language=en,null";
 /// Query used by TMDB video-gallery endpoints.
@@ -198,12 +209,15 @@ impl TmdbClient {
         let raw: Value = self
             .fetch_json(
                 &format!("movie/{tmdb_id}"),
-                &[(
-                    "append_to_response",
-                    MOVIE_DETAIL_QUERY_STRING
-                        .trim_start_matches("append_to_response=")
-                        .to_owned(),
-                )],
+                &[
+                    (
+                        "append_to_response",
+                        MOVIE_DETAIL_APPEND_TO_RESPONSE.to_owned(),
+                    ),
+                    ("language", "en-US".to_owned()),
+                    ("include_image_language", "en,null".to_owned()),
+                    ("include_video_language", "en,null".to_owned()),
+                ],
                 true,
             )
             .await?;
@@ -212,19 +226,6 @@ impl TmdbClient {
                 endpoint: bounded_endpoint(&format!("movie/{tmdb_id}")),
             })?;
         Ok((raw, movie))
-    }
-
-    /// Fetches the default movie detail document without appended resources.
-    ///
-    /// # Errors
-    ///
-    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
-    pub async fn fetch_movie_base(&self, tmdb_id: u32) -> Result<Value, TmdbClientError> {
-        if tmdb_id == 0 {
-            return Err(TmdbClientError::InvalidPath);
-        }
-        self.fetch_json(&format!("movie/{tmdb_id}"), &[], true)
-            .await
     }
 
     /// Fetches a typed television detail response.
@@ -253,12 +254,15 @@ impl TmdbClient {
         let raw: Value = self
             .fetch_json(
                 &format!("tv/{tmdb_id}"),
-                &[(
-                    "append_to_response",
-                    TV_DETAIL_QUERY_STRING
-                        .trim_start_matches("append_to_response=")
-                        .to_owned(),
-                )],
+                &[
+                    (
+                        "append_to_response",
+                        TV_DETAIL_APPEND_TO_RESPONSE.to_owned(),
+                    ),
+                    ("language", "en-US".to_owned()),
+                    ("include_image_language", "en,null".to_owned()),
+                    ("include_video_language", "en,null".to_owned()),
+                ],
                 true,
             )
             .await?;
@@ -269,18 +273,6 @@ impl TmdbClient {
         Ok((raw, series))
     }
 
-    /// Fetches the default TV detail document without appended resources.
-    ///
-    /// # Errors
-    ///
-    /// Returns a sanitized transport, HTTP, policy, or JSON-decoding error.
-    pub async fn fetch_tv_base(&self, tmdb_id: u32) -> Result<Value, TmdbClientError> {
-        if tmdb_id == 0 {
-            return Err(TmdbClientError::InvalidPath);
-        }
-        self.fetch_json(&format!("tv/{tmdb_id}"), &[], true).await
-    }
-
     /// Fetches a full TV season, including its episode list.
     ///
     /// # Errors
@@ -289,17 +281,11 @@ impl TmdbClient {
     pub async fn fetch_season(
         &self,
         tv_id: u32,
-        season_number: u16,
+        season_number: u32,
     ) -> Result<TmdbSeason, TmdbClientError> {
-        if tv_id == 0 {
-            return Err(TmdbClientError::InvalidPath);
-        }
-        self.fetch_json(
-            &format!("tv/{tv_id}/season/{season_number}"),
-            &[],
-            true,
-        )
-        .await
+        self.fetch_season_with_raw(tv_id, season_number)
+            .await
+            .map(|(_, season)| season)
     }
 
     /// Fetches a TV season document together with its typed representation.
@@ -310,7 +296,7 @@ impl TmdbClient {
     pub async fn fetch_season_with_raw(
         &self,
         tv_id: u32,
-        season_number: u16,
+        season_number: u32,
     ) -> Result<(Value, TmdbSeason), TmdbClientError> {
         if tv_id == 0 {
             return Err(TmdbClientError::InvalidPath);
@@ -318,7 +304,15 @@ impl TmdbClient {
         let raw: Value = self
             .fetch_json(
                 &format!("tv/{tv_id}/season/{season_number}"),
-                &[],
+                &[
+                    (
+                        "append_to_response",
+                        SEASON_DETAIL_APPEND_TO_RESPONSE.to_owned(),
+                    ),
+                    ("language", "en-US".to_owned()),
+                    ("include_image_language", "en,null".to_owned()),
+                    ("include_video_language", "en,null".to_owned()),
+                ],
                 true,
             )
             .await?;
@@ -337,7 +331,7 @@ impl TmdbClient {
     pub async fn fetch_episode(
         &self,
         tv_id: u32,
-        season_number: u16,
+        season_number: u32,
         episode_number: u16,
     ) -> Result<TmdbEpisode, TmdbClientError> {
         self.fetch_episode_with_raw(tv_id, season_number, episode_number)
@@ -353,16 +347,28 @@ impl TmdbClient {
     pub async fn fetch_episode_with_raw(
         &self,
         tv_id: u32,
-        season_number: u16,
+        season_number: u32,
         episode_number: u16,
     ) -> Result<(Value, TmdbEpisode), TmdbClientError> {
         if tv_id == 0 || episode_number == 0 {
             return Err(TmdbClientError::InvalidPath);
         }
-        let path = format!(
-            "tv/{tv_id}/season/{season_number}/episode/{episode_number}"
-        );
-        let raw: Value = self.fetch_json(&path, &[], true).await?;
+        let path = format!("tv/{tv_id}/season/{season_number}/episode/{episode_number}");
+        let raw: Value = self
+            .fetch_json(
+                &path,
+                &[
+                    (
+                        "append_to_response",
+                        EPISODE_DETAIL_APPEND_TO_RESPONSE.to_owned(),
+                    ),
+                    ("language", "en-US".to_owned()),
+                    ("include_image_language", "en,null".to_owned()),
+                    ("include_video_language", "en,null".to_owned()),
+                ],
+                true,
+            )
+            .await?;
         let episode: TmdbEpisode =
             serde_json::from_value(raw.clone()).map_err(|_| TmdbClientError::MalformedJson {
                 endpoint: bounded_endpoint(&path),
@@ -426,7 +432,7 @@ impl TmdbClient {
     pub async fn fetch_season_images(
         &self,
         tv_id: u32,
-        season_number: u16,
+        season_number: u32,
     ) -> Result<TmdbImages, TmdbClientError> {
         if tv_id == 0 {
             return Err(TmdbClientError::InvalidPath);
@@ -444,7 +450,7 @@ impl TmdbClient {
     pub async fn fetch_season_images_with_raw(
         &self,
         tv_id: u32,
-        season_number: u16,
+        season_number: u32,
     ) -> Result<(Value, TmdbImages), TmdbClientError> {
         if tv_id == 0 {
             return Err(TmdbClientError::InvalidPath);
@@ -461,7 +467,7 @@ impl TmdbClient {
     pub async fn fetch_episode_images(
         &self,
         tv_id: u32,
-        season_number: u16,
+        season_number: u32,
         episode_number: u16,
     ) -> Result<TmdbImages, TmdbClientError> {
         if tv_id == 0 || episode_number == 0 {
@@ -480,7 +486,7 @@ impl TmdbClient {
     pub async fn fetch_episode_images_with_raw(
         &self,
         tv_id: u32,
-        season_number: u16,
+        season_number: u32,
         episode_number: u16,
     ) -> Result<(Value, TmdbImages), TmdbClientError> {
         if tv_id == 0 || episode_number == 0 {

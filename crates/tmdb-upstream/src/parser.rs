@@ -129,9 +129,7 @@ impl DailyExportParser {
         let mut writer = BufWriter::new(file);
         let mut write_error = None;
         let records = self.scan_file(source, |record| {
-            if write_error.is_none()
-                && writeln!(writer, "{}", record.id).is_err()
-            {
+            if write_error.is_none() && writeln!(writer, "{}", record.id).is_err() {
                 write_error = Some(());
             }
         });
@@ -432,9 +430,13 @@ mod tests {
 "#,
         )
         .map_err(|_| ExportParseError::Io)?;
-        let records = DailyExportParser::default().write_id_file(source.path(), destination.path())?;
+        let records =
+            DailyExportParser::default().write_id_file(source.path(), destination.path())?;
         assert_eq!(records, 2);
-        assert_eq!(std::fs::read_to_string(destination.path()).map_err(|_| ExportParseError::Io)?, "7\n8\n");
+        assert_eq!(
+            std::fs::read_to_string(destination.path()).map_err(|_| ExportParseError::Io)?,
+            "7\n8\n"
+        );
         Ok(())
     }
 

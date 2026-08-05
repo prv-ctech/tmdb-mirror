@@ -1,7 +1,4 @@
 \set ON_ERROR_STOP on
-\set seed_count 100000
-\set seed_base 900000000
-
 BEGIN;
 
 -- Only the reserved synthetic ID range is touched. This script never deletes
@@ -9,12 +6,12 @@ BEGIN;
 -- project.
 DELETE FROM catalog.titles
  WHERE tmdb_id >= (:seed_base + 1)
-   AND tmdb_id < (:seed_base + :seed_count + 1);
+   AND tmdb_id < (:seed_base + :seed_limit + 1);
 -- Deleting titles first cascades title credits; people are RESTRICTed while
 -- those credits still exist.
 DELETE FROM catalog.people
  WHERE id >= :seed_base
-   AND id < (:seed_base + 1000);
+   AND id < (:seed_base + :seed_limit + 1);
 
 INSERT INTO catalog.genres (id, name)
 SELECT :seed_base + value, 'Stress Genre ' || value
@@ -53,6 +50,9 @@ ON CONFLICT (id) DO UPDATE SET
 INSERT INTO catalog.languages (iso_639_1, english_name, name)
 VALUES ('en', 'English', 'English'),
        ('ja', 'Japanese', '日本語'),
+       ('zh', 'Chinese', '中文'),
+       ('ko', 'Korean', '한국어'),
+       ('ro', 'Romanian', 'Română'),
        ('es', 'Spanish', 'Español'),
        ('fr', 'French', 'Français')
 ON CONFLICT (iso_639_1) DO UPDATE SET
@@ -84,13 +84,26 @@ INSERT INTO catalog.titles (
 SELECT :seed_base + value,
        CASE WHEN value % 2 = 0 THEN 'tv' ELSE 'movie' END,
        :seed_base + value,
-       CASE WHEN value % 101 = 0 THEN 'Café One Piece Stress ' || value
+       CASE WHEN value % 109 = 0 THEN '日本語ストレス ' || value
+            WHEN value % 107 = 0 THEN '中文壓力測試 ' || value
+            WHEN value % 103 = 0 THEN '한국어 스트레스 ' || value
+            WHEN value % 89 = 0 THEN 'România Știință Stress ' || value
+            WHEN value % 101 = 0 THEN 'Café One Piece Stress ' || value
             ELSE 'Café Stress Title ' || value END,
-       'Cafe Original Stress ' || value,
+       CASE WHEN value % 109 = 0 THEN '日本語原題 ' || value
+            WHEN value % 107 = 0 THEN '中文原名 ' || value
+            WHEN value % 103 = 0 THEN '한국어 원제 ' || value
+            ELSE 'Cafe Original Stress ' || value END,
        'A searchable stress fixture with accented words and stable facets.',
        'Fast deterministic fixture',
        CASE WHEN value % 11 = 0 THEN 'Ended' ELSE 'Released' END,
-       CASE WHEN value % 5 = 0 THEN 'ja' WHEN value % 3 = 0 THEN 'es' ELSE 'en' END,
+       CASE WHEN value % 109 = 0 THEN 'ja'
+            WHEN value % 107 = 0 THEN 'zh'
+            WHEN value % 103 = 0 THEN 'ko'
+            WHEN value % 89 = 0 THEN 'ro'
+            WHEN value % 5 = 0 THEN 'ja'
+            WHEN value % 3 = 0 THEN 'es'
+            ELSE 'en' END,
        (DATE '2000-01-01' + (value % 9000)::integer),
        CASE WHEN value % 2 = 0 THEN (DATE '2000-01-01' + (value % 9000)::integer) END,
        CASE WHEN value % 2 = 0 THEN (DATE '2001-01-01' + (value % 9000)::integer) END,
@@ -184,7 +197,13 @@ ON CONFLICT DO NOTHING;
 
 INSERT INTO catalog.title_languages (title_id, language_id, is_original)
 SELECT :seed_base + value,
-       CASE WHEN value % 5 = 0 THEN 'ja' WHEN value % 3 = 0 THEN 'es' ELSE 'en' END,
+       CASE WHEN value % 109 = 0 THEN 'ja'
+            WHEN value % 107 = 0 THEN 'zh'
+            WHEN value % 103 = 0 THEN 'ko'
+            WHEN value % 89 = 0 THEN 'ro'
+            WHEN value % 5 = 0 THEN 'ja'
+            WHEN value % 3 = 0 THEN 'es'
+            ELSE 'en' END,
        true
 FROM generate_series(1, :seed_count) AS value
 ON CONFLICT (title_id, language_id) DO UPDATE SET is_original = EXCLUDED.is_original;

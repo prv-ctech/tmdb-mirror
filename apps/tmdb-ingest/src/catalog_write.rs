@@ -18,6 +18,45 @@ const IMAGE_JOB_TYPE: &str = "image.download";
 const IMAGE_JOB_PAYLOAD_VERSION: i32 = 1;
 const MAX_ACTIVE_IMAGE_JOBS: i64 = 10_000;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CatalogWriteOptions {
+    enqueue_media: bool,
+    enqueue_enrichment: bool,
+    enqueue_seasons: bool,
+}
+
+impl CatalogWriteOptions {
+    pub(crate) const CATALOG_ONLY: Self = Self {
+        enqueue_media: false,
+        enqueue_enrichment: false,
+        enqueue_seasons: false,
+    };
+
+    pub(crate) const fn title_refresh(enqueue_media: bool) -> Self {
+        Self {
+            enqueue_media,
+            enqueue_enrichment: true,
+            enqueue_seasons: true,
+        }
+    }
+
+    pub(crate) const fn title_enrichment(enqueue_media: bool) -> Self {
+        Self {
+            enqueue_media,
+            enqueue_enrichment: false,
+            enqueue_seasons: true,
+        }
+    }
+
+    pub(crate) const fn season_refresh(enqueue_media: bool) -> Self {
+        Self {
+            enqueue_media,
+            enqueue_enrichment: false,
+            enqueue_seasons: false,
+        }
+    }
+}
+
 /// Persists the exact upstream JSON used for a detail refresh.
 pub(crate) async fn persist_tmdb_document(
     pool: &PgPool,
@@ -46,7 +85,7 @@ use super::{normalize_language, parse_source_date, source_id};
 pub(crate) async fn persist_movie_with_options(
     pool: &PgPool,
     movie: &TmdbMovie,
-    allow_local_media: bool,
+    options: CatalogWriteOptions,
 ) -> Result<(), JobExecutionError> {
     let tmdb_id = source_id(movie.id)?;
     let release_date = parse_source_date(movie.release_date.as_deref())?;
@@ -93,19 +132,12 @@ pub(crate) async fn persist_movie_with_options(
 
     replace_genres(&mut transaction, title_id, &movie.genres).await?;
     replace_keywords(&mut transaction, title_id, &movie.keywords).await?;
-    replace_credits(
-        &mut transaction,
-        title_id,
-        &movie.credits,
-        allow_local_media,
-    )
-    .await?;
+    replace_credits(&mut transaction, title_id, &movie.credits).await?;
     replace_companies(
         &mut transaction,
         title_id,
         &movie.production_companies,
         "production",
-        allow_local_media,
     )
     .await?;
     replace_original_language(
@@ -118,7 +150,6 @@ pub(crate) async fn persist_movie_with_options(
         &mut transaction,
         title_id,
         movie.belongs_to_collection.as_ref(),
-        allow_local_media,
     )
     .await?;
     replace_common_parity_facets(
@@ -136,6 +167,19 @@ pub(crate) async fn persist_movie_with_options(
         movie.release_dates.results.as_slice(),
     )
     .await?;
+    enqueue_credit_images(&mut transaction, &movie.credits, options.enqueue_media).await?;
+    enqueue_company_images(
+        &mut transaction,
+        &movie.production_companies,
+        options.enqueue_media,
+    )
+    .await?;
+    enqueue_collection_images(
+        &mut transaction,
+        movie.belongs_to_collection.as_ref(),
+        options.enqueue_media,
+    )
+    .await?;
     enqueue_title_images(
         &mut transaction,
         "movie",
@@ -143,9 +187,12 @@ pub(crate) async fn persist_movie_with_options(
         movie.poster_path.as_deref(),
         movie.backdrop_path.as_deref(),
         &movie.images,
-        allow_local_media,
+        options.enqueue_media,
     )
     .await?;
+    if options.enqueue_enrichment {
+        enqueue_title_enrichment(&mut transaction, super::ENRICH_MOVIE_JOB, tmdb_id).await?;
+    }
     transaction.commit().await.map_err(database_error)
 }
 
@@ -155,7 +202,7 @@ pub(crate) async fn persist_movie_with_options(
 pub(crate) async fn persist_tv_with_options(
     pool: &PgPool,
     series: &TmdbTv,
-    allow_local_media: bool,
+    options: CatalogWriteOptions,
 ) -> Result<(), JobExecutionError> {
     let tmdb_id = source_id(series.id)?;
     let first_air_date = parse_source_date(series.first_air_date.as_deref())?;
@@ -211,36 +258,16 @@ pub(crate) async fn persist_tv_with_options(
 
     replace_genres(&mut transaction, title_id, &series.genres).await?;
     replace_keywords(&mut transaction, title_id, &series.keywords).await?;
-    replace_credits(
-        &mut transaction,
-        title_id,
-        &series.credits,
-        allow_local_media,
-    )
-    .await?;
-    replace_season_summaries(
-        &mut transaction,
-        title_id,
-        tmdb_id,
-        series.seasons.as_slice(),
-        allow_local_media,
-    )
-    .await?;
+    replace_credits(&mut transaction, title_id, &series.credits).await?;
+    replace_season_summaries(&mut transaction, title_id, series.seasons.as_slice()).await?;
     replace_companies(
         &mut transaction,
         title_id,
         &series.production_companies,
         "production",
-        allow_local_media,
     )
     .await?;
-    replace_networks(
-        &mut transaction,
-        title_id,
-        &series.networks,
-        allow_local_media,
-    )
-    .await?;
+    replace_networks(&mut transaction, title_id, &series.networks).await?;
     replace_original_language(
         &mut transaction,
         title_id,
@@ -262,6 +289,21 @@ pub(crate) async fn persist_tv_with_options(
         series.content_ratings.results.as_slice(),
     )
     .await?;
+    enqueue_credit_images(&mut transaction, &series.credits, options.enqueue_media).await?;
+    enqueue_season_summary_jobs(
+        &mut transaction,
+        tmdb_id,
+        series.seasons.as_slice(),
+        options,
+    )
+    .await?;
+    enqueue_company_images(
+        &mut transaction,
+        &series.production_companies,
+        options.enqueue_media,
+    )
+    .await?;
+    enqueue_network_images(&mut transaction, &series.networks, options.enqueue_media).await?;
     enqueue_title_images(
         &mut transaction,
         "tv",
@@ -269,9 +311,12 @@ pub(crate) async fn persist_tv_with_options(
         series.poster_path.as_deref(),
         series.backdrop_path.as_deref(),
         &series.images,
-        allow_local_media,
+        options.enqueue_media,
     )
     .await?;
+    if options.enqueue_enrichment {
+        enqueue_title_enrichment(&mut transaction, super::ENRICH_TV_JOB, tmdb_id).await?;
+    }
     transaction.commit().await.map_err(database_error)
 }
 
@@ -282,11 +327,12 @@ pub(crate) async fn persist_season_with_options(
     pool: &PgPool,
     tv_id: u32,
     season: &TmdbSeason,
-    allow_local_media: bool,
+    options: CatalogWriteOptions,
 ) -> Result<(), JobExecutionError> {
     let tv_id = source_id(u64::from(tv_id))?;
     let season_id = source_id(season.id)?;
-    let season_number = i32::from(season.season_number);
+    let season_number = i32::try_from(season.season_number)
+        .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
     let air_date = parse_source_date(season.air_date.as_deref())?;
     let resources = season_write_resources(tv_id, season, season_id)?;
     let mut transaction = pool.begin().await.map_err(database_error)?;
@@ -335,6 +381,10 @@ pub(crate) async fn persist_season_with_options(
     .await
     .map_err(database_error)?;
 
+    for episode in &season.episodes {
+        persist_episode(&mut transaction, title_id, season_id, episode).await?;
+    }
+
     enqueue_gallery_images_with_position(
         &mut transaction,
         "season",
@@ -345,20 +395,24 @@ pub(crate) async fn persist_season_with_options(
         Some(season.season_number),
         None,
         Some(tv_id),
-        allow_local_media,
+        options.enqueue_media,
     )
     .await?;
     for episode in &season.episodes {
-        persist_episode(
+        enqueue_gallery_images_with_position(
             &mut transaction,
-            title_id,
-            season_id,
-            tv_id,
-            season.season_number,
-            episode,
-            allow_local_media,
+            "episode",
+            source_id(episode.id)?,
+            "still",
+            episode.still_path.as_deref(),
+            &episode.images.stills,
+            Some(season.season_number),
+            Some(episode.episode_number),
+            Some(tv_id),
+            options.enqueue_media,
         )
         .await?;
+        enqueue_credit_images(&mut transaction, &episode.credits, options.enqueue_media).await?;
     }
     transaction.commit().await.map_err(database_error)
 }
@@ -492,11 +546,25 @@ async fn replace_genres(
         .execute(&mut **transaction)
         .await
         .map_err(database_error)?;
+    let mut genres = genres.iter().collect::<Vec<_>>();
+    genres.sort_unstable_by_key(|genre| genre.id);
     for genre in genres {
         let genre_id = source_id(genre.id)?;
         sqlx::query(
-            "INSERT INTO catalog.genres (id, name) VALUES ($1, $2)
-             ON CONFLICT (id) DO UPDATE SET name = COALESCE(EXCLUDED.name, catalog.genres.name)",
+            "WITH updated AS (
+                 UPDATE catalog.genres
+                    SET name = $2
+                  WHERE id = $1
+                    AND $2 IS NOT NULL
+                    AND name IS DISTINCT FROM $2
+                 RETURNING id
+             )
+             INSERT INTO catalog.genres (id, name)
+             SELECT $1, $2
+              WHERE NOT EXISTS (
+                    SELECT 1 FROM catalog.genres WHERE id = $1
+              )
+             ON CONFLICT (id) DO NOTHING",
         )
         .bind(genre_id)
         .bind(genre.name.as_deref())
@@ -526,11 +594,25 @@ async fn replace_keywords(
         .execute(&mut **transaction)
         .await
         .map_err(database_error)?;
+    let mut keywords = keywords.iter().collect::<Vec<_>>();
+    keywords.sort_unstable_by_key(|keyword| keyword.id);
     for keyword in keywords {
         let keyword_id = source_id(keyword.id)?;
         sqlx::query(
-            "INSERT INTO catalog.keywords (id, name) VALUES ($1, $2)
-             ON CONFLICT (id) DO UPDATE SET name = COALESCE(EXCLUDED.name, catalog.keywords.name)",
+            "WITH updated AS (
+                 UPDATE catalog.keywords
+                    SET name = $2
+                  WHERE id = $1
+                    AND $2 IS NOT NULL
+                    AND name IS DISTINCT FROM $2
+                 RETURNING id
+             )
+             INSERT INTO catalog.keywords (id, name)
+             SELECT $1, $2
+              WHERE NOT EXISTS (
+                    SELECT 1 FROM catalog.keywords WHERE id = $1
+              )
+             ON CONFLICT (id) DO NOTHING",
         )
         .bind(keyword_id)
         .bind(keyword.name.as_deref())
@@ -554,65 +636,49 @@ async fn replace_credits(
     transaction: &mut Transaction<'_, Postgres>,
     title_id: i64,
     credits: &TmdbCredits,
-    allow_local_media: bool,
 ) -> Result<(), JobExecutionError> {
     sqlx::query("DELETE FROM catalog.title_credits WHERE title_id = $1")
         .bind(title_id)
         .execute(&mut **transaction)
         .await
         .map_err(database_error)?;
-    for (credit_type, rows) in [
-        ("cast", credits.cast.as_slice()),
-        ("crew", credits.crew.as_slice()),
-    ] {
-        for (position, credit) in rows.iter().enumerate() {
-            let person_id = source_id(credit.id)?;
-            let credit_id = stable_credit_id(credit, credit_type, position);
-            upsert_person(transaction, person_id, credit).await?;
-            enqueue_gallery_images(
-                transaction,
-                "person",
-                person_id,
-                "profile",
-                credit.profile_path.as_deref(),
-                &credit.images.profiles,
-                allow_local_media,
-            )
-            .await?;
-            sqlx::query(
-                "INSERT INTO catalog.title_credits (
-                     title_id, person_id, credit_id, credit_type, department, job,
-                     character, cast_order, episode_count, adult, source_updated_at
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, clock_timestamp())
-                 ON CONFLICT (title_id, person_id, credit_id) DO UPDATE SET
-                     credit_type = EXCLUDED.credit_type,
-                     department = EXCLUDED.department,
-                     job = EXCLUDED.job,
-                     character = EXCLUDED.character,
-                     cast_order = EXCLUDED.cast_order,
-                     episode_count = EXCLUDED.episode_count,
-                     adult = EXCLUDED.adult,
-                     source_updated_at = EXCLUDED.source_updated_at,
-                     updated_at = clock_timestamp()",
-            )
-            .bind(title_id)
-            .bind(person_id)
-            .bind(credit_id)
-            .bind(credit_type)
-            .bind(credit.department.as_deref())
-            .bind(credit.job.as_deref())
-            .bind(credit.character.as_deref())
-            .bind(if credit_type == "cast" {
-                credit.order
-            } else {
-                None
-            })
-            .bind(credit.total_episode_count)
-            .bind(credit.adult)
-            .execute(&mut **transaction)
-            .await
-            .map_err(database_error)?;
-        }
+    for (credit_type, position, credit) in ordered_credits(credits) {
+        let person_id = source_id(credit.id)?;
+        let credit_id = stable_credit_id(credit, credit_type, position);
+        upsert_person(transaction, person_id, credit).await?;
+        sqlx::query(
+            "INSERT INTO catalog.title_credits (
+                 title_id, person_id, credit_id, credit_type, department, job,
+                 character, cast_order, episode_count, adult, source_updated_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, clock_timestamp())
+             ON CONFLICT (title_id, person_id, credit_id) DO UPDATE SET
+                 credit_type = EXCLUDED.credit_type,
+                 department = EXCLUDED.department,
+                 job = EXCLUDED.job,
+                 character = EXCLUDED.character,
+                 cast_order = EXCLUDED.cast_order,
+                 episode_count = EXCLUDED.episode_count,
+                 adult = EXCLUDED.adult,
+                 source_updated_at = EXCLUDED.source_updated_at,
+                 updated_at = clock_timestamp()",
+        )
+        .bind(title_id)
+        .bind(person_id)
+        .bind(credit_id)
+        .bind(credit_type)
+        .bind(credit.department.as_deref())
+        .bind(credit.job.as_deref())
+        .bind(credit.character.as_deref())
+        .bind(if credit_type == "cast" {
+            credit.order
+        } else {
+            None
+        })
+        .bind(credit.total_episode_count)
+        .bind(credit.adult)
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
     }
     Ok(())
 }
@@ -620,12 +686,14 @@ async fn replace_credits(
 async fn replace_season_summaries(
     transaction: &mut Transaction<'_, Postgres>,
     title_id: i64,
-    tv_id: i64,
     seasons: &[TmdbSeasonSummary],
-    allow_local_media: bool,
 ) -> Result<(), JobExecutionError> {
+    let mut seasons = seasons.iter().collect::<Vec<_>>();
+    seasons.sort_unstable_by_key(|season| season.id);
     for season in seasons {
         let season_id = source_id(season.id)?;
+        let season_number = i32::try_from(season.season_number)
+            .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
         let air_date = parse_source_date(season.air_date.as_deref())?;
         sqlx::query(
             "INSERT INTO catalog.seasons (
@@ -645,7 +713,7 @@ async fn replace_season_summaries(
         )
         .bind(season_id)
         .bind(title_id)
-        .bind(i32::from(season.season_number))
+        .bind(season_number)
         .bind(season.name.as_deref())
         .bind(season.overview.as_deref())
         .bind(air_date)
@@ -654,19 +722,54 @@ async fn replace_season_summaries(
         .execute(&mut **transaction)
         .await
         .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+async fn enqueue_credit_images(
+    transaction: &mut Transaction<'_, Postgres>,
+    credits: &TmdbCredits,
+    allow_local_media: bool,
+) -> Result<(), JobExecutionError> {
+    for (_, _, credit) in ordered_credits(credits) {
+        enqueue_gallery_images(
+            transaction,
+            "person",
+            source_id(credit.id)?,
+            "profile",
+            credit.profile_path.as_deref(),
+            &credit.images.profiles,
+            allow_local_media,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn enqueue_season_summary_jobs(
+    transaction: &mut Transaction<'_, Postgres>,
+    tv_id: i64,
+    seasons: &[TmdbSeasonSummary],
+    options: CatalogWriteOptions,
+) -> Result<(), JobExecutionError> {
+    let mut seasons = seasons.iter().collect::<Vec<_>>();
+    seasons.sort_unstable_by_key(|season| season.id);
+    for season in seasons {
         enqueue_image_job_with_position(
             transaction,
             "season",
-            season_id,
+            source_id(season.id)?,
             "poster",
             season.poster_path.as_deref(),
             Some(season.season_number),
             None,
             Some(tv_id),
-            allow_local_media,
+            options.enqueue_media,
         )
         .await?;
-        enqueue_season_refresh(transaction, tv_id, season.season_number).await?;
+        if options.enqueue_seasons {
+            enqueue_season_refresh(transaction, tv_id, season.season_number).await?;
+        }
     }
     Ok(())
 }
@@ -674,10 +777,10 @@ async fn replace_season_summaries(
 async fn enqueue_season_refresh(
     transaction: &mut Transaction<'_, Postgres>,
     tv_id: i64,
-    season_number: u16,
+    season_number: u32,
 ) -> Result<(), JobExecutionError> {
     if !season_refresh_queue_has_capacity(transaction).await? {
-        tracing::warn!(
+        tracing::debug!(
             event = "season_refresh_queue_capacity_deferred",
             tv_id,
             season_number,
@@ -709,12 +812,37 @@ async fn enqueue_season_refresh(
     Ok(())
 }
 
+async fn enqueue_title_enrichment(
+    transaction: &mut Transaction<'_, Postgres>,
+    job_type: &str,
+    tmdb_id: i64,
+) -> Result<(), JobExecutionError> {
+    let payload = serde_json::json!({"tmdb_id": tmdb_id});
+    let dedup_key = format!("{job_type}:{tmdb_id}");
+    sqlx::query(
+        "SELECT job_id, was_duplicate
+           FROM ops.submit_job($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(job_type)
+    .bind(super::INGEST_PAYLOAD_VERSION)
+    .bind(payload.to_string())
+    .bind(super::ENRICHMENT_PRIORITY)
+    .bind(8_i32)
+    .bind(Option::<chrono::DateTime<Utc>>::None)
+    .bind(dedup_key)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    Ok(())
+}
+
 async fn season_refresh_queue_has_capacity(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<bool, JobExecutionError> {
     sqlx::query(
         "SELECT pg_catalog.pg_advisory_xact_lock(
-             pg_catalog.hashtextextended('queue:season.refresh', 0)
+             pg_catalog.hashtextextended('queue:capacity', 0)
          )",
     )
     .execute(&mut **transaction)
@@ -740,23 +868,37 @@ async fn upsert_person(
     person_id: i64,
     credit: &TmdbCredit,
 ) -> Result<(), JobExecutionError> {
+    let original_name = non_empty_text(credit.original_name.as_deref());
+    let name = non_empty_text(credit.name.as_deref()).or(original_name);
     sqlx::query(
-        "INSERT INTO catalog.people (
+        "WITH updated AS (
+             UPDATE catalog.people
+                SET name = COALESCE($2, name),
+                    original_name = COALESCE($3, original_name),
+                    known_for_department = COALESCE($4, known_for_department),
+                    profile_path = COALESCE($5, profile_path),
+                    adult = $6,
+                    source_updated_at = clock_timestamp(),
+                    updated_at = clock_timestamp()
+              WHERE id = $1
+                AND (($2 IS NOT NULL AND name IS DISTINCT FROM $2)
+                  OR ($3 IS NOT NULL AND original_name IS DISTINCT FROM $3)
+                  OR ($4 IS NOT NULL AND known_for_department IS DISTINCT FROM $4)
+                  OR ($5 IS NOT NULL AND profile_path IS DISTINCT FROM $5)
+                  OR adult IS DISTINCT FROM $6)
+             RETURNING id
+         )
+         INSERT INTO catalog.people (
              id, name, original_name, known_for_department, profile_path,
              adult, source_updated_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, clock_timestamp())
-         ON CONFLICT (id) DO UPDATE SET
-             name = COALESCE(EXCLUDED.name, catalog.people.name),
-             original_name = COALESCE(EXCLUDED.original_name, catalog.people.original_name),
-             known_for_department = COALESCE(EXCLUDED.known_for_department, catalog.people.known_for_department),
-             profile_path = COALESCE(EXCLUDED.profile_path, catalog.people.profile_path),
-             adult = EXCLUDED.adult,
-             source_updated_at = EXCLUDED.source_updated_at,
-             updated_at = clock_timestamp()",
+         )
+         SELECT $1, $2, $3, $4, $5, $6, clock_timestamp()
+          WHERE NOT EXISTS (SELECT 1 FROM catalog.people WHERE id = $1)
+         ON CONFLICT (id) DO NOTHING",
     )
     .bind(person_id)
-    .bind(credit.name.as_deref())
-    .bind(credit.original_name.as_deref())
+    .bind(name)
+    .bind(original_name)
     .bind(credit.department.as_deref())
     .bind(credit.profile_path.as_deref())
     .bind(credit.adult)
@@ -764,6 +906,10 @@ async fn upsert_person(
     .await
     .map_err(database_error)?;
     Ok(())
+}
+
+fn non_empty_text(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn stable_credit_id(credit: &TmdbCredit, credit_type: &str, position: usize) -> String {
@@ -777,15 +923,35 @@ fn stable_credit_id(credit: &TmdbCredit, credit_type: &str, position: usize) -> 
         )
 }
 
-#[allow(clippy::too_many_arguments)]
+fn ordered_credits(credits: &TmdbCredits) -> Vec<(&'static str, usize, &TmdbCredit)> {
+    let mut rows = credits
+        .cast
+        .iter()
+        .enumerate()
+        .map(|(position, credit)| ("cast", position, credit))
+        .chain(
+            credits
+                .crew
+                .iter()
+                .enumerate()
+                .map(|(position, credit)| ("crew", position, credit)),
+        )
+        .collect::<Vec<_>>();
+    rows.sort_unstable_by(|left, right| {
+        left.2
+            .id
+            .cmp(&right.2.id)
+            .then_with(|| left.0.cmp(right.0))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    rows
+}
+
 async fn persist_episode(
     transaction: &mut Transaction<'_, Postgres>,
     title_id: i64,
     season_id: i64,
-    tv_id: i64,
-    season_number: u16,
     episode: &TmdbEpisode,
-    allow_local_media: bool,
 ) -> Result<(), JobExecutionError> {
     let episode_id = source_id(episode.id)?;
     let air_date = parse_source_date(episode.air_date.as_deref())?;
@@ -829,27 +995,7 @@ async fn persist_episode(
     .execute(&mut **transaction)
     .await
     .map_err(database_error)?;
-    enqueue_gallery_images_with_position(
-        transaction,
-        "episode",
-        episode_id,
-        "still",
-        episode.still_path.as_deref(),
-        &episode.images.stills,
-        Some(season_number),
-        Some(episode.episode_number),
-        Some(tv_id),
-        allow_local_media,
-    )
-    .await?;
-    replace_episode_credits(
-        transaction,
-        episode_id,
-        title_id,
-        &episode.credits,
-        allow_local_media,
-    )
-    .await
+    replace_episode_credits(transaction, episode_id, title_id, &episode.credits).await
 }
 
 async fn replace_episode_credits(
@@ -857,7 +1003,6 @@ async fn replace_episode_credits(
     episode_id: i64,
     title_id: i64,
     credits: &TmdbCredits,
-    allow_local_media: bool,
 ) -> Result<(), JobExecutionError> {
     sqlx::query("DELETE FROM catalog.episode_credits WHERE episode_id = $1 AND title_id = $2")
         .bind(episode_id)
@@ -865,54 +1010,39 @@ async fn replace_episode_credits(
         .execute(&mut **transaction)
         .await
         .map_err(database_error)?;
-    for (credit_type, rows) in [
-        ("cast", credits.cast.as_slice()),
-        ("crew", credits.crew.as_slice()),
-    ] {
-        for (position, credit) in rows.iter().enumerate() {
-            let person_id = source_id(credit.id)?;
-            let credit_id = stable_credit_id(credit, credit_type, position);
-            upsert_person(transaction, person_id, credit).await?;
-            enqueue_gallery_images(
-                transaction,
-                "person",
-                person_id,
-                "profile",
-                credit.profile_path.as_deref(),
-                &credit.images.profiles,
-                allow_local_media,
-            )
-            .await?;
-            sqlx::query(
-                "INSERT INTO catalog.episode_credits (
-                     episode_id, title_id, person_id, credit_id, credit_type,
-                     department, job, character, cast_order, source_updated_at
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp())
-                 ON CONFLICT (episode_id, person_id, credit_id) DO UPDATE SET
-                     credit_type = EXCLUDED.credit_type,
-                     department = EXCLUDED.department,
-                     job = EXCLUDED.job,
-                     character = EXCLUDED.character,
-                     cast_order = EXCLUDED.cast_order,
-                     source_updated_at = EXCLUDED.source_updated_at",
-            )
-            .bind(episode_id)
-            .bind(title_id)
-            .bind(person_id)
-            .bind(credit_id)
-            .bind(credit_type)
-            .bind(credit.department.as_deref())
-            .bind(credit.job.as_deref())
-            .bind(credit.character.as_deref())
-            .bind(if credit_type == "cast" {
-                credit.order
-            } else {
-                None
-            })
-            .execute(&mut **transaction)
-            .await
-            .map_err(database_error)?;
-        }
+    for (credit_type, position, credit) in ordered_credits(credits) {
+        let person_id = source_id(credit.id)?;
+        let credit_id = stable_credit_id(credit, credit_type, position);
+        upsert_person(transaction, person_id, credit).await?;
+        sqlx::query(
+            "INSERT INTO catalog.episode_credits (
+                 episode_id, title_id, person_id, credit_id, credit_type,
+                 department, job, character, cast_order, source_updated_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp())
+             ON CONFLICT (episode_id, person_id, credit_id) DO UPDATE SET
+                 credit_type = EXCLUDED.credit_type,
+                 department = EXCLUDED.department,
+                 job = EXCLUDED.job,
+                 character = EXCLUDED.character,
+                 cast_order = EXCLUDED.cast_order,
+                 source_updated_at = EXCLUDED.source_updated_at",
+        )
+        .bind(episode_id)
+        .bind(title_id)
+        .bind(person_id)
+        .bind(credit_id)
+        .bind(credit_type)
+        .bind(credit.department.as_deref())
+        .bind(credit.job.as_deref())
+        .bind(credit.character.as_deref())
+        .bind(if credit_type == "cast" {
+            credit.order
+        } else {
+            None
+        })
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
     }
     Ok(())
 }
@@ -922,22 +1052,32 @@ async fn replace_companies(
     title_id: i64,
     companies: &[TmdbCompany],
     role: &str,
-    allow_local_media: bool,
 ) -> Result<(), JobExecutionError> {
     sqlx::query("DELETE FROM catalog.title_companies WHERE title_id = $1")
         .bind(title_id)
         .execute(&mut **transaction)
         .await
         .map_err(database_error)?;
+    let mut companies = companies.iter().collect::<Vec<_>>();
+    companies.sort_unstable_by_key(|company| company.id);
     for company in companies {
         let company_id = source_id(company.id)?;
         sqlx::query(
-            "INSERT INTO catalog.companies (id, name, origin_country, logo_path)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (id) DO UPDATE SET
-                 name = COALESCE(EXCLUDED.name, catalog.companies.name),
-                 origin_country = COALESCE(EXCLUDED.origin_country, catalog.companies.origin_country),
-                 logo_path = COALESCE(EXCLUDED.logo_path, catalog.companies.logo_path)",
+            "WITH updated AS (
+                 UPDATE catalog.companies
+                    SET name = COALESCE($2, name),
+                        origin_country = COALESCE($3, origin_country),
+                        logo_path = COALESCE($4, logo_path)
+                  WHERE id = $1
+                    AND (($2 IS NOT NULL AND name IS DISTINCT FROM $2)
+                      OR ($3 IS NOT NULL AND origin_country IS DISTINCT FROM $3)
+                      OR ($4 IS NOT NULL AND logo_path IS DISTINCT FROM $4))
+                 RETURNING id
+             )
+             INSERT INTO catalog.companies (id, name, origin_country, logo_path)
+             SELECT $1, $2, $3, $4
+              WHERE NOT EXISTS (SELECT 1 FROM catalog.companies WHERE id = $1)
+             ON CONFLICT (id) DO NOTHING",
         )
         .bind(company_id)
         .bind(company.name.as_deref())
@@ -946,16 +1086,6 @@ async fn replace_companies(
         .execute(&mut **transaction)
         .await
         .map_err(database_error)?;
-        enqueue_gallery_images(
-            transaction,
-            "company",
-            company_id,
-            "logo",
-            company.logo_path.as_deref(),
-            &company.images.logos,
-            allow_local_media,
-        )
-        .await?;
         sqlx::query(
             "INSERT INTO catalog.title_companies (title_id, company_id, company_role)
              VALUES ($1, $2, $3)
@@ -975,22 +1105,34 @@ async fn replace_networks(
     transaction: &mut Transaction<'_, Postgres>,
     title_id: i64,
     networks: &[TmdbNetwork],
-    allow_local_media: bool,
 ) -> Result<(), JobExecutionError> {
     sqlx::query("DELETE FROM catalog.title_networks WHERE title_id = $1")
         .bind(title_id)
         .execute(&mut **transaction)
         .await
         .map_err(database_error)?;
+    let mut networks = networks.iter().collect::<Vec<_>>();
+    networks.sort_unstable_by_key(|network| network.id);
     for network in networks {
         let network_id = source_id(network.id)?;
         sqlx::query(
-            "INSERT INTO catalog.networks (id, name, origin_country, logo_path)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (id) DO UPDATE SET
-                 name = COALESCE(EXCLUDED.name, catalog.networks.name),
-                 origin_country = COALESCE(EXCLUDED.origin_country, catalog.networks.origin_country),
-                 logo_path = COALESCE(EXCLUDED.logo_path, catalog.networks.logo_path)",
+            "WITH updated AS (
+                 UPDATE catalog.networks
+                    SET name = COALESCE($2, name),
+                        origin_country = COALESCE($3, origin_country),
+                        logo_path = COALESCE($4, logo_path)
+                  WHERE id = $1
+                    AND (($2 IS NOT NULL AND name IS DISTINCT FROM $2)
+                      OR ($3 IS NOT NULL AND origin_country IS DISTINCT FROM $3)
+                      OR ($4 IS NOT NULL AND logo_path IS DISTINCT FROM $4))
+                 RETURNING id
+             )
+             INSERT INTO catalog.networks (id, name, origin_country, logo_path)
+             SELECT $1, $2, $3, $4
+              WHERE NOT EXISTS (
+                    SELECT 1 FROM catalog.networks WHERE id = $1
+              )
+             ON CONFLICT (id) DO NOTHING",
         )
         .bind(network_id)
         .bind(network.name.as_deref())
@@ -999,16 +1141,6 @@ async fn replace_networks(
         .execute(&mut **transaction)
         .await
         .map_err(database_error)?;
-        enqueue_gallery_images(
-            transaction,
-            "network",
-            network_id,
-            "logo",
-            network.logo_path.as_deref(),
-            &network.images.logos,
-            allow_local_media,
-        )
-        .await?;
         sqlx::query(
             "INSERT INTO catalog.title_networks (title_id, network_id) VALUES ($1, $2)
              ON CONFLICT DO NOTHING",
@@ -1061,7 +1193,6 @@ async fn replace_collection(
     transaction: &mut Transaction<'_, Postgres>,
     title_id: i64,
     collection: Option<&TmdbCollection>,
-    allow_local_media: bool,
 ) -> Result<(), JobExecutionError> {
     sqlx::query("DELETE FROM catalog.title_collections WHERE title_id = $1")
         .bind(title_id)
@@ -1073,12 +1204,21 @@ async fn replace_collection(
     };
     let collection_id = source_id(collection.id)?;
     sqlx::query(
-        "INSERT INTO catalog.collections (id, name, poster_path, backdrop_path)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (id) DO UPDATE SET
-             name = COALESCE(EXCLUDED.name, catalog.collections.name),
-             poster_path = COALESCE(EXCLUDED.poster_path, catalog.collections.poster_path),
-             backdrop_path = COALESCE(EXCLUDED.backdrop_path, catalog.collections.backdrop_path)",
+        "WITH updated AS (
+             UPDATE catalog.collections
+                SET name = COALESCE($2, name),
+                    poster_path = COALESCE($3, poster_path),
+                    backdrop_path = COALESCE($4, backdrop_path)
+              WHERE id = $1
+                AND (($2 IS NOT NULL AND name IS DISTINCT FROM $2)
+                  OR ($3 IS NOT NULL AND poster_path IS DISTINCT FROM $3)
+                  OR ($4 IS NOT NULL AND backdrop_path IS DISTINCT FROM $4))
+             RETURNING id
+         )
+         INSERT INTO catalog.collections (id, name, poster_path, backdrop_path)
+         SELECT $1, $2, $3, $4
+          WHERE NOT EXISTS (SELECT 1 FROM catalog.collections WHERE id = $1)
+         ON CONFLICT (id) DO NOTHING",
     )
     .bind(collection_id)
     .bind(collection.name.as_deref())
@@ -1087,6 +1227,72 @@ async fn replace_collection(
     .execute(&mut **transaction)
     .await
     .map_err(database_error)?;
+    sqlx::query(
+        "INSERT INTO catalog.title_collections (title_id, collection_id)
+         VALUES ($1, $2)
+         ON CONFLICT (title_id) DO UPDATE SET collection_id = EXCLUDED.collection_id",
+    )
+    .bind(title_id)
+    .bind(collection_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    Ok(())
+}
+
+async fn enqueue_company_images(
+    transaction: &mut Transaction<'_, Postgres>,
+    companies: &[TmdbCompany],
+    allow_local_media: bool,
+) -> Result<(), JobExecutionError> {
+    let mut companies = companies.iter().collect::<Vec<_>>();
+    companies.sort_unstable_by_key(|company| company.id);
+    for company in companies {
+        enqueue_gallery_images(
+            transaction,
+            "company",
+            source_id(company.id)?,
+            "logo",
+            company.logo_path.as_deref(),
+            &company.images.logos,
+            allow_local_media,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn enqueue_network_images(
+    transaction: &mut Transaction<'_, Postgres>,
+    networks: &[TmdbNetwork],
+    allow_local_media: bool,
+) -> Result<(), JobExecutionError> {
+    let mut networks = networks.iter().collect::<Vec<_>>();
+    networks.sort_unstable_by_key(|network| network.id);
+    for network in networks {
+        enqueue_gallery_images(
+            transaction,
+            "network",
+            source_id(network.id)?,
+            "logo",
+            network.logo_path.as_deref(),
+            &network.images.logos,
+            allow_local_media,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn enqueue_collection_images(
+    transaction: &mut Transaction<'_, Postgres>,
+    collection: Option<&TmdbCollection>,
+    allow_local_media: bool,
+) -> Result<(), JobExecutionError> {
+    let Some(collection) = collection else {
+        return Ok(());
+    };
+    let collection_id = source_id(collection.id)?;
     enqueue_gallery_images(
         transaction,
         "collection",
@@ -1106,18 +1312,7 @@ async fn replace_collection(
         &collection.images.backdrops,
         allow_local_media,
     )
-    .await?;
-    sqlx::query(
-        "INSERT INTO catalog.title_collections (title_id, collection_id)
-         VALUES ($1, $2)
-         ON CONFLICT (title_id) DO UPDATE SET collection_id = EXCLUDED.collection_id",
-    )
-    .bind(title_id)
-    .bind(collection_id)
-    .execute(&mut **transaction)
     .await
-    .map_err(database_error)?;
-    Ok(())
 }
 
 #[allow(
@@ -1573,7 +1768,7 @@ async fn enqueue_gallery_images_with_position(
     kind: &str,
     primary_path: Option<&str>,
     images: &[TmdbImage],
-    season_number: Option<u16>,
+    season_number: Option<u32>,
     episode_number: Option<u16>,
     title_tmdb_id: Option<i64>,
     allow_local_media: bool,
@@ -1586,7 +1781,7 @@ async fn enqueue_gallery_images_with_position(
         return Ok(());
     }
     if !image_queue_has_capacity(transaction, paths.len()).await? {
-        tracing::warn!(
+        tracing::debug!(
             event = "image_queue_capacity_deferred",
             entity_type,
             entity_id,
@@ -1623,7 +1818,7 @@ async fn image_queue_has_capacity(
 ) -> Result<bool, JobExecutionError> {
     sqlx::query(
         "SELECT pg_catalog.pg_advisory_xact_lock(
-             pg_catalog.hashtextextended('queue:image.download', 0)
+             pg_catalog.hashtextextended('queue:capacity', 0)
          )",
     )
     .execute(&mut **transaction)
@@ -1675,16 +1870,16 @@ async fn enqueue_image_job_with_position(
     entity_id: i64,
     kind: &str,
     tmdb_path: Option<&str>,
-    season_number: Option<u16>,
+    season_number: Option<u32>,
     episode_number: Option<u16>,
     title_tmdb_id: Option<i64>,
     allow_local_media: bool,
 ) -> Result<(), JobExecutionError> {
-    if !allow_local_media || !tmdb_path.is_some_and(|path| valid_image_path(path)) {
+    if !allow_local_media || !tmdb_path.is_some_and(valid_image_path) {
         return Ok(());
     }
     if !image_queue_has_capacity(transaction, 1).await? {
-        tracing::warn!(
+        tracing::debug!(
             event = "image_queue_capacity_deferred",
             entity_type,
             entity_id,
@@ -1717,7 +1912,7 @@ async fn enqueue_image_job_with_position_and_index(
     entity_id: i64,
     kind: &str,
     tmdb_path: Option<&str>,
-    season_number: Option<u16>,
+    season_number: Option<u32>,
     episode_number: Option<u16>,
     title_tmdb_id: Option<i64>,
     asset_index: u16,
@@ -1814,8 +2009,8 @@ mod tests {
     use serde_json::Value;
     use sqlx::PgPool;
     use tmdb_upstream::{
-        TmdbCredit, TmdbCredits, TmdbEpisode, TmdbGenre, TmdbImage, TmdbMovie, TmdbSeason,
-        TmdbSeasonSummary, TmdbTv,
+        TmdbCompany, TmdbCredit, TmdbCredits, TmdbEpisode, TmdbGenre, TmdbImage, TmdbMovie,
+        TmdbSeason, TmdbSeasonSummary, TmdbTv,
     };
     use tokio::sync::Barrier;
 
@@ -1871,10 +2066,10 @@ mod tests {
             backdrop_path: Some("/backdrop-fixture.jpg".to_owned()),
             ..TmdbMovie::default()
         };
-        persist_movie_with_options(&pool, &movie, true)
+        persist_movie_with_options(&pool, &movie, CatalogWriteOptions::title_refresh(true))
             .await
             .map_err(|error| as_sqlx_error(&error))?;
-        persist_movie_with_options(&pool, &movie, true)
+        persist_movie_with_options(&pool, &movie, CatalogWriteOptions::title_refresh(true))
             .await
             .map_err(|error| as_sqlx_error(&error))?;
 
@@ -1903,6 +2098,15 @@ mod tests {
                     digest_hex("/poster-fixture.jpg")
                 )
         }));
+        let enrichment_jobs: i64 = sqlx::query_scalar(
+            "SELECT count(*)
+               FROM ops.jobs
+              WHERE job_type = 'ingest.enrich_movie'
+                AND status IN ('queued', 'running', 'retry_wait')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(enrichment_jobs, 1);
         Ok(())
     }
 
@@ -1926,7 +2130,7 @@ mod tests {
             backdrop_path: Some("/capacity-backdrop.jpg".to_owned()),
             ..TmdbMovie::default()
         };
-        persist_movie_with_options(&pool, &movie, true)
+        persist_movie_with_options(&pool, &movie, CatalogWriteOptions::title_refresh(true))
             .await
             .map_err(|error| as_sqlx_error(&error))?;
 
@@ -2013,10 +2217,10 @@ mod tests {
             ..TmdbTv::default()
         };
 
-        persist_movie_with_options(&pool, &movie, false)
+        persist_movie_with_options(&pool, &movie, CatalogWriteOptions::title_refresh(false))
             .await
             .map_err(|error| as_sqlx_error(&error))?;
-        persist_tv_with_options(&pool, &tv, false)
+        persist_tv_with_options(&pool, &tv, CatalogWriteOptions::title_refresh(false))
             .await
             .map_err(|error| as_sqlx_error(&error))?;
 
@@ -2033,6 +2237,50 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn catalog_only_title_persistence_does_not_enqueue_child_jobs(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let movie = TmdbMovie {
+            id: 46,
+            title: Some("Catalog-only movie".to_owned()),
+            poster_path: Some("/movie.jpg".to_owned()),
+            ..TmdbMovie::default()
+        };
+        let tv = TmdbTv {
+            id: 47,
+            name: Some("Catalog-only TV".to_owned()),
+            poster_path: Some("/tv.jpg".to_owned()),
+            seasons: vec![TmdbSeasonSummary {
+                id: 48,
+                season_number: 1,
+                poster_path: Some("/season.jpg".to_owned()),
+                ..TmdbSeasonSummary::default()
+            }],
+            ..TmdbTv::default()
+        };
+
+        persist_movie_with_options(&pool, &movie, CatalogWriteOptions::CATALOG_ONLY)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+        persist_tv_with_options(&pool, &tv, CatalogWriteOptions::CATALOG_ONLY)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+
+        let child_jobs: i64 = sqlx::query_scalar(
+            "SELECT count(*)
+               FROM ops.jobs
+              WHERE job_type IN (
+                    'image.download', 'ingest.enrich_movie',
+                    'ingest.enrich_tv', 'ingest.refresh_season'
+              )",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(child_jobs, 0);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
     async fn disabled_local_media_does_not_create_download_jobs(pool: PgPool) -> sqlx::Result<()> {
         let movie = TmdbMovie {
             id: 43,
@@ -2040,7 +2288,7 @@ mod tests {
             poster_path: Some("/poster-remote.jpg".to_owned()),
             ..TmdbMovie::default()
         };
-        persist_movie_with_options(&pool, &movie, false)
+        persist_movie_with_options(&pool, &movie, CatalogWriteOptions::title_refresh(false))
             .await
             .map_err(|error| as_sqlx_error(&error))?;
         let count: i64 =
@@ -2056,7 +2304,7 @@ mod tests {
         pool: PgPool,
     ) -> sqlx::Result<()> {
         let series = concurrent_tv_fixture();
-        persist_tv_with_options(&pool, &series, false)
+        persist_tv_with_options(&pool, &series, CatalogWriteOptions::title_refresh(false))
             .await
             .map_err(|error| as_sqlx_error(&error))?;
         let season = concurrent_season_fixture();
@@ -2069,13 +2317,24 @@ mod tests {
                 let series = series.clone();
                 writers.spawn(async move {
                     writer_start.wait().await;
-                    persist_tv_with_options(&writer_pool, &series, false).await
+                    persist_tv_with_options(
+                        &writer_pool,
+                        &series,
+                        CatalogWriteOptions::title_refresh(false),
+                    )
+                    .await
                 });
             } else {
                 let season = season.clone();
                 writers.spawn(async move {
                     writer_start.wait().await;
-                    persist_season_with_options(&writer_pool, 800_001, &season, false).await
+                    persist_season_with_options(
+                        &writer_pool,
+                        800_001,
+                        &season,
+                        CatalogWriteOptions::season_refresh(false),
+                    )
+                    .await
                 });
             }
         }
@@ -2127,7 +2386,12 @@ mod tests {
             };
             writers.spawn(async move {
                 writer_start.wait().await;
-                persist_movie_with_options(&writer_pool, &movie, false).await
+                persist_movie_with_options(
+                    &writer_pool,
+                    &movie,
+                    CatalogWriteOptions::title_refresh(false),
+                )
+                .await
             });
         }
         start.wait().await;
@@ -2153,6 +2417,428 @@ mod tests {
         .fetch_one(&pool)
         .await?;
         assert_eq!(persisted, (2, 2, 2));
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn concurrent_catalog_and_media_fanout_use_one_lock_order(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let series = TmdbTv {
+            id: 811_001,
+            name: Some("Media lock-order TV fixture".to_owned()),
+            seasons: vec![TmdbSeasonSummary {
+                id: 811_011,
+                season_number: 1,
+                ..TmdbSeasonSummary::default()
+            }],
+            ..TmdbTv::default()
+        };
+        persist_tv_with_options(&pool, &series, CatalogWriteOptions::CATALOG_ONLY)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+
+        let shared_person = TmdbCredit {
+            id: 811_021,
+            name: Some("Shared media person".to_owned()),
+            profile_path: Some("/shared-media-person.jpg".to_owned()),
+            ..TmdbCredit::default()
+        };
+        let movie = TmdbMovie {
+            id: 811_002,
+            title: Some("Media lock-order movie fixture".to_owned()),
+            poster_path: Some("/media-lock-order-movie.jpg".to_owned()),
+            credits: TmdbCredits {
+                cast: vec![shared_person.clone()],
+                ..TmdbCredits::default()
+            },
+            production_companies: vec![TmdbCompany {
+                id: 811_031,
+                name: Some("Media lock-order company".to_owned()),
+                logo_path: Some("/media-lock-order-company.png".to_owned()),
+                ..TmdbCompany::default()
+            }],
+            ..TmdbMovie::default()
+        };
+        let season = TmdbSeason {
+            id: 811_011,
+            season_number: 1,
+            poster_path: Some("/media-lock-order-season.jpg".to_owned()),
+            episodes: vec![TmdbEpisode {
+                id: 811_012,
+                episode_number: 1,
+                still_path: Some("/media-lock-order-episode.jpg".to_owned()),
+                credits: TmdbCredits {
+                    crew: vec![shared_person],
+                    ..TmdbCredits::default()
+                },
+                ..TmdbEpisode::default()
+            }],
+            ..TmdbSeason::default()
+        };
+
+        let start = Arc::new(Barrier::new(17));
+        let mut writers = tokio::task::JoinSet::new();
+        for writer in 0_usize..16 {
+            let writer_pool = pool.clone();
+            let writer_start = Arc::clone(&start);
+            if writer.is_multiple_of(2) {
+                let movie = movie.clone();
+                writers.spawn(async move {
+                    writer_start.wait().await;
+                    persist_movie_with_options(
+                        &writer_pool,
+                        &movie,
+                        CatalogWriteOptions::title_refresh(true),
+                    )
+                    .await
+                });
+            } else {
+                let season = season.clone();
+                writers.spawn(async move {
+                    writer_start.wait().await;
+                    persist_season_with_options(
+                        &writer_pool,
+                        811_001,
+                        &season,
+                        CatalogWriteOptions::season_refresh(true),
+                    )
+                    .await
+                });
+            }
+        }
+        start.wait().await;
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(result) = writers.join_next().await {
+                result
+                    .map_err(|error| sqlx::Error::Protocol(error.to_string()))?
+                    .map_err(|error| as_sqlx_error(&error))?;
+            }
+            Ok::<(), sqlx::Error>(())
+        })
+        .await
+        .map_err(|_| {
+            sqlx::Error::Protocol("media fanout writers exceeded 30 seconds".to_owned())
+        })??;
+
+        let persisted: (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT count(*) FROM catalog.titles
+                   WHERE tmdb_id IN (811001, 811002)),
+                 (SELECT count(*) FROM catalog.episodes WHERE id = 811012),
+                 (SELECT count(*) FROM ops.jobs WHERE job_type = 'image.download')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!((persisted.0, persisted.1), (2, 1));
+        assert!(persisted.2 >= 5);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn unchanged_shared_genre_is_not_rewritten(pool: PgPool) -> sqlx::Result<()> {
+        let first = TmdbMovie {
+            id: 820_001,
+            title: Some("Genre seed fixture".to_owned()),
+            genres: vec![TmdbGenre {
+                id: 28,
+                name: Some("Action".to_owned()),
+            }],
+            ..TmdbMovie::default()
+        };
+        persist_movie_with_options(&pool, &first, CatalogWriteOptions::CATALOG_ONLY)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+        let before: String =
+            sqlx::query_scalar("SELECT xmin::text FROM catalog.genres WHERE id = 28")
+                .fetch_one(&pool)
+                .await?;
+        let second = TmdbMovie {
+            id: 820_002,
+            title: Some("Independent title fixture".to_owned()),
+            genres: first.genres.clone(),
+            ..TmdbMovie::default()
+        };
+        persist_movie_with_options(&pool, &second, CatalogWriteOptions::CATALOG_ONLY)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+        let after: String =
+            sqlx::query_scalar("SELECT xmin::text FROM catalog.genres WHERE id = 28")
+                .fetch_one(&pool)
+                .await?;
+
+        assert_eq!(after, before);
+        let renamed = TmdbMovie {
+            id: 820_003,
+            title: Some("Genre rename fixture".to_owned()),
+            genres: vec![TmdbGenre {
+                id: 28,
+                name: Some("Action Updated".to_owned()),
+            }],
+            ..TmdbMovie::default()
+        };
+        persist_movie_with_options(&pool, &renamed, CatalogWriteOptions::CATALOG_ONLY)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+        let genre_name: String =
+            sqlx::query_scalar("SELECT name FROM catalog.genres WHERE id = 28")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(genre_name, "Action Updated");
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn unchanged_shared_keyword_is_not_rewritten(pool: PgPool) -> sqlx::Result<()> {
+        let first = TmdbMovie {
+            id: 825_001,
+            title: Some("Keyword seed fixture".to_owned()),
+            keywords: vec![TmdbKeyword {
+                id: 42,
+                name: Some("based on novel".to_owned()),
+            }],
+            ..TmdbMovie::default()
+        };
+        persist_movie_with_options(&pool, &first, CatalogWriteOptions::CATALOG_ONLY)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+        let before: String =
+            sqlx::query_scalar("SELECT xmin::text FROM catalog.keywords WHERE id = 42")
+                .fetch_one(&pool)
+                .await?;
+        let second = TmdbMovie {
+            id: 825_002,
+            title: Some("Independent keyword fixture".to_owned()),
+            keywords: first.keywords.clone(),
+            ..TmdbMovie::default()
+        };
+        persist_movie_with_options(&pool, &second, CatalogWriteOptions::CATALOG_ONLY)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+        let after: String =
+            sqlx::query_scalar("SELECT xmin::text FROM catalog.keywords WHERE id = 42")
+                .fetch_one(&pool)
+                .await?;
+
+        assert_eq!(after, before);
+        let renamed = TmdbMovie {
+            id: 825_003,
+            title: Some("Keyword rename fixture".to_owned()),
+            keywords: vec![TmdbKeyword {
+                id: 42,
+                name: Some("novel adaptation".to_owned()),
+            }],
+            ..TmdbMovie::default()
+        };
+        persist_movie_with_options(&pool, &renamed, CatalogWriteOptions::CATALOG_ONLY)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+        let keyword_name: String =
+            sqlx::query_scalar("SELECT name FROM catalog.keywords WHERE id = 42")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(keyword_name, "novel adaptation");
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn unchanged_shared_network_is_not_rewritten(pool: PgPool) -> sqlx::Result<()> {
+        let first = TmdbTv {
+            id: 830_001,
+            name: Some("Network seed fixture".to_owned()),
+            networks: vec![TmdbNetwork {
+                id: 6,
+                name: Some("NBC".to_owned()),
+                origin_country: Some("US".to_owned()),
+                logo_path: Some("/nbc.png".to_owned()),
+                ..TmdbNetwork::default()
+            }],
+            ..TmdbTv::default()
+        };
+        persist_tv_with_options(&pool, &first, CatalogWriteOptions::CATALOG_ONLY)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+        let before: String =
+            sqlx::query_scalar("SELECT xmin::text FROM catalog.networks WHERE id = 6")
+                .fetch_one(&pool)
+                .await?;
+        let second = TmdbTv {
+            id: 830_002,
+            name: Some("Independent network fixture".to_owned()),
+            networks: first.networks.clone(),
+            ..TmdbTv::default()
+        };
+        persist_tv_with_options(&pool, &second, CatalogWriteOptions::CATALOG_ONLY)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+        let after: String =
+            sqlx::query_scalar("SELECT xmin::text FROM catalog.networks WHERE id = 6")
+                .fetch_one(&pool)
+                .await?;
+
+        assert_eq!(after, before);
+        let renamed = TmdbTv {
+            id: 830_003,
+            name: Some("Network rename fixture".to_owned()),
+            networks: vec![TmdbNetwork {
+                id: 6,
+                name: Some("NBC Updated".to_owned()),
+                origin_country: Some("US".to_owned()),
+                logo_path: Some("/nbc.png".to_owned()),
+                ..TmdbNetwork::default()
+            }],
+            ..TmdbTv::default()
+        };
+        persist_tv_with_options(&pool, &renamed, CatalogWriteOptions::CATALOG_ONLY)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+        let network_name: String =
+            sqlx::query_scalar("SELECT name FROM catalog.networks WHERE id = 6")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(network_name, "NBC Updated");
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn unchanged_shared_people_companies_and_collections_are_not_rewritten(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let shared_credit = TmdbCredit {
+            id: 850_101,
+            name: Some("Shared Person".to_owned()),
+            original_name: Some("Shared Person".to_owned()),
+            department: Some("Acting".to_owned()),
+            profile_path: Some("/shared-person.jpg".to_owned()),
+            ..TmdbCredit::default()
+        };
+        let shared_company = TmdbCompany {
+            id: 850_102,
+            name: Some("Shared Company".to_owned()),
+            origin_country: Some("US".to_owned()),
+            logo_path: Some("/shared-company.png".to_owned()),
+            ..TmdbCompany::default()
+        };
+        let shared_collection = TmdbCollection {
+            id: 850_103,
+            name: Some("Shared Collection".to_owned()),
+            poster_path: Some("/shared-collection.jpg".to_owned()),
+            backdrop_path: Some("/shared-collection-backdrop.jpg".to_owned()),
+            ..TmdbCollection::default()
+        };
+        let first = TmdbMovie {
+            id: 850_001,
+            title: Some("Shared resource seed".to_owned()),
+            credits: TmdbCredits {
+                cast: vec![shared_credit.clone()],
+                ..TmdbCredits::default()
+            },
+            production_companies: vec![shared_company.clone()],
+            belongs_to_collection: Some(shared_collection.clone()),
+            ..TmdbMovie::default()
+        };
+        persist_movie_with_options(&pool, &first, CatalogWriteOptions::CATALOG_ONLY)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+        let before: (String, String, String) = sqlx::query_as(
+            "SELECT
+                 (SELECT xmin::text FROM catalog.people WHERE id = 850101),
+                 (SELECT xmin::text FROM catalog.companies WHERE id = 850102),
+                 (SELECT xmin::text FROM catalog.collections WHERE id = 850103)",
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        let second = TmdbMovie {
+            id: 850_002,
+            title: Some("Independent shared resource title".to_owned()),
+            credits: first.credits.clone(),
+            production_companies: first.production_companies.clone(),
+            belongs_to_collection: first.belongs_to_collection.clone(),
+            ..TmdbMovie::default()
+        };
+        persist_movie_with_options(&pool, &second, CatalogWriteOptions::CATALOG_ONLY)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+        let after: (String, String, String) = sqlx::query_as(
+            "SELECT
+                 (SELECT xmin::text FROM catalog.people WHERE id = 850101),
+                 (SELECT xmin::text FROM catalog.companies WHERE id = 850102),
+                 (SELECT xmin::text FROM catalog.collections WHERE id = 850103)",
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(after, before);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn unchanged_title_search_document_is_not_rewritten(pool: PgPool) -> sqlx::Result<()> {
+        let movie = TmdbMovie {
+            id: 850_201,
+            title: Some("Stable search title".to_owned()),
+            original_title: Some("Stable original title".to_owned()),
+            overview: Some("Stable overview".to_owned()),
+            ..TmdbMovie::default()
+        };
+        persist_movie_with_options(&pool, &movie, CatalogWriteOptions::CATALOG_ONLY)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+        let before: String = sqlx::query_scalar(
+            "SELECT xmin::text FROM search.search_documents
+              WHERE title_id = (SELECT id FROM catalog.titles
+                                  WHERE media_type = 'movie' AND tmdb_id = 850201)
+                AND locale = ''",
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        persist_movie_with_options(&pool, &movie, CatalogWriteOptions::CATALOG_ONLY)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+        let after: String = sqlx::query_scalar(
+            "SELECT xmin::text FROM search.search_documents
+              WHERE title_id = (SELECT id FROM catalog.titles
+                                  WHERE media_type = 'movie' AND tmdb_id = 850201)
+                AND locale = ''",
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(after, before);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+    async fn blank_credit_name_uses_the_original_person_name(pool: PgPool) -> sqlx::Result<()> {
+        let movie = TmdbMovie {
+            id: 840_001,
+            title: Some("Blank credit name fixture".to_owned()),
+            credits: TmdbCredits {
+                crew: vec![TmdbCredit {
+                    id: 4_153_033,
+                    name: Some(" ".to_owned()),
+                    original_name: Some("Murielle La Ferrière".to_owned()),
+                    ..TmdbCredit::default()
+                }],
+                ..TmdbCredits::default()
+            },
+            ..TmdbMovie::default()
+        };
+
+        persist_movie_with_options(&pool, &movie, CatalogWriteOptions::CATALOG_ONLY)
+            .await
+            .map_err(|error| as_sqlx_error(&error))?;
+        let persisted: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT name, original_name FROM catalog.people WHERE id = $1")
+                .bind(4_153_033_i64)
+                .fetch_one(&pool)
+                .await?;
+
+        assert_eq!(persisted.0.as_deref(), Some("Murielle La Ferrière"));
+        assert_eq!(persisted.1.as_deref(), Some("Murielle La Ferrière"));
         Ok(())
     }
 

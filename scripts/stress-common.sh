@@ -65,6 +65,23 @@ configure_runtime() {
     refresh_paths
 }
 
+configure_existing_runtime() {
+    local key value
+    configure_runtime "$@"
+    [[ -f "$ENV_FILE" ]] || return 0
+    for key in TMDB_STRESS_API_PORT TMDB_STRESS_ADMIN_PORT TMDB_STRESS_IMAGE_PORT TMDB_STRESS_PG_PORT; do
+        value="$(awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1); exit }' "$ENV_FILE")"
+        [[ "$value" =~ ^[0-9]+$ ]] || die "invalid $key in existing stress runtime"
+        case "$key" in
+            TMDB_STRESS_API_PORT) API_PORT="$value" ;;
+            TMDB_STRESS_ADMIN_PORT) ADMIN_PORT="$value" ;;
+            TMDB_STRESS_IMAGE_PORT) IMAGE_PORT="$value" ;;
+            TMDB_STRESS_PG_PORT) POSTGRES_PORT="$value" ;;
+        esac
+        export "$key=$value"
+    done
+}
+
 die() {
     printf 'ERROR: %s\n' "$*" >&2
     exit 1
@@ -107,7 +124,7 @@ read_stress_secrets() {
     while IFS= read -r line || [[ -n "$line" ]]; do
         line="${line%$'\r'}"
         [[ -z "${line//[[:space:]]/}" || "$line" == \#* ]] && continue
-        [[ "$line" =~ ^(TMDB_STRESS_READ_TOKEN|TMDB_STRESS_API_KEY|TMDB_STRESS_TRAWL_BASE_URL)=(.+)$ ]] \
+        [[ "$line" =~ ^(TMDB_STRESS_READ_TOKEN|TMDB_STRESS_API_KEY|TMDB_STRESS_TRAWL_BASE_URL|TMDB_ADMIN_API_KEY)=(.+)$ ]] \
             || die "invalid local stress secret entry in $path"
         key="${BASH_REMATCH[1]}"
         value="${BASH_REMATCH[2]}"
@@ -115,6 +132,7 @@ read_stress_secrets() {
         case "$value" in
             *[[:space:]]*|*\"*|*\'*) die "invalid local stress secret value for $key" ;;
         esac
+        [[ "$key" != 'TMDB_ADMIN_API_KEY' ]] || continue
         STRESS_SECRETS["$key"]="$value"
     done < "$path"
 
@@ -248,7 +266,7 @@ wait_for_migrations() {
             continue
         fi
         version="$(psql_at "$password" "SELECT COALESCE(max(version), 0) FROM ops._sqlx_migrations WHERE success" 2>/dev/null || true)"
-        if [[ "$version" =~ ^[0-9]+$ ]] && (( version >= 41 )); then
+        if [[ "$version" =~ ^[0-9]+$ ]] && (( version >= 50 )); then
             return 0
         fi
         sleep 2
@@ -302,7 +320,7 @@ TMDB_ADMIN_API_KEY=test-admin-key-placeholder-0123456789
 TMDB_API_BASE_URL=https://api.themoviedb.org/3
 TMDB_MEDIA_BASE_URL=http://127.0.0.1:$IMAGE_PORT/media
 TMDB_RATE_LIMIT=40
-TMDB_MAX_CONNECTIONS=20
+TMDB_MAX_CONNECTIONS=64
 TMDB_MAX_ATTEMPTS=4
 TMDB_REQUEST_TIMEOUT_SECONDS=30
 TMDB_DAILY_EXPORT_MAX_BYTES=536870912
@@ -312,7 +330,7 @@ TMDB_IMAGE_WORKER_CONCURRENCY=4
 TMDB_WORKER_LEASE_SECONDS=60
 TMDB_WORKER_HEARTBEAT_SECONDS=15
 TMDB_WORKER_IDLE_POLL_MS=100
-TMDB_STRESS_PG_MAX_CONNECTIONS=120
+TMDB_STRESS_PG_MAX_CONNECTIONS=200
 TMDB_STRESS_PG_SHARED_BUFFERS=2GB
 TMDB_STRESS_PG_EFFECTIVE_CACHE_SIZE=8GB
 TMDB_STRESS_PG_WORK_MEM=32MB

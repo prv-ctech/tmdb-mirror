@@ -5,6 +5,10 @@
 //! session/list/favorite/watchlist/rating state so clients can use the same
 //! contract without sending writes to TMDB.
 
+// Invalid TMDB-compatible requests carry a ready-to-send Axum response. Keeping
+// that response inline avoids an allocation on every rejected request.
+#![allow(clippy::result_large_err)]
+
 use std::collections::{HashMap, HashSet};
 
 use axum::{
@@ -106,7 +110,6 @@ impl From<sqlx::Error> for ApiError {
 }
 
 /// Builds the local TMDB v3 route surface.
-#[must_use]
 pub fn build_tmdb_v3_router(
     read_pool: PgPool,
     write_pool: PgPool,
@@ -144,7 +147,7 @@ async fn dispatch(
 
 async fn get_operation(state: &TmdbV3State, endpoint_path: &str, query: &str) -> Response {
     match generated_get(state, endpoint_path, query).await {
-        Ok(GeneratedGet::Response(value)) => match localize_media_paths(state, value).await {
+        Ok(GeneratedGet::Response(value)) => match add_local_media_paths(state, value).await {
             Ok(value) => json_response(value),
             Err(_) => database_unavailable(),
         },
@@ -159,7 +162,7 @@ async fn document(state: &TmdbV3State, endpoint_path: &str, query: &str) -> Resp
     for candidate in document_query_candidates(endpoint_path, query) {
         match state.documents.get(endpoint_path, &candidate).await {
             Ok(Some(value)) => {
-                return match localize_media_paths(state, value).await {
+                return match add_local_media_paths(state, value).await {
                     Ok(value) => json_response(value),
                     Err(_) => database_unavailable(),
                 };
@@ -200,13 +203,13 @@ fn default_language(endpoint_path: &str, value: &str) -> bool {
     }
 }
 
-const LOCAL_MEDIA_FIELDS: &[&str] = &[
-    "backdrop_path",
-    "file_path",
-    "logo_path",
-    "poster_path",
-    "profile_path",
-    "still_path",
+const LOCAL_MEDIA_FIELDS: &[(&str, &str)] = &[
+    ("backdrop_path", "local_backdrop_path"),
+    ("file_path", "local_file_path"),
+    ("logo_path", "local_logo_path"),
+    ("poster_path", "local_poster_path"),
+    ("profile_path", "local_profile_path"),
+    ("still_path", "local_still_path"),
 ];
 
 #[derive(Debug, FromRow)]
@@ -215,7 +218,7 @@ struct LocalMediaPathRow {
     storage_path: String,
 }
 
-async fn localize_media_paths(
+async fn add_local_media_paths(
     state: &TmdbV3State,
     mut value: Value,
 ) -> Result<Value, sqlx::Error> {
@@ -236,14 +239,12 @@ async fn localize_media_paths(
         .fetch_all(&state.read_pool)
         .await?;
         for row in rows {
-            local_paths.entry(row.source_key).or_insert(row.storage_path);
+            local_paths
+                .entry(row.source_key)
+                .or_insert(row.storage_path);
         }
     }
-    rewrite_media_paths(
-        &mut value,
-        state.media_base_url.as_deref(),
-        &local_paths,
-    );
+    insert_local_media_paths(&mut value, state.media_base_url.as_deref(), &local_paths);
     Ok(value)
 }
 
@@ -256,7 +257,7 @@ fn collect_media_source_keys(value: &Value, source_keys: &mut HashSet<String>) {
         }
         Value::Object(object) => {
             for (key, value) in object {
-                if LOCAL_MEDIA_FIELDS.contains(&key.as_str()) {
+                if local_media_field(key).is_some() {
                     if let Some(source_key) = value.as_str()
                         && is_tmdb_source_key(source_key)
                     {
@@ -271,7 +272,7 @@ fn collect_media_source_keys(value: &Value, source_keys: &mut HashSet<String>) {
     }
 }
 
-fn rewrite_media_paths(
+fn insert_local_media_paths(
     value: &mut Value,
     media_base_url: Option<&str>,
     local_paths: &HashMap<String, String>,
@@ -279,12 +280,13 @@ fn rewrite_media_paths(
     match value {
         Value::Array(values) => {
             for value in values {
-                rewrite_media_paths(value, media_base_url, local_paths);
+                insert_local_media_paths(value, media_base_url, local_paths);
             }
         }
         Value::Object(object) => {
-            for (key, value) in object {
-                if LOCAL_MEDIA_FIELDS.contains(&key.as_str()) {
+            let mut additions = Vec::new();
+            for (key, value) in object.iter_mut() {
+                if let Some(local_field) = local_media_field(key) {
                     let local_url = value
                         .as_str()
                         .filter(|source_key| is_tmdb_source_key(source_key))
@@ -293,14 +295,26 @@ fn rewrite_media_paths(
                         .and_then(|storage_path| {
                             media_base_url.map(|base| format!("{base}/{storage_path}"))
                         });
-                    *value = local_url.map_or(Value::Null, |url| Value::String(url));
+                    additions.push((
+                        local_field.to_owned(),
+                        local_url.map_or(Value::Null, Value::String),
+                    ));
                 } else {
-                    rewrite_media_paths(value, media_base_url, local_paths);
+                    insert_local_media_paths(value, media_base_url, local_paths);
                 }
+            }
+            for (key, value) in additions {
+                object.insert(key, value);
             }
         }
         _ => {}
     }
+}
+
+fn local_media_field(upstream_field: &str) -> Option<&'static str> {
+    LOCAL_MEDIA_FIELDS
+        .iter()
+        .find_map(|(field, local_field)| (*field == upstream_field).then_some(*local_field))
 }
 
 fn is_tmdb_source_key(value: &str) -> bool {
@@ -322,6 +336,7 @@ fn is_safe_storage_path(value: &str) -> bool {
             .any(|part| part.is_empty() || part == "." || part == "..")
 }
 
+#[allow(clippy::too_many_lines)]
 async fn generated_get(
     state: &TmdbV3State,
     endpoint_path: &str,
@@ -379,13 +394,13 @@ async fn generated_get(
         ["discover", "tv"] => discover_titles(state, "tv", query).await,
         ["find", external_id] => find_external_id(state, external_id, query).await,
         ["account", account_id] => {
-            let account_id = parse_id(account_id).ok_or_else(|| invalid_id_error())?;
+            let account_id = parse_id(account_id).ok_or_else(invalid_id_error)?;
             let session = require_account_session(&state.write_pool, query, account_id).await?;
             let _ = session;
             Ok(GeneratedGet::Response(json!({"id": account_id})))
         }
         ["account", account_id, "lists"] => {
-            let account_id = parse_id(account_id).ok_or_else(|| invalid_id_error())?;
+            let account_id = parse_id(account_id).ok_or_else(invalid_id_error)?;
             let session = require_account_session(&state.write_pool, query, account_id).await?;
             let _ = session;
             account_lists(&state.write_pool, account_id, query).await
@@ -394,7 +409,7 @@ async fn generated_get(
             if matches!(*relation, "favorite" | "watchlist")
                 && matches!(*media_type, "movies" | "tv") =>
         {
-            let account_id = parse_id(account_id).ok_or_else(|| invalid_id_error())?;
+            let account_id = parse_id(account_id).ok_or_else(invalid_id_error)?;
             let _session = require_account_session(&state.write_pool, query, account_id).await?;
             let media_type = if *media_type == "movies" {
                 "movie"
@@ -404,7 +419,7 @@ async fn generated_get(
             account_media(state, account_id, relation, media_type, query).await
         }
         ["account", account_id, "rated", media_type] if matches!(*media_type, "movies" | "tv") => {
-            let account_id = parse_id(account_id).ok_or_else(|| invalid_id_error())?;
+            let account_id = parse_id(account_id).ok_or_else(invalid_id_error)?;
             let session = require_account_session(&state.write_pool, query, account_id).await?;
             let media_type = if *media_type == "movies" {
                 "movie"
@@ -414,7 +429,7 @@ async fn generated_get(
             rated_media(state, "session", &session.session_id, media_type, query).await
         }
         ["account", account_id, "rated", "tv", "episodes"] => {
-            let account_id = parse_id(account_id).ok_or_else(|| invalid_id_error())?;
+            let account_id = parse_id(account_id).ok_or_else(invalid_id_error)?;
             let session = require_account_session(&state.write_pool, query, account_id).await?;
             rated_media(state, "session", &session.session_id, "tv_episode", query).await
         }
@@ -434,14 +449,14 @@ async fn generated_get(
             rated_media(state, "guest", guest_session_id, "tv_episode", query).await
         }
         ["list", list_id] => {
-            let list_id = parse_id(list_id).ok_or_else(|| invalid_id_error())?;
+            let list_id = parse_id(list_id).ok_or_else(invalid_id_error)?;
             list_detail(state, list_id, query).await
         }
         ["list", list_id, "item_status"] => {
-            let list_id = parse_id(list_id).ok_or_else(|| invalid_id_error())?;
+            let list_id = parse_id(list_id).ok_or_else(invalid_id_error)?;
             let movie_id = query_parameter(query, "movie_id")
                 .and_then(|value| parse_id(&value))
-                .ok_or_else(|| invalid_id_error())?;
+                .ok_or_else(invalid_id_error)?;
             let present: bool = sqlx::query_scalar(
                 "SELECT EXISTS (
                      SELECT 1 FROM source.tmdb_v3_list_items
@@ -788,6 +803,7 @@ async fn delete_list(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn rating_operation(
     state: &TmdbV3State,
     media_type: &str,
@@ -962,6 +978,7 @@ async fn rated_media(
     Ok(GeneratedGet::Response(page_response(results, total, page)))
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 struct DiscoverFilters {
     include_adult: bool,
@@ -1011,7 +1028,7 @@ fn parse_discover_filters(query: &str, media_type: &str) -> Result<DiscoverFilte
         "first_air_date_year"
     };
     let year = parse_i32_parameter(query, year_name)?;
-    let date_gte = parse_date_parameter(
+    let start_date = parse_date_parameter(
         query,
         if media_type == "movie" {
             "primary_release_date.gte"
@@ -1019,7 +1036,7 @@ fn parse_discover_filters(query: &str, media_type: &str) -> Result<DiscoverFilte
             "first_air_date.gte"
         },
     )?;
-    let date_lte = parse_date_parameter(
+    let end_date = parse_date_parameter(
         query,
         if media_type == "movie" {
             "primary_release_date.lte"
@@ -1033,12 +1050,9 @@ fn parse_discover_filters(query: &str, media_type: &str) -> Result<DiscoverFilte
         include_adult,
         include_video,
         year,
-        date_gte,
-        date_lte,
-        original_language: bounded_filter_string(query_parameter(
-            query,
-            "with_original_language",
-        ))?,
+        date_gte: start_date,
+        date_lte: end_date,
+        original_language: bounded_filter_string(query_parameter(query, "with_original_language"))?,
         without_original_language: bounded_filter_string(query_parameter(
             query,
             "without_original_language",
@@ -1059,6 +1073,7 @@ fn parse_discover_filters(query: &str, media_type: &str) -> Result<DiscoverFilte
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn fetch_discover_rows(
     pool: &PgPool,
     media_type: &str,
@@ -1218,7 +1233,10 @@ async fn search_titles(
         let mut rows = movies
             .into_iter()
             .map(|row| title_search_result(row, "movie", true))
-            .chain(tv.into_iter().map(|row| title_search_result(row, "tv", true)))
+            .chain(
+                tv.into_iter()
+                    .map(|row| title_search_result(row, "tv", true)),
+            )
             .collect::<Vec<_>>();
         if include_people {
             let (people, people_total) =
@@ -1227,7 +1245,11 @@ async fn search_titles(
             let total = movie_total
                 .saturating_add(tv_total)
                 .saturating_add(people_total);
-            rows.extend(people.into_iter().map(|row| person_search_result(row, true)));
+            rows.extend(
+                people
+                    .into_iter()
+                    .map(|row| person_search_result(row, true)),
+            );
             (rows, total)
         } else {
             (rows, movie_total.saturating_add(tv_total))
@@ -1404,10 +1426,7 @@ struct KeywordSearchRow {
     total_results: i64,
 }
 
-async fn search_collections(
-    state: &TmdbV3State,
-    query: &str,
-) -> Result<GeneratedGet, ApiError> {
+async fn search_collections(state: &TmdbV3State, query: &str) -> Result<GeneratedGet, ApiError> {
     let search_term = required_search_term(query)?;
     let page = requested_page(query);
     let rows = sqlx::query_as::<_, CollectionSearchRow>(
@@ -1442,10 +1461,7 @@ async fn search_collections(
     Ok(GeneratedGet::Response(page_response(results, total, page)))
 }
 
-async fn search_companies(
-    state: &TmdbV3State,
-    query: &str,
-) -> Result<GeneratedGet, ApiError> {
+async fn search_companies(state: &TmdbV3State, query: &str) -> Result<GeneratedGet, ApiError> {
     let search_term = required_search_term(query)?;
     let page = requested_page(query);
     let rows = sqlx::query_as::<_, CompanySearchRow>(
@@ -1480,10 +1496,7 @@ async fn search_companies(
     Ok(GeneratedGet::Response(page_response(results, total, page)))
 }
 
-async fn search_keywords(
-    state: &TmdbV3State,
-    query: &str,
-) -> Result<GeneratedGet, ApiError> {
+async fn search_keywords(state: &TmdbV3State, query: &str) -> Result<GeneratedGet, ApiError> {
     let search_term = required_search_term(query)?;
     let page = requested_page(query);
     let rows = sqlx::query_as::<_, KeywordSearchRow>(
@@ -1647,6 +1660,7 @@ fn title_search_result(row: TitleSearchRow, media_type: &str, include_media_type
     result
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn person_search_result(row: PersonSearchRow, include_media_type: bool) -> Value {
     let mut result = json!({
         "adult": row.adult,
@@ -1670,9 +1684,8 @@ async fn list_detail(
     list_id: i64,
     query: &str,
 ) -> Result<GeneratedGet, ApiError> {
-    let owner = match list_owner_optional(&state.write_pool, list_id, query).await? {
-        Some(owner) => owner,
-        None => return Ok(GeneratedGet::NotFound),
+    let Some(owner) = list_owner_optional(&state.write_pool, list_id, query).await? else {
+        return Ok(GeneratedGet::NotFound);
     };
     let row = sqlx::query_as::<_, ListRow>(
         "SELECT id, name, description, language_code
@@ -1688,7 +1701,7 @@ async fn list_detail(
     .bind(list_id)
     .fetch_all(&state.write_pool)
     .await?;
-    let item_count = ids.len() as i64;
+    let item_count = i64::try_from(ids.len()).map_err(|_| ApiError::Database)?;
     let items = media_results(&state.documents, "movie", ids, None).await?;
     let _ = owner;
     Ok(GeneratedGet::Response(json!({
@@ -1830,6 +1843,7 @@ async fn media_results_with_ratings(
     media_results(documents, media_type, ids, Some(&ratings)).await
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn list_summary(row: ListSummaryRow) -> Value {
     json!({
         "description": row.description,
@@ -1842,6 +1856,7 @@ fn list_summary(row: ListSummaryRow) -> Value {
     })
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn page_response(results: Vec<Value>, total: i64, page: i64) -> Value {
     let total_pages = if total == 0 {
         1
@@ -1896,10 +1911,7 @@ fn parse_f64_parameter(query: &str, name: &str) -> Result<Option<f64>, ApiError>
     Ok(value)
 }
 
-fn parse_date_parameter(
-    query: &str,
-    name: &str,
-) -> Result<Option<chrono::NaiveDate>, ApiError> {
+fn parse_date_parameter(query: &str, name: &str) -> Result<Option<chrono::NaiveDate>, ApiError> {
     query_parameter(query, name)
         .map(|value| chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d"))
         .transpose()
@@ -1907,10 +1919,9 @@ fn parse_date_parameter(
 }
 
 fn bounded_filter_string(value: Option<String>) -> Result<Option<String>, ApiError> {
-    if value
-        .as_deref()
-        .is_some_and(|value| value.is_empty() || value.chars().count() > 32 || value.chars().any(char::is_control))
-    {
+    if value.as_deref().is_some_and(|value| {
+        value.is_empty() || value.chars().count() > 32 || value.chars().any(char::is_control)
+    }) {
         return Err(ApiError::Response(invalid_parameter_error()));
     }
     Ok(value)
@@ -1922,7 +1933,7 @@ fn parse_id_filter(value: Option<String>) -> Result<(Vec<i64>, bool), ApiError> 
     };
     let require_all = value.contains('|');
     let ids = value
-        .split(|character| character == '|' || character == ',')
+        .split(['|', ','])
         .map(|value| {
             value
                 .parse::<i64>()
@@ -1985,7 +1996,7 @@ fn body_object(body: &Bytes) -> Result<Map<String, Value>, Response> {
 }
 
 fn required_string(object: &Map<String, Value>, name: &str) -> Result<String, Response> {
-    optional_string(object, name).ok_or_else(|| invalid_parameter_error())
+    optional_string(object, name).ok_or_else(invalid_parameter_error)
 }
 
 fn optional_string(object: &Map<String, Value>, name: &str) -> Option<String> {

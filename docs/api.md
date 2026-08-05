@@ -7,7 +7,7 @@ second catalog schema or an anime namespace.
 | Listener | Port | Contract |
 | --- | ---: | --- |
 | Public API | `9001` | Health and `/3/...` TMDB documents |
-| Admin API | container `8081` | Authenticated worker, scan, job, and backup control |
+| Admin API | `8081` | Authenticated worker, scan, job, and backup control |
 | Media | `9002` | Verified local image files |
 
 ## Public routes
@@ -18,8 +18,10 @@ GET /health/ready
 GET /3/{tmdb_v3_endpoint_path}
 ```
 
-`/3/{tmdb_v3_endpoint_path}` uses the exact path and query string captured by
-the worker. A missing document returns the TMDB not-found shape:
+Implemented search, discovery, account, and write routes query the local
+database directly. Other `/3/{tmdb_v3_endpoint_path}` reads return the exact
+document captured by a worker scan. The public API never fetches TMDB on
+demand. A missing local document returns the TMDB not-found shape:
 
 ```json
 {
@@ -56,9 +58,33 @@ curl -sS 'http://127.0.0.1:9001/3/tv/4586/season/1/episode/1/images?language=en-
 
 The worker captures title, season, episode, reusable-entity, and configuration
 documents during explicit scans. An endpoint is not fetched on demand by the
-public API. Image-path fields are rewritten to the matching local media URL
-when the asset is ready; a missing local asset is returned as `null`. Set
-`TMDB_MEDIA_BASE_URL` to the public base URL of the media listener.
+public API. TMDB image paths are preserved and an additive local field contains
+the matching full media URL when the asset is ready, or `null` when it is not.
+Set `TMDB_MEDIA_BASE_URL` to the public base URL of the media listener.
+
+| TMDB field | Local field |
+| --- | --- |
+| `file_path` | `local_file_path` |
+| `poster_path` | `local_poster_path` |
+| `backdrop_path` | `local_backdrop_path` |
+| `profile_path` | `local_profile_path` |
+| `logo_path` | `local_logo_path` |
+| `still_path` | `local_still_path` |
+
+For example:
+
+```json
+{
+  "poster_path": "/upstream-poster.jpg",
+  "local_poster_path": "http://127.0.0.1:9002/media/movies/42/posters/poster.jpg",
+  "backdrop_path": "/upstream-backdrop.jpg",
+  "local_backdrop_path": null
+}
+```
+
+The media worker records ready local assets in PostgreSQL. The API resolves
+the additive fields from those records; the workers do not communicate
+directly and the stored upstream TMDB document is not modified.
 
 ## Media files
 
@@ -79,10 +105,12 @@ variant, `.masters` directory, video file, or `/videos` media folder exists.
 ## Admin API
 
 The admin listener requires `X-API-Key` or a bearer token containing
-`TMDB_ADMIN_API_KEY`. Production keeps port `8081` private.
+`TMDB_ADMIN_API_KEY`. Production publishes it on host port `8081`; protect
+that port with the host firewall and keep the key secret.
 
-Every state-changing request requires an `Idempotency-Key` and returns a
-durable job submission. Reusing a key with the same request is idempotent;
+Every state-changing request requires an `Idempotency-Key`. Scans, job
+operations, and backups return durable operation IDs; worker controls return
+the persisted worker state. Reusing a key with the same request is idempotent;
 reusing it with a different request returns `409`.
 
 | Method | Path | Purpose |
@@ -113,6 +141,14 @@ past the retention window, its child-job links are released; the scan root and
 its aggregate counters remain available for audit. Terminal cleanup uses
 retention indexes and remains an explicit operator action.
 
+`full_sweep` imports TMDB's daily movie and TV ID exports in uninterrupted
+500-title scheduling batches. Durable 100-title enrichment batches begin only
+after census work drains, and 25-season TV season/episode batches begin only
+after enrichment drains. Media downloads and reusable-entity galleries require
+a separate media scan. `daily_sync` reads TMDB's movie and TV change feeds,
+refreshes changed titles, and discovers new seasons and episodes from the
+refreshed documents.
+
 Example catalog scan:
 
 ```bash
@@ -136,6 +172,11 @@ curl -sS -X POST http://127.0.0.1:8081/admin/v1/worker \
 `pause` stops new claims and lets the active job finish. `cancel` stops the
 worker state, cancels queued work, and requests cancellation for active work.
 The container remains running after either action.
+
+Catalog and media controls are independent. For an emergency stop, cancel the
+main worker first, wait for its active catalog jobs to settle, then cancel the
+media worker. This second step clears any image jobs committed by catalog work
+that was already in flight when the first cancellation was requested.
 
 ## Official references
 

@@ -411,6 +411,9 @@ pub(crate) fn validate_failure_code(value: &str) -> Result<(), ValidationError> 
             | "export_storage"
             | "database_unavailable"
             | "export_queue_incomplete"
+            | "changes_queue_full"
+            | "missing_queue_full"
+            | "catalog_phase_busy"
     ) {
         Ok(())
     } else {
@@ -458,6 +461,9 @@ mod tests {
             "export_storage",
             "database_unavailable",
             "export_queue_incomplete",
+            "changes_queue_full",
+            "missing_queue_full",
+            "catalog_phase_busy",
         ] {
             assert!(validate_failure_code(code).is_ok(), "{code}");
         }

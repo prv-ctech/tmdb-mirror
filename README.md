@@ -12,13 +12,13 @@ pulls the published Linux AMD64 images and uses relative `./data` bind mounts:
 | Service | Host port | Purpose |
 | --- | ---: | --- |
 | `postgres` | none | PostgreSQL 18, migrations, WAL archiving, and pgBackRest |
-| `api` | `9001` | Public catalog API |
+| `api` | `9001`, `8081` | Public catalog and authenticated admin APIs |
 | `worker` | none | Migrations and explicitly submitted ingest jobs |
 | `media` | `9002` | Downloaded public image files |
 
-The admin listener remains on container port `8081` and is not published by
-the production file. A container on the configured external network can reach it at
-`http://tmdb-mirror-api:8081`.
+The API container listens on `8080` for the public catalog API and `8081` for
+the authenticated admin API. Compose publishes them as host ports `9001` and
+`8081` respectively.
 
 Keep the real runtime environment outside the repository. The template has
 placeholders only; never commit a token, password, or private key. For a
@@ -43,9 +43,10 @@ docker compose --env-file "$TMDB_ENV_FILE" \
 ```
 
 The external network named in the Compose file must already exist. The Git
-examples use `your.network` as a neutral placeholder; replace only that
-`name:` value with your existing Docker network. All four services use this
-one external network. The application paths inside containers are fixed:
+examples use `your.network` as a neutral placeholder; replace every
+`"your.network"` network reference with your existing Docker network name
+before starting the stack. All four services use this one external network.
+The application paths inside containers are fixed:
 `/config` for scratch, exports, checkpoints, logs, and backups; `/media` for
 public image files.
 
@@ -61,7 +62,7 @@ permissions, media policy, and validation.
 These files replace the older deployment contract. The four services and host
 ports remain the same, but the current files use the `tmdb-runtime` startup
 wrapper for worker/media storage preparation, relative Compose bind sources,
-and no published admin port. The root standalone file reads `.env` beside it;
+and publish the authenticated admin listener on host port `8081`. The root standalone file reads `.env` beside it;
 the production file reads `../.env` by default or the file selected by
 `TMDB_ENV_FILE`.
 
@@ -74,8 +75,7 @@ Compose.
 
 ## API
 
-Public catalog routes require no client key and have both unversioned and
-stable `/v1` forms:
+Public catalog routes require no client key and mirror TMDB's `/3` paths:
 
 ```text
 GET /health/live
@@ -89,8 +89,19 @@ GET /3/search/movie?query=matrix
 The private admin API supports status, durable job history, explicit
 `full_sweep`, `missing_only`, `prune_cleanup`, and `daily_sync` scans,
 cancellation/retry, media audits, persistent worker controls, and
-full/differential backup requests. Admin writes require
-`Idempotency-Key` and return `202 Accepted` durable jobs.
+full/differential backup requests. Admin writes require an
+`Idempotency-Key`; scans, job operations, and backups return durable operation
+IDs, while worker controls return the persisted worker state.
+
+A `full_sweep` is phased for throughput. It imports the TMDB daily title-ID
+exports in uninterrupted 500-title scheduling batches, enriches titles in
+100-title batches after census work drains, then processes TV seasons and
+episodes in 25-season batches. Reusable people, company, network, and
+collection galleries remain part of explicit media scans.
+
+`daily_sync` is the incremental production scan. It reads TMDB's movie and TV
+change feeds, refreshes changed titles, and discovers newly added seasons and
+episodes through the refreshed TV and season documents.
 
 Neither worker runs a catalog scheduler or starts queued work automatically
 after a restart. A previously running worker is reset to stopped; a paused

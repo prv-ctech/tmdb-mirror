@@ -58,13 +58,25 @@ async fn jobs_migration_has_exact_readiness_indexes_and_hardened_functions(
         versions,
         [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+            47, 48, 49, 50
         ]
     );
     let revision: String = sqlx::query_scalar("SELECT schema_revision FROM ops.readiness")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(revision, "0041");
+    assert_eq!(revision, "0050");
+
+    let queue_limit_function: String = sqlx::query_scalar(
+        "SELECT pg_catalog.pg_get_functiondef(
+                    'ops.enforce_image_queue_limit()'::pg_catalog.regprocedure
+                )",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(queue_limit_function.contains("queue:capacity"));
+    assert!(queue_limit_function.contains("tmdb.queue_capacity_count"));
+    assert!(!queue_limit_function.contains("'queue:' || queue_name"));
 
     let indexes: Vec<(String, String)> = sqlx::query_as(
         "SELECT indexname, indexdef
@@ -218,6 +230,34 @@ async fn jobs_migration_has_exact_readiness_indexes_and_hardened_functions(
         ]
     );
 
+    Ok(())
+}
+
+#[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+async fn queue_capacity_count_is_cached_per_transaction(pool: PgPool) -> sqlx::Result<()> {
+    let mut transaction = pool.begin().await?;
+    for suffix in ["first", "second"] {
+        sqlx::query(
+            "SELECT job_id, was_duplicate
+               FROM ops.submit_job(
+                    gen_random_uuid(), 'image.download', 1, '{}'::text,
+                    0::smallint, 3, NULL::timestamptz, $1
+               )",
+        )
+        .bind(format!("capacity-cache-{suffix}"))
+        .execute(&mut *transaction)
+        .await?;
+    }
+    let cached: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT current_setting('tmdb.queue_capacity_name', true),
+                current_setting('tmdb.queue_capacity_count', true)",
+    )
+    .fetch_one(&mut *transaction)
+    .await?;
+
+    assert_eq!(cached.0.as_deref(), Some("image.download"));
+    assert_eq!(cached.1.as_deref(), Some("2"));
+    transaction.rollback().await?;
     Ok(())
 }
 

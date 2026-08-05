@@ -367,6 +367,61 @@ async fn media_scan_submission_and_worker_control_are_idempotent_and_bound_claim
 }
 
 #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+async fn media_audit_continuations_remain_linked_to_their_scan(pool: PgPool) -> sqlx::Result<()> {
+    let (_, run_id, _): (Uuid, Uuid, bool) = sqlx::query_as(
+        "SELECT job_id, run_id, was_duplicate
+           FROM ops.submit_media_scan($1, $2, 'audit-continuation-scan', $3)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(r#"{"mode":"audit","repair":false}"#)
+    .bind(Uuid::now_v7())
+    .fetch_one(&pool)
+    .await?;
+    sqlx::query(
+        "UPDATE ops.media_scan_runs
+            SET status = 'running', phase = 'audit', started_at = clock_timestamp()
+          WHERE id = $1",
+    )
+    .bind(run_id)
+    .execute(&pool)
+    .await?;
+
+    let child_id: Uuid = sqlx::query_scalar(
+        "SELECT job_id
+           FROM ops.submit_job(
+               $1, 'admin.media_audit', 1,
+               jsonb_build_object('repair', false, 'runId', $2::uuid)::text,
+               0::smallint, 3, NULL, 'audit-continuation-child')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(run_id)
+    .fetch_one(&pool)
+    .await?;
+    let linked: bool = sqlx::query_scalar("SELECT ops.link_media_scan_audit_job($1, $2)")
+        .bind(run_id)
+        .bind(child_id)
+        .fetch_one(&pool)
+        .await?;
+    assert!(linked);
+    let duplicate: bool = sqlx::query_scalar("SELECT ops.link_media_scan_audit_job($1, $2)")
+        .bind(run_id)
+        .bind(child_id)
+        .fetch_one(&pool)
+        .await?;
+    assert!(!duplicate);
+    let privileges: (bool, bool, bool) = sqlx::query_as(
+        "SELECT
+             has_function_privilege('image_writer', 'ops.link_media_scan_audit_job(uuid,uuid)', 'EXECUTE'),
+             has_function_privilege('ingest_writer', 'ops.link_media_scan_audit_job(uuid,uuid)', 'EXECUTE'),
+             has_function_privilege('api_job_submitter', 'ops.link_media_scan_audit_job(uuid,uuid)', 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(privileges, (true, false, false));
+    Ok(())
+}
+
+#[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
 async fn operator_control_gates_ingest_and_media_claims_independently(
     pool: PgPool,
 ) -> sqlx::Result<()> {
@@ -536,7 +591,7 @@ async fn image_job_submission_stays_bounded_and_keeps_active_duplicates_idempote
     .await?;
     assert!(duplicate.1);
 
-    let rejected = sqlx::query(
+    let Err(rejected) = sqlx::query(
         "SELECT job_id
            FROM ops.submit_job(
                $1, 'image.download', 1, '{}', 0::smallint, 3,
@@ -545,7 +600,11 @@ async fn image_job_submission_stays_bounded_and_keeps_active_duplicates_idempote
     .bind(Uuid::now_v7())
     .fetch_one(&pool)
     .await
-    .expect_err("a new image job must not exceed the active queue limit");
+    else {
+        return Err(sqlx::Error::Protocol(
+            "a new image job exceeded the active queue limit".to_owned(),
+        ));
+    };
     assert_eq!(sqlstate(&rejected).as_deref(), Some("P0004"));
 
     sqlx::query(
@@ -596,7 +655,7 @@ async fn title_refresh_submission_stays_bounded(pool: PgPool) -> sqlx::Result<()
     .execute(&pool)
     .await?;
 
-    let rejected = sqlx::query(
+    let Err(rejected) = sqlx::query(
         "SELECT job_id
            FROM ops.submit_job(
                $1, 'ingest.refresh_movie', 1, '{\"tmdb_id\":2001}', 0::smallint, 3,
@@ -605,7 +664,11 @@ async fn title_refresh_submission_stays_bounded(pool: PgPool) -> sqlx::Result<()
     .bind(Uuid::now_v7())
     .fetch_one(&pool)
     .await
-    .expect_err("a new title refresh must not exceed the active queue limit");
+    else {
+        return Err(sqlx::Error::Protocol(
+            "a new title refresh exceeded the active queue limit".to_owned(),
+        ));
+    };
     assert_eq!(sqlstate(&rejected).as_deref(), Some("P0004"));
     Ok(())
 }

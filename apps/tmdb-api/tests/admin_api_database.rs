@@ -33,7 +33,7 @@ async fn database_backed_admin_routes_are_durable_and_idempotent(
     assert_eq!(response.status(), StatusCode::OK);
     let status: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 32 * 1024).await?)?;
-    assert_eq!(status["data"]["build"]["schemaRevision"], "0041");
+    assert_eq!(status["data"]["build"]["schemaRevision"], "0050");
     assert_eq!(status["data"]["database"]["reachable"], true);
 
     let scan_request = || {
@@ -41,7 +41,9 @@ async fn database_backed_admin_routes_are_durable_and_idempotent(
             .header("x-api-key", ADMIN_KEY)
             .header("idempotency-key", "database-scan-1")
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(r#"{"mode":"full_sweep","mediaTypes":["movie","tv"]}"#))
+            .body(Body::from(
+                r#"{"mode":"full_sweep","mediaTypes":["movie","tv"]}"#,
+            ))
     };
     let response = app.clone().oneshot(scan_request()?).await?;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
@@ -88,7 +90,9 @@ async fn database_backed_admin_routes_are_durable_and_idempotent(
                 .header("x-api-key", ADMIN_KEY)
                 .header("idempotency-key", "database-scan-1")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"mode":"missing_only","mediaTypes":["movie"]}"#))?,
+                .body(Body::from(
+                    r#"{"mode":"missing_only","mediaTypes":["movie"]}"#,
+                ))?,
         )
         .await?;
     assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -231,7 +235,12 @@ async fn database_backed_admin_routes_are_durable_and_idempotent(
         .await?;
     let pause_status = response.status();
     let pause_body = to_bytes(response.into_body(), 4 * 1024).await?;
-    assert_eq!(pause_status, StatusCode::OK, "{}", String::from_utf8_lossy(&pause_body));
+    assert_eq!(
+        pause_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&pause_body)
+    );
     let response = app
         .clone()
         .oneshot(worker_request("resume", "database-media-resume-1")?)

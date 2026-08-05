@@ -16,7 +16,7 @@ while (($#)); do
 done
 [[ "$count" =~ ^[0-9]+$ ]] && (( count >= 1000 && count <= 2000000 )) || die 'count must be between 1000 and 2000000'
 
-configure_runtime "$project" "${TMDB_STRESS_API_PORT:-18080}" "${TMDB_STRESS_ADMIN_PORT:-18081}" \
+configure_existing_runtime "$project" "${TMDB_STRESS_API_PORT:-18080}" "${TMDB_STRESS_ADMIN_PORT:-18081}" \
     "${TMDB_STRESS_IMAGE_PORT:-18090}" "${TMDB_STRESS_PG_PORT:-55433}"
 load_runtime
 seed_file="$REPO_ROOT/scripts/stress-seed.sql"
@@ -33,10 +33,13 @@ trap cleanup EXIT
 
 compose exec -T -e "PGPASSWORD=$password" postgres psql -X -v ON_ERROR_STOP=1 \
     --username "$(database_user)" --dbname "$(database_name)" \
-    --set="seed_count=$count" --set='seed_base=900000000' --file "$container_seed_path"
+    --set="seed_count=$count" --set='seed_base=900000000' --set='seed_limit=2000000' \
+    --file "$container_seed_path"
 
 verification="$(psql_at "$password" "SELECT json_build_object(
   'titles', count(*),
+  'reserved_titles', (SELECT count(*) FROM catalog.titles
+    WHERE tmdb_id >= 900000001 AND tmdb_id < 902000001),
   'search_documents', (SELECT count(*) FROM search.search_documents WHERE title_id IN (
     SELECT id FROM catalog.titles WHERE tmdb_id >= 900000001 AND tmdb_id < 900000001 + $count
   ))

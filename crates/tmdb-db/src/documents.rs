@@ -1,7 +1,9 @@
 //! Exact TMDB response documents persisted for local API reads.
 
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, QueryBuilder};
+
+const DOCUMENT_BATCH_SIZE: usize = 500;
 
 /// Repository for the source JSON captured from TMDB.
 #[derive(Clone, Debug)]
@@ -63,5 +65,40 @@ impl TmdbDocumentRepository {
         .execute(&self.pool)
         .await
         .map(|_| ())
+    }
+
+    /// Inserts or replaces a bounded batch of exact upstream documents.
+    ///
+    /// The input order is not significant. Batches are split internally so a
+    /// caller cannot accidentally create an unbounded SQL statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns the database error if any batch cannot be written.
+    pub async fn upsert_many(
+        &self,
+        documents: &[(String, String, Value)],
+    ) -> Result<(), sqlx::Error> {
+        for batch in documents.chunks(DOCUMENT_BATCH_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                "INSERT INTO source.tmdb_documents (
+                     endpoint_path, query_string, response
+                 ) ",
+            );
+            query.push_values(batch, |mut values, document| {
+                values
+                    .push_bind(&document.0)
+                    .push_bind(&document.1)
+                    .push_bind(&document.2);
+            });
+            query.push(
+                " ON CONFLICT (endpoint_path, query_string)
+                  DO UPDATE SET response = EXCLUDED.response,
+                                fetched_at = pg_catalog.clock_timestamp(),
+                                updated_at = pg_catalog.clock_timestamp()",
+            );
+            query.build().execute(&self.pool).await?;
+        }
+        Ok(())
     }
 }

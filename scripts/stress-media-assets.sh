@@ -22,7 +22,9 @@ while (($#)); do
 done
 [[ "$timeout" =~ ^[0-9]+$ ]] && (( timeout >= 1 && timeout <= 3600 )) || die 'invalid timeout'
 
-configure_runtime "$project" "${TMDB_STRESS_API_PORT:-18080}" "$admin_port" "$image_port" "${TMDB_STRESS_PG_PORT:-55433}"
+configure_existing_runtime "$project" "${TMDB_STRESS_API_PORT:-18080}" "$admin_port" "$image_port" "${TMDB_STRESS_PG_PORT:-55433}"
+admin_port="$ADMIN_PORT"
+image_port="$IMAGE_PORT"
 load_runtime
 mkdir -p "$RESULT_ROOT"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"

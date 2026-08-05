@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tmdb_jobs::{ClaimedJob, JobExecutor, JobRepository, Worker, WorkerConfig, WorkerId};
+use tokio::sync::Notify;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -30,6 +31,20 @@ impl JobExecutor for BlockingExecutor {
     async fn execute(&self, _job: ClaimedJob) -> Result<Value, tmdb_jobs::JobExecutionError> {
         std::future::pending::<()>().await;
         Ok(json!({}))
+    }
+}
+
+struct CoordinatedExecutor {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl JobExecutor for CoordinatedExecutor {
+    async fn execute(&self, _job: ClaimedJob) -> Result<Value, tmdb_jobs::JobExecutionError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        Ok(json!({"ok": true}))
     }
 }
 
@@ -146,6 +161,59 @@ async fn cancellation_does_not_claim_new_jobs(pool: PgPool) -> sqlx::Result<()> 
         .fetch_one(&pool)
         .await?;
     assert_eq!(status, "queued");
+    Ok(())
+}
+
+#[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+async fn database_failure_while_recording_outcome_does_not_stop_worker(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let repository = JobRepository::new(pool.clone());
+    repository
+        .submit(
+            tmdb_jobs::NewJob::noop("worker-runtime-database-recovery")
+                .map_err(|error| test_error(&error.to_string()))?,
+        )
+        .await
+        .map_err(|error| test_error(&error.to_string()))?;
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let worker = Worker::new(
+        repository,
+        CoordinatedExecutor {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        },
+        WorkerConfig::try_new(
+            WorkerId::new("worker-runtime-database-recovery")
+                .map_err(|error| test_error(&error.to_string()))?,
+            Duration::from_secs(5),
+            Duration::from_secs(4),
+            Duration::from_millis(10),
+        )
+        .map_err(|error| test_error(&error.to_string()))?,
+    );
+    let cancellation = CancellationToken::new();
+    let mut worker_task = tokio::spawn(worker.run(cancellation.clone()));
+
+    timeout(Duration::from_secs(2), started.notified())
+        .await
+        .map_err(|_| test_error("worker did not begin the recovery fixture in time"))?;
+    pool.close().await;
+    release.notify_one();
+
+    assert!(
+        timeout(Duration::from_millis(100), &mut worker_task)
+            .await
+            .is_err(),
+        "worker stopped after a transient repository error"
+    );
+    cancellation.cancel();
+    timeout(Duration::from_secs(1), worker_task)
+        .await
+        .map_err(|_| test_error("worker did not stop after cancellation"))?
+        .map_err(|error| test_error(&error.to_string()))?
+        .map_err(|error| test_error(&error.to_string()))?;
     Ok(())
 }
 

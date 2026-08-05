@@ -5,45 +5,48 @@ use sqlx::{Postgres, Transaction};
 use tmdb_domain::MediaType;
 use tmdb_jobs::JobExecutionError;
 use tmdb_upstream::{
-    ChangePage, TmdbCollection, TmdbCompany, TmdbCredit, TmdbCredits, TmdbEpisode, TmdbGenre,
-    TmdbKeyword, TmdbMovie, TmdbNetwork, TmdbSeason, TmdbSeasonSummary, TmdbTv,
+    ChangePage, TmdbCredits, TmdbEpisode, TmdbMovie, TmdbSeason, TmdbSeasonSummary, TmdbTv,
 };
 
 use super::{normalize_language, source_id};
 
-/// Builds the complete shared-resource set a movie-detail write can mutate.
+/// Builds the ownership-resource set a movie-detail write can mutate.
 ///
 /// The set is validated before the transaction begins so malformed upstream
 /// identifiers cannot leave a partially written catalog transaction behind.
+/// Shared lookup rows are written in source-ID order instead of being locked;
+/// locking them here serializes unrelated titles that share common metadata.
 pub(crate) fn movie_write_resources(
     movie: &TmdbMovie,
     tmdb_id: i64,
 ) -> Result<BTreeSet<String>, JobExecutionError> {
     let mut resources = BTreeSet::new();
     insert_title_resource(&mut resources, "movie", tmdb_id);
-    insert_genre_resources(&mut resources, &movie.genres)?;
-    insert_keyword_resources(&mut resources, &movie.keywords)?;
-    insert_credit_resources(&mut resources, &movie.credits)?;
-    insert_company_resources(&mut resources, &movie.production_companies)?;
-    insert_language_resource(&mut resources, movie.original_language.as_deref())?;
-    insert_collection_resource(&mut resources, movie.belongs_to_collection.as_ref())?;
+    validate_source_ids(movie.genres.iter().map(|genre| genre.id))?;
+    validate_source_ids(movie.keywords.iter().map(|keyword| keyword.id))?;
+    validate_credit_ids(&movie.credits)?;
+    validate_source_ids(movie.production_companies.iter().map(|company| company.id))?;
+    validate_language(movie.original_language.as_deref())?;
+    if let Some(collection) = &movie.belongs_to_collection {
+        source_id(collection.id)?;
+    }
     Ok(resources)
 }
 
-/// Builds the complete shared-resource set a TV-detail write can mutate.
+/// Builds the ownership-resource set a TV-detail write can mutate.
 pub(crate) fn tv_write_resources(
     series: &TmdbTv,
     tmdb_id: i64,
 ) -> Result<BTreeSet<String>, JobExecutionError> {
     let mut resources = BTreeSet::new();
     insert_title_resource(&mut resources, "tv", tmdb_id);
-    insert_genre_resources(&mut resources, &series.genres)?;
-    insert_keyword_resources(&mut resources, &series.keywords)?;
-    insert_credit_resources(&mut resources, &series.credits)?;
+    validate_source_ids(series.genres.iter().map(|genre| genre.id))?;
+    validate_source_ids(series.keywords.iter().map(|keyword| keyword.id))?;
+    validate_credit_ids(&series.credits)?;
     insert_season_resources(&mut resources, &series.seasons)?;
-    insert_company_resources(&mut resources, &series.production_companies)?;
-    insert_network_resources(&mut resources, &series.networks)?;
-    insert_language_resource(&mut resources, series.original_language.as_deref())?;
+    validate_source_ids(series.production_companies.iter().map(|company| company.id))?;
+    validate_source_ids(series.networks.iter().map(|network| network.id))?;
+    validate_language(series.original_language.as_deref())?;
     Ok(resources)
 }
 
@@ -132,41 +135,10 @@ fn insert_title_resource(resources: &mut BTreeSet<String>, media_type: &str, tmd
     resources.insert(format!("catalog:title:{media_type}:{tmdb_id}"));
 }
 
-fn insert_genre_resources(
-    resources: &mut BTreeSet<String>,
-    genres: &[TmdbGenre],
-) -> Result<(), JobExecutionError> {
-    for genre in genres {
-        insert_source_resource(resources, "genre", genre.id)?;
-    }
-    Ok(())
-}
-
-fn insert_keyword_resources(
-    resources: &mut BTreeSet<String>,
-    keywords: &[TmdbKeyword],
-) -> Result<(), JobExecutionError> {
-    for keyword in keywords {
-        insert_source_resource(resources, "keyword", keyword.id)?;
-    }
-    Ok(())
-}
-
-fn insert_credit_resources(
-    resources: &mut BTreeSet<String>,
-    credits: &TmdbCredits,
-) -> Result<(), JobExecutionError> {
+fn validate_credit_ids(credits: &TmdbCredits) -> Result<(), JobExecutionError> {
     for credit in credits.cast.iter().chain(credits.crew.iter()) {
-        insert_credit_resource(resources, credit)?;
+        source_id(credit.id)?;
     }
-    Ok(())
-}
-
-fn insert_credit_resource(
-    resources: &mut BTreeSet<String>,
-    credit: &TmdbCredit,
-) -> Result<(), JobExecutionError> {
-    insert_source_resource(resources, "person", credit.id)?;
     Ok(())
 }
 
@@ -185,51 +157,21 @@ fn insert_episode_resource(
     episode: &TmdbEpisode,
 ) -> Result<(), JobExecutionError> {
     insert_source_resource(resources, "episode", episode.id)?;
-    insert_credit_resources(resources, &episode.credits)
+    validate_credit_ids(&episode.credits)
 }
 
-fn insert_company_resources(
-    resources: &mut BTreeSet<String>,
-    companies: &[TmdbCompany],
-) -> Result<(), JobExecutionError> {
-    for company in companies {
-        insert_source_resource(resources, "company", company.id)?;
+fn validate_source_ids(ids: impl IntoIterator<Item = u64>) -> Result<(), JobExecutionError> {
+    for id in ids {
+        source_id(id)?;
     }
     Ok(())
 }
 
-fn insert_network_resources(
-    resources: &mut BTreeSet<String>,
-    networks: &[TmdbNetwork],
-) -> Result<(), JobExecutionError> {
-    for network in networks {
-        insert_source_resource(resources, "network", network.id)?;
-    }
-    Ok(())
-}
-
-fn insert_language_resource(
-    resources: &mut BTreeSet<String>,
-    language: Option<&str>,
-) -> Result<(), JobExecutionError> {
+fn validate_language(language: Option<&str>) -> Result<(), JobExecutionError> {
     let Some(language) = language.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(());
     };
-    resources.insert(format!(
-        "catalog:language:{}",
-        normalize_language(language)?
-    ));
-    Ok(())
-}
-
-fn insert_collection_resource(
-    resources: &mut BTreeSet<String>,
-    collection: Option<&TmdbCollection>,
-) -> Result<(), JobExecutionError> {
-    let Some(collection) = collection else {
-        return Ok(());
-    };
-    insert_source_resource(resources, "collection", collection.id)?;
+    normalize_language(language)?;
     Ok(())
 }
 
@@ -264,7 +206,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn movie_resource_set_is_complete_deduplicated_and_sorted()
+    fn movie_resource_set_locks_only_ownership_rows_and_validates_nested_ids()
     -> Result<(), Box<dyn std::error::Error>> {
         let movie = TmdbMovie {
             id: 42,
@@ -299,22 +241,13 @@ mod tests {
             movie_write_resources(&movie, 42)?
                 .into_iter()
                 .collect::<Vec<_>>(),
-            [
-                "catalog:collection:6",
-                "catalog:company:5",
-                "catalog:genre:1",
-                "catalog:genre:2",
-                "catalog:keyword:3",
-                "catalog:language:en",
-                "catalog:person:4",
-                "catalog:title:movie:42",
-            ]
+            ["catalog:title:movie:42"]
         );
         Ok(())
     }
 
     #[test]
-    fn season_resource_set_covers_parent_season_episode_and_people()
+    fn season_resource_set_locks_ownership_rows_and_validates_people()
     -> Result<(), Box<dyn std::error::Error>> {
         let season = TmdbSeason {
             id: 20,
@@ -338,7 +271,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "catalog:episode:30",
-                "catalog:person:40",
                 "catalog:season:20",
                 "catalog:title:tv:10",
             ]

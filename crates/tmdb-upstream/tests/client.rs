@@ -2,23 +2,23 @@
 
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
 use axum::response::Response;
-use axum::Router;
-use http::{header::AUTHORIZATION, HeaderValue, StatusCode};
+use http::{HeaderValue, StatusCode, header::AUTHORIZATION};
 use reqwest::Url;
 use secrecy::SecretString;
 use tempfile::tempdir;
 use tmdb_domain::MediaType;
 use tmdb_upstream::{
-    classify_response, trawl_decision, RateLimitPolicy, ResponseClass, RetryPolicy, TmdbClient,
-    TmdbClientError, TrawlDecision,
+    RateLimitPolicy, ResponseClass, RetryPolicy, TmdbClient, TmdbClientError, TrawlDecision,
+    classify_response, trawl_decision,
 };
 use tokio::sync::Mutex;
 
@@ -130,6 +130,30 @@ async fn successful_details_are_typed_and_authorized() {
 }
 
 #[tokio::test]
+async fn title_details_append_galleries_with_bounded_languages() {
+    let (base_url, state, task) = mock_server(vec![MockResponse {
+        status: StatusCode::OK,
+        body: r#"{"id":42,"title":"Gallery fixture","images":{"posters":[{"file_path":"/poster.jpg","width":1000,"height":1500,"adult":false}]},"videos":{"results":[]}}"#,
+        retry_after: None,
+    }])
+    .await;
+
+    let (_, movie) = client(&base_url)
+        .fetch_movie_with_raw(42)
+        .await
+        .expect("movie detail");
+    assert_eq!(movie.images.posters.len(), 1);
+
+    let uris = state.uris.lock().await.clone();
+    assert_eq!(uris.len(), 1);
+    assert!(uris[0].contains("append_to_response="));
+    assert!(uris[0].contains("images"));
+    assert!(uris[0].contains("include_image_language=en%2Cnull"));
+    assert!(uris[0].contains("include_video_language=en%2Cnull"));
+    task.abort();
+}
+
+#[tokio::test]
 async fn television_keyword_results_are_unwrapped() {
     let (base_url, _state, task) = mock_server(vec![MockResponse {
         status: StatusCode::OK,
@@ -153,6 +177,23 @@ async fn television_numeric_tvdb_id_is_normalized() {
     .await;
     let tv = client(&base_url).fetch_tv(42).await.expect("tv JSON");
     assert_eq!(tv.external_ids.tvdb_id.as_deref(), Some("309164"));
+    task.abort();
+}
+
+#[tokio::test]
+async fn television_large_season_number_is_preserved() {
+    let (base_url, _state, task) = mock_server(vec![MockResponse {
+        status: StatusCode::OK,
+        body: r#"{"id":134819,"name":"Fixture","seasons":[{"id":212865,"season_number":120120224,"episode_count":1}]}"#,
+        retry_after: None,
+    }])
+    .await;
+
+    let tv = client(&base_url).fetch_tv(134_819).await.expect("tv JSON");
+    assert_eq!(
+        tv.seasons.first().map(|season| season.season_number),
+        Some(120_120_224)
+    );
     task.abort();
 }
 
@@ -218,16 +259,16 @@ async fn episode_images_allow_specials_season_and_reject_zero_episode() {
 }
 
 #[tokio::test]
-async fn season_and_episode_details_use_exact_tmdb_routes_without_appends() {
+async fn season_and_episode_details_append_optional_documents() {
     let (base_url, state, task) = mock_server(vec![
         MockResponse {
             status: StatusCode::OK,
-            body: r#"{"id":900,"season_number":1,"episodes":[{"id":901,"episode_number":1,"name":"Pilot"}]}"#,
+            body: r#"{"id":900,"season_number":1,"episodes":[{"id":901,"episode_number":1,"name":"Pilot"}],"images":{"posters":[{"file_path":"/season.jpg","width":1000,"height":1500}]}}"#,
             retry_after: None,
         },
         MockResponse {
             status: StatusCode::OK,
-            body: r#"{"id":901,"season_number":1,"episode_number":1,"name":"Pilot"}"#,
+            body: r#"{"id":901,"season_number":1,"episode_number":1,"name":"Pilot","images":{"stills":[{"file_path":"/episode.jpg","width":1280,"height":720}]}}"#,
             retry_after: None,
         },
     ])
@@ -239,6 +280,7 @@ async fn season_and_episode_details_use_exact_tmdb_routes_without_appends() {
         .expect("season detail");
     assert_eq!(season_raw["id"], 900);
     assert_eq!(season.episodes[0].id, 901);
+    assert_eq!(season.images.posters[0].file_path, "/season.jpg");
 
     let (episode_raw, episode) = client(&base_url)
         .fetch_episode_with_raw(119_495, 1, 1)
@@ -246,10 +288,21 @@ async fn season_and_episode_details_use_exact_tmdb_routes_without_appends() {
         .expect("episode detail");
     assert_eq!(episode_raw["id"], 901);
     assert_eq!(episode.name.as_deref(), Some("Pilot"));
+    assert_eq!(episode.images.stills[0].file_path, "/episode.jpg");
 
     let uris = state.uris.lock().await.clone();
-    assert_eq!(uris[0], "/tv/119495/season/1");
-    assert_eq!(uris[1], "/tv/119495/season/1/episode/1");
+    assert!(uris[0].starts_with("/tv/119495/season/1?"));
+    assert!(uris[0].contains("append_to_response="));
+    assert!(uris[0].contains("images"));
+    assert!(uris[0].contains("aggregate_credits"));
+    assert!(uris[0].contains("include_image_language=en%2Cnull"));
+    assert!(uris[0].contains("include_video_language=en%2Cnull"));
+    assert!(uris[1].starts_with("/tv/119495/season/1/episode/1?"));
+    assert!(uris[1].contains("append_to_response="));
+    assert!(uris[1].contains("images"));
+    assert!(uris[1].contains("credits"));
+    assert!(uris[1].contains("include_image_language=en%2Cnull"));
+    assert!(uris[1].contains("include_video_language=en%2Cnull"));
     task.abort();
 }
 

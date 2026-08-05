@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::jobs::IngestExecutor;
 
-const MAX_INGEST_WORKER_CONCURRENCY: usize = 8;
+const MAX_INGEST_WORKER_CONCURRENCY: usize = 64;
 const COMPONENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Starts the direct-database ingestion worker shell.
@@ -111,7 +111,7 @@ pub async fn run_worker() -> anyhow::Result<()> {
             .with_export_max_bytes(export_max_bytes)
             .map_err(|error| anyhow::anyhow!(error))?;
     let worker_config = load_worker_config(source, "tmdb-worker")?;
-    let worker_concurrency = load_ingest_worker_concurrency(source)?;
+    let worker_concurrency = load_ingest_worker_concurrency(&source)?;
     let pool = connect_direct(&database, PoolPolicy::ReadWrite)
         .await
         .map_err(|error| anyhow::anyhow!(error))
@@ -284,8 +284,17 @@ fn load_worker_config(source: EnvSource, default_id: &str) -> anyhow::Result<Wor
     .map_err(|error| anyhow::anyhow!(error))
 }
 
-fn load_ingest_worker_concurrency(source: EnvSource) -> anyhow::Result<usize> {
-    let upstream_connections = parse_or(source, "TMDB_MAX_CONNECTIONS", 20_u32)?;
+fn load_ingest_worker_concurrency(source: &impl ConfigSource) -> anyhow::Result<usize> {
+    let upstream_connections = match source.get("TMDB_MAX_CONNECTIONS") {
+        Some(value) => value
+            .into_string()
+            .map_err(|_| {
+                anyhow::anyhow!("configuration field TMDB_MAX_CONNECTIONS is not valid Unicode")
+            })?
+            .parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("configuration field TMDB_MAX_CONNECTIONS is invalid"))?,
+        None => 64,
+    };
     let upstream_connections = usize::try_from(upstream_connections)
         .map_err(|_| anyhow::anyhow!("TMDB_MAX_CONNECTIONS is too large"))?;
     Ok(upstream_connections.clamp(1, MAX_INGEST_WORKER_CONCURRENCY))
@@ -355,6 +364,16 @@ async fn shutdown_signal() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tmdb_config::MapSource;
+
+    #[test]
+    fn ingest_concurrency_can_hide_upstream_latency_without_raising_the_rate_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = MapSource::from([("TMDB_MAX_CONNECTIONS", "64")]);
+
+        assert_eq!(load_ingest_worker_concurrency(&source)?, 64);
+        Ok(())
+    }
 
     #[test]
     fn parallel_ingest_workers_receive_distinct_lease_ids() -> Result<(), Box<dyn std::error::Error>>

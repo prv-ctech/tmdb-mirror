@@ -342,10 +342,10 @@ pub enum AssetVariant {
     /// A reusable person profile image.  Index one is `profile`.
     Profile { index: u16 },
     /// A TV season poster.
-    SeasonPoster { season: u16, index: u16 },
+    SeasonPoster { season: u32, index: u16 },
     /// An episode thumbnail, with season zero represented as specials.
     EpisodeThumbnail {
-        season: u16,
+        season: u32,
         episode: u16,
         index: u16,
     },
@@ -778,6 +778,21 @@ mod tests {
             )
             .ok(),
             Some(PathBuf::from("tv/13/posters/season01-poster-02.jpg"))
+        );
+        assert_eq!(
+            title_asset(
+                TitleScope::Tv,
+                134_819,
+                AssetVariant::SeasonPoster {
+                    season: 120_120_224,
+                    index: 1
+                },
+                ImageFormat::Jpeg
+            )
+            .ok(),
+            Some(PathBuf::from(
+                "tv/134819/posters/season120120224-poster.jpg"
+            ))
         );
     }
 

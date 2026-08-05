@@ -20,10 +20,7 @@ async fn tmdb_documents_replace_exact_endpoint_and_query(pool: sqlx::PgPool) -> 
     repository
         .upsert("movie/42", "", &json!({"id": 42, "title": "Base"}))
         .await?;
-    assert_eq!(
-        repository.get("movie/42", "language=en-US").await?,
-        None
-    );
+    assert_eq!(repository.get("movie/42", "language=en-US").await?, None);
 
     repository
         .upsert(
@@ -42,6 +39,47 @@ async fn tmdb_documents_replace_exact_endpoint_and_query(pool: sqlx::PgPool) -> 
             .get("movie/42", "append_to_response=credits")
             .await?,
         Some(second)
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+async fn tmdb_documents_upsert_many_replaces_and_preserves_keys(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let repository = TmdbDocumentRepository::new(pool);
+    let documents = vec![
+        (
+            "movie/42/images".to_owned(),
+            "language=en-US".to_owned(),
+            json!({"posters": [{"file_path": "/one.jpg"}]}),
+        ),
+        (
+            "movie/42/videos".to_owned(),
+            "language=en-US".to_owned(),
+            json!({"results": [{"key": "one"}]}),
+        ),
+    ];
+
+    repository.upsert_many(&documents).await?;
+    assert_eq!(
+        repository.get("movie/42/images", "language=en-US").await?,
+        Some(documents[0].2.clone())
+    );
+
+    let replacement = vec![(
+        "movie/42/images".to_owned(),
+        "language=en-US".to_owned(),
+        json!({"posters": [{"file_path": "/two.jpg"}]}),
+    )];
+    repository.upsert_many(&replacement).await?;
+    assert_eq!(
+        repository.get("movie/42/images", "language=en-US").await?,
+        Some(replacement[0].2.clone())
+    );
+    assert_eq!(
+        repository.get("movie/42/videos", "language=en-US").await?,
+        Some(documents[1].2.clone())
     );
     Ok(())
 }

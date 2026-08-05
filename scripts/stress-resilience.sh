@@ -19,7 +19,10 @@ while (($#)); do
     esac
 done
 
-configure_runtime "$project" "$api_port" "$admin_port" "$image_port" "${TMDB_STRESS_PG_PORT:-55433}"
+configure_existing_runtime "$project" "$api_port" "$admin_port" "$image_port" "${TMDB_STRESS_PG_PORT:-55433}"
+api_port="$API_PORT"
+admin_port="$ADMIN_PORT"
+image_port="$IMAGE_PORT"
 load_runtime
 mkdir -p "$RESULT_ROOT"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -114,13 +117,13 @@ cat >"$result_file" <<EOF
   "checked_at_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "worker_restart": {"control_before": "$before_ingest_control", "control_after": "$after_worker_restart_control", "reset_to_stopped": $([[ "$before_ingest_control" == running && "$after_worker_restart_control" == stopped ]] && echo true || echo false)},
   "media_restart": {"before": "$before_media", "after": "$after_media", "control_before": "$before_media_control", "control_after": "$after_media_restart_control", "reset_to_stopped": $([[ "$before_media" == running && "$after_media" == running && "$before_media_control" == running && "$after_media_restart_control" == stopped ]] && echo true || echo false)},
-  "dependency_recovery": {"readiness_during_postgres_stop": $during_ready, "readiness_after_recovery": $after_ready, "failure_observed": $([[ "$during_ready" != 200 ]] && echo true || echo false), "recovered": $([[ "$after_ready" == 200 ]] && echo true || echo false), "worker": "$worker_state", "media": "$media_state", "control_after_outage": {"ingest": "$after_dependency_ingest_control", "media": "$after_dependency_media_control"}, "reset_to_stopped": $([[ "$after_dependency_ingest_control" == stopped && "$after_dependency_media_control" == stopped ]] && echo true || echo false)},
+  "dependency_recovery": {"readiness_during_postgres_stop": $during_ready, "readiness_after_recovery": $after_ready, "failure_observed": $([[ "$during_ready" != 200 ]] && echo true || echo false), "recovered": $([[ "$after_ready" == 200 ]] && echo true || echo false), "worker": "$worker_state", "media": "$media_state", "control_after_outage": {"ingest": "$after_dependency_ingest_control", "media": "$after_dependency_media_control"}, "remained_running": $([[ "$after_dependency_ingest_control" == running && "$after_dependency_media_control" == running ]] && echo true || echo false)},
   "final_control": {"ingest": "$final_ingest_control", "media": "$final_media_control"},
   "log_artifact": "$log_file"
 }
 EOF
 cat "$result_file"
-if [[ "$before_ingest_control" != running || "$after_worker_restart_control" != stopped || "$before_media" != running || "$after_media" != running || "$before_media_control" != running || "$after_media_restart_control" != stopped || "$during_ready" == 200 || "$after_ready" != 200 || "$worker_state" != running || "$media_state" != running || "$after_dependency_ingest_control" != stopped || "$after_dependency_media_control" != stopped || "$final_ingest_control" != running || "$final_media_control" != running ]]; then
+if [[ "$before_ingest_control" != running || "$after_worker_restart_control" != stopped || "$before_media" != running || "$after_media" != running || "$before_media_control" != running || "$after_media_restart_control" != stopped || "$during_ready" == 200 || "$after_ready" != 200 || "$worker_state" != running || "$media_state" != running || "$after_dependency_ingest_control" != running || "$after_dependency_media_control" != running || "$final_ingest_control" != running || "$final_media_control" != running ]]; then
     die "resilience checks failed; see $result_file and $log_file"
 fi
 printf '%s\n' 'Resilience checks passed.'

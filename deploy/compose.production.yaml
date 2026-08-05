@@ -75,7 +75,7 @@ services:
       retries: 30
       start_period: 30s
     networks:
-      - app-network
+      - "your.network"
 
   api:
     <<: *app-common
@@ -85,6 +85,7 @@ services:
         condition: service_healthy
     ports:
       - "9001:8080"
+      - "8081:8081"
     healthcheck:
       test: [CMD, curl, --fail, --silent, --show-error, http://127.0.0.1:8080/health/live]
       interval: 10s
@@ -92,7 +93,7 @@ services:
       retries: 12
       start_period: 10s
     networks:
-      app-network:
+      "your.network":
         aliases:
           - tmdb-mirror-api
 
@@ -113,7 +114,7 @@ services:
           create_host_path: true
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SETPCAP]
     networks:
-      - app-network
+      - "your.network"
 
   media:
     <<: *app-common
@@ -145,10 +146,9 @@ services:
       retries: 12
       start_period: 10s
     networks:
-      - app-network
+      - "your.network"
 
 networks:
-  # Replace your.network with the existing external Docker network name.
-  app-network:
+  # Replace every "your.network" reference with your existing external network.
+  "your.network":
     external: true
-    name: your.network

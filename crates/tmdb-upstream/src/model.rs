@@ -438,7 +438,7 @@ pub struct TmdbSeasonSummary {
     /// TMDB season identifier.
     pub id: u64,
     /// Season number; zero is the specials season.
-    pub season_number: u16,
+    pub season_number: u32,
     /// Display name.
     #[serde(default)]
     pub name: Option<String>,
@@ -465,7 +465,7 @@ pub struct TmdbSeason {
     #[serde(default)]
     pub show_id: Option<u64>,
     /// Season number; zero is the specials season.
-    pub season_number: u16,
+    pub season_number: u32,
     /// Display name.
     #[serde(default)]
     pub name: Option<String>,

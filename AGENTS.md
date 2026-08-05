@@ -14,6 +14,9 @@ changing code. This repository is Linux-first; use Bash, Docker Desktop, and
   `paused` state remains paused for emergency persistence.
 - Both workers are controlled by the authenticated admin API: `start`,
   `pause`, `resume`, and `cancel`.
+- Catalog and media controls are independent. For an emergency stop, cancel
+  catalog ingest first, wait for active catalog jobs to settle, then cancel
+  media so already in-flight catalog work cannot leave image jobs queued.
 - Production job submission and scan control use the authenticated admin API;
   do not ship or invoke a direct database job-submission CLI.
 - Catalog scans are explicit and durable: `full_sweep`, `missing_only`,
@@ -29,6 +32,39 @@ changing code. This repository is Linux-first; use Bash, Docker Desktop, and
   Terminal cleanup is index-backed and remains an explicit operator action.
 - The public API mirrors the TMDB v3 path and JSON shape. Do not create anime
   partitions or custom public catalog routes.
+- `daily_sync` is the incremental production path: consume TMDB movie/TV
+  changes, refresh changed titles, and discover new seasons and episodes from
+  refreshed TV and season documents.
+- Preserve TMDB media fields (`file_path`, `poster_path`, `backdrop_path`,
+  `profile_path`, `logo_path`, and `still_path`). Add the corresponding
+  `local_*` field as a full local URL when a ready asset exists, otherwise
+  `null`. Never replace the upstream field or mutate the stored TMDB document.
+- A transient PostgreSQL queue failure must not terminate a worker process.
+  Retry queue access at a bounded interval while preserving immediate
+  cancellation; validation and rejected-state errors remain fatal.
+
+## Throughput objective
+
+- Full sweeps must move title metadata as close as safely possible to TMDB's
+  documented request ceiling without bypassing `429` responses.
+- TMDB has no arbitrary multi-ID detail endpoint. Use one bounded concurrent
+  request per ID, `append_to_response` for same-title data, and bounded local
+  batches for scheduling and database writes.
+- Keep full sweeps phased: run the title census first in uninterrupted
+  500-title batches, then title enrichment in batches of 100, then TV seasons
+  and episodes in batches of 25. Census writes must not enqueue child jobs.
+- Reuse appended title documents from the detail response. Reusable-entity
+  galleries belong to an explicit media scan and must not run per title during
+  a catalog full sweep.
+- Use measured concurrency, bulk persistence where it removes round trips, and
+  structured timing/count events. Do not add speculative caching, queues,
+  abstractions, or a fake TMDB batch API.
+- In-flight request concurrency may exceed the requests-per-second setting to
+  hide measured upstream latency; the shared request-start limiter must remain
+  capped at 40 requests per second and continue honoring `429` responses.
+- Season and episode detail appends include their image galleries; do not issue
+  a second image request when that appended document is present. Report census,
+  enrichment, season, and media throughput separately.
 
 ## Simplicity rule
 
@@ -88,6 +124,8 @@ change.
 - Verify migrations, roles, queue bounds, deduplication, pause/resume/cancel,
   retries, restart persistence, API authorization, image paths and MIME types,
   local HTTP serving, permissions, backups, and restore/PITR.
+- Restricted API write tests must verify both table privileges and schema
+  `USAGE`; table grants alone are not sufficient for production roles.
 - Stress tests must report bounded request counts, failures, latency, queue
   depth, downloaded files, database rows, and container errors without
   revealing credentials. TMDB/Trawl rate limits must be reported, never

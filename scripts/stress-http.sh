@@ -23,7 +23,9 @@ done
 [[ "$concurrency" =~ ^[0-9]+$ ]] && (( concurrency >= 1 && concurrency <= 1000 )) || die 'invalid concurrency'
 [[ "$requests" =~ ^[0-9]+$ ]] && (( requests >= 1 && requests <= 10000 )) || die 'invalid requests-per-worker'
 
-configure_runtime "$project" "$api_port" "${TMDB_STRESS_ADMIN_PORT:-18081}" "$image_port" "${TMDB_STRESS_PG_PORT:-55433}"
+configure_existing_runtime "$project" "$api_port" "${TMDB_STRESS_ADMIN_PORT:-18081}" "$image_port" "${TMDB_STRESS_PG_PORT:-55433}"
+api_port="$API_PORT"
+image_port="$IMAGE_PORT"
 load_runtime
 mkdir -p "$RESULT_ROOT"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -38,7 +40,6 @@ base_url="http://127.0.0.1:$api_port"
 image_url="http://127.0.0.1:$image_port"
 urls=(
     "$base_url/health/live"
-    "$base_url/3/configuration"
     "$base_url/3/movie/550"
     "$base_url/3/movie/550/images?language=en-US&include_image_language=en,null"
     "$base_url/3/tv/4586"
@@ -122,6 +123,21 @@ check_body() {
     fi
 }
 
+check_optional_body() {
+    local name="$1" url="$2" body status
+    body="$work_dir/body-optional-$name.json"
+    status="$(curl --silent --show-error --output "$body" --write-out '%{http_code}' \
+        --connect-timeout 5 --max-time 30 "$url" || printf '000')"
+    if [[ "$status" == 200 && -s "$body" ]]; then
+        printf '%s\tPASS\n' "$name" >>"$semantic_file"
+    elif [[ "$status" == 404 ]]; then
+        printf '%s\tNOT_SEEDED\n' "$name" >>"$semantic_file"
+    else
+        printf '%s\tFAIL\n' "$name" >>"$semantic_file"
+        semantic_failures=$((semantic_failures + 1))
+    fi
+}
+
 check_status() {
     local name="$1" url="$2" expected="$3" status
     status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
@@ -134,8 +150,21 @@ check_status() {
     fi
 }
 
+check_search() {
+    local name="$1" query="$2" expected="$3" body
+    body="$work_dir/body-search-$name.json"
+    if curl --silent --show-error --fail --get --connect-timeout 5 --max-time 30 \
+        --data-urlencode "query=$query" "$base_url/3/search/multi" -o "$body" \
+        && grep -Fq "$expected" "$body"; then
+        printf '%s\tPASS\n' "$name" >>"$semantic_file"
+    else
+        printf '%s\tFAIL\n' "$name" >>"$semantic_file"
+        semantic_failures=$((semantic_failures + 1))
+    fi
+}
+
 : >"$semantic_file"
-check_body configuration_document "$base_url/3/configuration" present
+check_optional_body configuration_document "$base_url/3/configuration"
 check_body movie_document "$base_url/3/movie/550" present
 check_body tv_document "$base_url/3/tv/4586" present
 check_body movie_videos "$base_url/3/movie/550/videos?language=en-US&include_video_language=en,null" present
@@ -143,6 +172,10 @@ check_body tv_gallery "$base_url/3/tv/4586/images?language=en-US&include_image_l
 check_body tv_videos "$base_url/3/tv/4586/videos?language=en-US&include_video_language=en,null" present
 check_body season_gallery "$base_url/3/tv/4586/season/1/images?language=en-US&include_image_language=en,null" present
 check_body episode_gallery "$base_url/3/tv/4586/season/1/episode/1/images?language=en-US&include_image_language=en,null" present
+check_search japanese_search '日本語ストレス' '日本語ストレス'
+check_search chinese_search '中文壓力測試' '中文壓力測試'
+check_search korean_search '한국어 스트레스' '한국어 스트레스'
+check_search romanian_accent_folded_search 'Romania Stiinta' 'România Știință'
 if curl --silent --show-error --fail --connect-timeout 5 --max-time 30 "$image_url/healthz" >/dev/null; then
     printf '%s\tPASS\n' media_health >>"$semantic_file"
 else

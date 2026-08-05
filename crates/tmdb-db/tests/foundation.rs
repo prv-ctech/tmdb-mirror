@@ -108,7 +108,7 @@ async fn foundation_rows_constraints_and_readiness_projection_are_exact(
     let registry_count: i64 = sqlx::query_scalar("SELECT count(*) FROM ops.job_type_registry")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(registry_count, 16);
+    assert_eq!(registry_count, 18);
     let metadata_count: i64 = sqlx::query_scalar("SELECT count(*) FROM ops.service_metadata")
         .fetch_one(&pool)
         .await?;
@@ -118,7 +118,7 @@ async fn foundation_rows_constraints_and_readiness_projection_are_exact(
         sqlx::query_as("SELECT schema_revision, migrated_at FROM ops.readiness")
             .fetch_one(&pool)
             .await?;
-    assert_eq!(readiness_row.0, "0041");
+    assert_eq!(readiness_row.0, "0050");
     let readiness_columns: Vec<String> = sqlx::query_scalar(
         "SELECT column_name FROM information_schema.columns
           WHERE table_schema = 'ops' AND table_name = 'readiness'
@@ -331,10 +331,9 @@ async fn worker_startup_reset_stops_only_running_workers(pool: PgPool) -> sqlx::
     .execute(&pool)
     .await?;
 
-    let ingest_state: String =
-        sqlx::query_scalar("SELECT ops.stop_worker_on_startup('ingest')")
-            .fetch_one(&pool)
-            .await?;
+    let ingest_state: String = sqlx::query_scalar("SELECT ops.stop_worker_on_startup('ingest')")
+        .fetch_one(&pool)
+        .await?;
     let media_state: String = sqlx::query_scalar("SELECT ops.stop_worker_on_startup('media')")
         .fetch_one(&pool)
         .await?;
@@ -355,6 +354,104 @@ async fn worker_startup_reset_stops_only_running_workers(pool: PgPool) -> sqlx::
             ("media".to_owned(), "paused".to_owned())
         ]
     );
+    Ok(())
+}
+
+#[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+async fn ingest_writer_can_use_only_the_locked_child_submission_gate(
+    owner_pool: PgPool,
+) -> sqlx::Result<()> {
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&owner_pool)
+        .await?;
+    let ingest = role_pool(&database, "ingest_writer", PoolPolicy::ReadWrite).await?;
+
+    let can_read_control: bool = sqlx::query_scalar(
+        "SELECT has_table_privilege(current_user, 'ops.worker_control', 'SELECT')",
+    )
+    .fetch_one(&ingest)
+    .await?;
+    let can_execute_gate: bool = sqlx::query_scalar(
+        "SELECT has_function_privilege(
+            current_user, 'ops.ingest_child_submissions_enabled()', 'EXECUTE'
+        )",
+    )
+    .fetch_one(&ingest)
+    .await?;
+    assert!(!can_read_control);
+    assert!(can_execute_gate);
+    assert!(
+        !sqlx::query_scalar::<_, bool>("SELECT ops.ingest_child_submissions_enabled()")
+            .fetch_one(&ingest)
+            .await?
+    );
+
+    sqlx::query(
+        "UPDATE ops.worker_control
+            SET state = 'running', updated_at = clock_timestamp()
+          WHERE worker_kind = 'ingest'",
+    )
+    .execute(&owner_pool)
+    .await?;
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT ops.ingest_child_submissions_enabled()")
+            .fetch_one(&ingest)
+            .await?
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+async fn media_restart_blocks_claims_until_an_admin_start(pool: PgPool) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE ops.worker_control
+            SET state = 'running', updated_at = clock_timestamp()
+          WHERE worker_kind = 'media'",
+    )
+    .execute(&pool)
+    .await?;
+    let media_job: String = sqlx::query_scalar(
+        "SELECT job_id::text
+           FROM ops.submit_job(
+               gen_random_uuid(), 'image.download', 1, '{}', 0::smallint, 3,
+               clock_timestamp(), 'media-restart-claim-gate'
+           )",
+    )
+    .fetch_one(&pool)
+    .await?;
+
+    let startup_state: String = sqlx::query_scalar("SELECT ops.stop_worker_on_startup('media')")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(startup_state, "stopped");
+    let blocked_claim: Option<String> = sqlx::query_scalar(
+        "SELECT job_id::text
+           FROM ops.claim_job_for_types(
+               'media-restart-test', 1000000, ARRAY['image.download']::text[]
+           )",
+    )
+    .fetch_optional(&pool)
+    .await?;
+    assert!(blocked_claim.is_none());
+
+    let admin_state: String = sqlx::query_scalar(
+        "SELECT state
+           FROM ops.set_media_worker_state(
+               'start', 'media-restart-admin-start', gen_random_uuid()
+           )",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(admin_state, "running");
+    let claimed_job: String = sqlx::query_scalar(
+        "SELECT job_id::text
+           FROM ops.claim_job_for_types(
+               'media-restart-test', 1000000, ARRAY['image.download']::text[]
+           )",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(claimed_job, media_job);
     Ok(())
 }
 
@@ -393,6 +490,16 @@ async fn actual_roles_obey_the_permission_matrix_and_recover_after_denial(
     assert_eq!(current_user(&submitter).await?, "api_job_submitter");
     assert_session_policy(&submitter, "tmdb-read-write", "off").await?;
     assert!(schema_usage(&submitter, "ops").await?);
+    assert!(schema_usage(&submitter, "source").await?);
+    sqlx::query(
+        "INSERT INTO source.tmdb_v3_request_tokens (token, expires_at)
+         VALUES ('submitter-role-fixture', clock_timestamp() + interval '1 minute')",
+    )
+    .execute(&submitter)
+    .await?;
+    sqlx::query("DELETE FROM source.tmdb_v3_request_tokens WHERE token = 'submitter-role-fixture'")
+        .execute(&submitter)
+        .await?;
     denied_then_recovers(
         &submitter,
         "INSERT INTO ops.service_metadata(key, value) VALUES ('denied-submitter', '{}'::jsonb)",
@@ -609,7 +716,7 @@ async fn readiness_is_sanitized_read_only_and_requires_api_reader(
         .await
         .map_err(db_error)?;
     assert_eq!(report.postgres_major, 18);
-    assert_eq!(report.schema_revision, "0041");
+    assert_eq!(report.schema_revision, "0050");
     assert_eq!(
         report.extensions,
         ["pg_stat_statements", "pg_trgm", "unaccent"]
@@ -634,7 +741,7 @@ async fn readiness_rejects_an_extra_successful_migration(owner_pool: PgPool) -> 
     sqlx::query(
         "INSERT INTO ops._sqlx_migrations(
              version, description, installed_on, success, checksum, execution_time
-         ) VALUES (42, 'unexpected', clock_timestamp(), true, decode('00', 'hex'), 0)",
+         ) VALUES (51, 'unexpected', clock_timestamp(), true, decode('00', 'hex'), 0)",
     )
     .execute(&owner_pool)
     .await?;
@@ -646,7 +753,7 @@ async fn readiness_rejects_a_failed_migration_row(owner_pool: PgPool) -> sqlx::R
     sqlx::query(
         "INSERT INTO ops._sqlx_migrations(
              version, description, installed_on, success, checksum, execution_time
-         ) VALUES (42, 'failed', clock_timestamp(), false, decode('00', 'hex'), 0)",
+         ) VALUES (51, 'failed', clock_timestamp(), false, decode('00', 'hex'), 0)",
     )
     .execute(&owner_pool)
     .await?;
@@ -805,7 +912,7 @@ async fn representative_version_one_database_upgrades_through_two_three_and_four
     MIGRATOR
         .run(&owner_pool)
         .await
-        .map_err(|_| test_error("0001 fixture did not upgrade through 0041"))?;
+        .map_err(|_| test_error("0001 fixture did not upgrade through 0050"))?;
     let upgraded_versions: Vec<i64> = sqlx::query_scalar(
         "SELECT version FROM ops._sqlx_migrations WHERE success ORDER BY version",
     )
@@ -815,7 +922,8 @@ async fn representative_version_one_database_upgrades_through_two_three_and_four
         upgraded_versions,
         [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+            47, 48, 49, 50
         ]
     );
 
@@ -947,7 +1055,7 @@ async fn representative_version_one_database_upgrades_through_two_three_and_four
         sqlx::query_scalar("SELECT count(*) FROM ops._sqlx_migrations WHERE success")
             .fetch_one(&owner_pool)
             .await?;
-    assert_eq!(repeat_count, 41);
+    assert_eq!(repeat_count, 50);
     let scheduler_table: Option<String> =
         sqlx::query_scalar("SELECT to_regclass('ops.scheduler_runs')::text")
             .fetch_one(&owner_pool)
@@ -1012,7 +1120,7 @@ async fn representative_version_one_database_upgrades_through_two_three_and_four
             .await
             .map_err(db_error)?
             .schema_revision,
-        "0041"
+        "0050"
     );
     Ok(())
 }
@@ -1169,7 +1277,7 @@ async fn round_one_three_database_is_repaired_by_four(owner_pool: PgPool) -> sql
     let report = migrate(&migrator_pool, TEST_SHARED_DATABASE_OWNER)
         .await
         .map_err(db_error)?;
-    assert_eq!(report.applied, 38);
+    assert_eq!(report.applied, 47);
 
     let versions: Vec<i64> = sqlx::query_scalar(
         "SELECT version FROM ops._sqlx_migrations WHERE success ORDER BY version",
@@ -1180,7 +1288,8 @@ async fn round_one_three_database_is_repaired_by_four(owner_pool: PgPool) -> sql
         versions,
         [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+            47, 48, 49, 50
         ]
     );
     let claimable_exists: bool = sqlx::query_scalar(
@@ -1380,7 +1489,7 @@ async fn round_one_three_database_is_repaired_by_four(owner_pool: PgPool) -> sql
         sqlx::query_scalar::<_, String>("SELECT schema_revision FROM ops.readiness")
             .fetch_one(&owner_pool)
             .await?,
-        "0041"
+        "0050"
     );
     migrator_pool.close().await;
     Ok(())
@@ -1401,7 +1510,7 @@ async fn actual_migrator_applies_once_then_preserves_snapshot(
             .await
             .map_err(db_error)?
             .applied,
-        41
+        50
     );
     let first = foundation_snapshot(&migrator_pool).await?;
     sqlx::query(
@@ -1523,7 +1632,7 @@ async fn actual_migrator_applies_once_then_preserves_snapshot(
             .iter()
             .any(|line| line == "seed|job|ingest.trending|1|true")
     );
-    assert!(first.iter().any(|line| line == "seed|metadata|schema|0041"));
+    assert!(first.iter().any(|line| line == "seed|metadata|schema|0050"));
 
     migrator_pool.close().await;
     Ok(())
@@ -1558,7 +1667,7 @@ async fn concurrent_actual_migrators_report_exactly_one_application(
         second.map_err(db_error)?.applied,
     ];
     applied.sort_unstable();
-    assert_eq!(applied, [0, 41]);
+    assert_eq!(applied, [0, 50]);
 
     first_pool.close().await;
     second_pool.close().await;

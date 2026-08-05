@@ -8,6 +8,8 @@ use tokio::sync::Semaphore;
 use tokio::time::{self, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
+const DATABASE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
 use crate::{ClaimedJob, JobError, JobRepository, WorkerId};
 
 const MAX_LEASE_DURATION: Duration = Duration::from_hours(1);
@@ -199,8 +201,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::Repository`] when a queue operation fails for a reason other than
-    /// a lost or expired lease.
+    /// Returns [`WorkerError::Repository`] when a queue operation is rejected or fails validation.
+    /// Transient database failures are logged and retried until cancellation.
     pub async fn run(self, cancellation: CancellationToken) -> Result<(), WorkerError> {
         let supported_job_types = self.executor.supported_job_types();
         tracing::info!(
@@ -220,7 +222,7 @@ where
                 },
                 permit = self.claim_gate.clone().acquire_owned() => permit.map_err(|_| WorkerError::Repository(JobError::Database))?,
             };
-            let claim = tokio::select! {
+            let claim_result = tokio::select! {
                 () = cancellation.cancelled() => {
                     tracing::info!(event = "job_worker_stopped", worker_id = self.config.worker_id.as_str());
                     return Ok(());
@@ -229,9 +231,26 @@ where
                     &self.config.worker_id,
                     self.config.lease_duration,
                     supported_job_types,
-                ) => result?,
+                ) => result,
             };
             drop(permit);
+            let claim = match claim_result {
+                Ok(claim) => claim,
+                Err(JobError::Database) => {
+                    if self
+                        .wait_after_database_failure(&cancellation, "claim")
+                        .await
+                    {
+                        continue;
+                    }
+                    tracing::info!(
+                        event = "job_worker_stopped",
+                        worker_id = self.config.worker_id.as_str()
+                    );
+                    return Ok(());
+                }
+                Err(error) => return Err(WorkerError::Repository(error)),
+            };
 
             let Some(job) = claim else {
                 tokio::select! {
@@ -252,7 +271,39 @@ where
                 attempt = job.attempts(),
                 max_attempts = job.max_attempts(),
             );
-            self.execute_claimed(job, &cancellation).await?;
+            match self.execute_claimed(job, &cancellation).await {
+                Ok(()) => {}
+                Err(WorkerError::Repository(JobError::Database)) => {
+                    if !self
+                        .wait_after_database_failure(&cancellation, "record_outcome")
+                        .await
+                    {
+                        tracing::info!(
+                            event = "job_worker_stopped",
+                            worker_id = self.config.worker_id.as_str()
+                        );
+                        return Ok(());
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn wait_after_database_failure(
+        &self,
+        cancellation: &CancellationToken,
+        operation: &'static str,
+    ) -> bool {
+        tracing::warn!(
+            event = "job_worker_database_retry",
+            worker_id = self.config.worker_id.as_str(),
+            operation,
+            retry_seconds = DATABASE_RETRY_INTERVAL.as_secs_f64(),
+        );
+        tokio::select! {
+            () = cancellation.cancelled() => false,
+            () = time::sleep(DATABASE_RETRY_INTERVAL) => true,
         }
     }
 
@@ -477,7 +528,9 @@ where
         error: JobExecutionError,
     ) -> Result<(), WorkerError> {
         let failure_code = log_failure_code(error.failure_code());
-        log_job_execution_failure(job, &self.config.worker_id, failure_code, false);
+        if !is_expected_backpressure(failure_code) {
+            log_job_execution_failure(job, &self.config.worker_id, failure_code, false);
+        }
         match self
             .repository
             .fail(
@@ -489,16 +542,29 @@ where
             .await
         {
             Ok(crate::FailureDisposition::RetryScheduled { .. }) => {
-                tracing::warn!(
-                    event = "job_retry_scheduled",
-                    worker_id = self.config.worker_id.as_str(),
-                    job_id = %job.job_id().as_uuid(),
-                    job_type = job.job_type(),
-                    attempt = job.attempts(),
-                    max_attempts = job.max_attempts(),
-                    failure_code,
-                    retry_seconds = error.retry_delay().as_secs_f64(),
-                );
+                if is_expected_backpressure(failure_code) {
+                    tracing::info!(
+                        event = "job_backpressure_wait",
+                        worker_id = self.config.worker_id.as_str(),
+                        job_id = %job.job_id().as_uuid(),
+                        job_type = job.job_type(),
+                        attempt = job.attempts(),
+                        max_attempts = job.max_attempts(),
+                        failure_code,
+                        retry_seconds = error.retry_delay().as_secs_f64(),
+                    );
+                } else {
+                    tracing::warn!(
+                        event = "job_retry_scheduled",
+                        worker_id = self.config.worker_id.as_str(),
+                        job_id = %job.job_id().as_uuid(),
+                        job_type = job.job_type(),
+                        attempt = job.attempts(),
+                        max_attempts = job.max_attempts(),
+                        failure_code,
+                        retry_seconds = error.retry_delay().as_secs_f64(),
+                    );
+                }
                 Ok(())
             }
             Ok(crate::FailureDisposition::DeadLettered) => {
@@ -609,9 +675,22 @@ fn log_failure_code(code: &str) -> &str {
         | "entity_not_ready"
         | "export_storage"
         | "database_unavailable"
-        | "export_queue_incomplete" => code,
+        | "export_queue_incomplete"
+        | "changes_queue_full"
+        | "missing_queue_full"
+        | "catalog_phase_busy" => code,
         _ => "custom_failure",
     }
+}
+
+fn is_expected_backpressure(code: &str) -> bool {
+    matches!(
+        code,
+        "export_queue_incomplete"
+            | "changes_queue_full"
+            | "missing_queue_full"
+            | "catalog_phase_busy"
+    )
 }
 
 fn ignore_lost_lease(error: JobError) -> Result<(), WorkerError> {
@@ -635,5 +714,18 @@ mod tests {
             log_failure_code("https://example.invalid/?token=secret"),
             "custom_failure"
         );
+    }
+
+    #[test]
+    fn bounded_queue_waits_are_expected_backpressure() {
+        for code in [
+            "export_queue_incomplete",
+            "changes_queue_full",
+            "missing_queue_full",
+            "catalog_phase_busy",
+        ] {
+            assert!(is_expected_backpressure(code), "{code}");
+        }
+        assert!(!is_expected_backpressure("upstream_unavailable"));
     }
 }

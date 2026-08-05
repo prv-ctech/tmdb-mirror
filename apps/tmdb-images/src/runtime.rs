@@ -42,6 +42,8 @@ struct MediaAuditPayload {
     repair: bool,
     #[serde(default)]
     after_asset_id: Option<i64>,
+    #[serde(default)]
+    run_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -380,16 +382,39 @@ where
             let last_asset_id = rows.last().map(|row| row.id).ok_or_else(|| {
                 JobExecutionError::retry("execution_failed", Duration::from_secs(5))
             })?;
+            let mut follow_up_payload = json!({
+                "repair": payload.repair,
+                "afterAssetId": last_asset_id
+            });
+            if let Some(run_id) = payload.run_id {
+                follow_up_payload["runId"] = json!(run_id);
+            }
+            let scan_key = payload
+                .run_id
+                .map_or_else(|| "standalone".to_owned(), |run_id| run_id.to_string());
             let follow_up = NewJob::new(
                 MEDIA_AUDIT_JOB,
                 MEDIA_AUDIT_PAYLOAD_VERSION,
-                json!({"repair": payload.repair, "afterAssetId": last_asset_id}),
-                &format!("admin.media_audit:{}:{last_asset_id}", payload.repair),
+                follow_up_payload,
+                &format!(
+                    "admin.media_audit:{scan_key}:{}:{last_asset_id}",
+                    payload.repair
+                ),
             )
             .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
-            repository.submit(follow_up).await.map_err(|_| {
+            let outcome = repository.submit(follow_up).await.map_err(|_| {
                 JobExecutionError::retry("database_unavailable", Duration::from_secs(5))
             })?;
+            if let Some(run_id) = payload.run_id {
+                sqlx::query_scalar::<_, bool>("SELECT ops.link_media_scan_audit_job($1, $2)")
+                    .bind(run_id)
+                    .bind(outcome.job_id().as_uuid())
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|_| {
+                        JobExecutionError::retry("database_unavailable", Duration::from_secs(5))
+                    })?;
+            }
             summary.next_audit_queued = true;
         }
         tracing::info!(
@@ -582,7 +607,7 @@ fn repair_job(row: &MediaAuditAssetRow) -> Option<NewJob> {
     let entity_id = row.entity_id?;
     let season_number = row
         .season_number
-        .and_then(|number| u16::try_from(number).ok());
+        .and_then(|number| u32::try_from(number).ok());
     let episode_number = row
         .episode_number
         .and_then(|number| u16::try_from(number).ok());
@@ -1101,10 +1126,15 @@ mod tests {
             ImageWorkerJob::Noop
         ));
         assert!(matches!(
-            parse_image_worker_job(MEDIA_AUDIT_JOB, 1, &json!({"repair": true}))?,
+            parse_image_worker_job(
+                MEDIA_AUDIT_JOB,
+                1,
+                &json!({"repair": true, "runId": "019fd066-b5a8-7d33-adb4-a7b666d15c7b"})
+            )?,
             ImageWorkerJob::MediaAudit(MediaAuditPayload {
                 repair: true,
-                after_asset_id: None
+                after_asset_id: None,
+                run_id: Some(_),
             })
         ));
         assert!(parse_image_worker_job(crate::image::IMAGE_JOB_TYPE, 2, &value).is_err());

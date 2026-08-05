@@ -23,7 +23,9 @@ done
 [[ "$timeout" =~ ^[0-9]+$ ]] && (( timeout >= 30 && timeout <= 1800 )) || die 'invalid timeout'
 [[ "$max_active" =~ ^[0-9]+$ ]] && (( max_active > 0 && max_active <= 10000 )) || die 'invalid max-active'
 
-configure_runtime "$project" "${TMDB_STRESS_API_PORT:-18080}" "$admin_port" "$media_port" "${TMDB_STRESS_PG_PORT:-55433}"
+configure_existing_runtime "$project" "${TMDB_STRESS_API_PORT:-18080}" "$admin_port" "$media_port" "${TMDB_STRESS_PG_PORT:-55433}"
+admin_port="$ADMIN_PORT"
+media_port="$IMAGE_PORT"
 load_runtime
 require_command curl
 require_command python3

@@ -20,7 +20,23 @@ async fn v3_routes_return_captured_tmdb_json_and_tmdb_not_found_shape(
         .upsert(
             "movie/42",
             "append_to_response=credits",
-            &json!({"id": 42, "title": "Movie", "poster_path": "/poster.jpg"}),
+            &json!({
+                "id": 42,
+                "title": "Movie",
+                "poster_path": "/poster.jpg",
+                "backdrop_path": "/missing.jpg",
+                "images": {
+                    "posters": [
+                        {"file_path": "/poster.jpg"},
+                        {"file_path": "/missing-gallery.jpg"}
+                    ]
+                },
+                "media_field_fixture": {
+                    "logo_path": "/missing-logo.png",
+                    "profile_path": "/missing-profile.jpg",
+                    "still_path": "/missing-still.jpg"
+                }
+            }),
         )
         .await?;
     repository
@@ -101,10 +117,42 @@ async fn v3_routes_return_captured_tmdb_json_and_tmdb_not_found_shape(
         .oneshot(Request::get("/3/movie/42?append_to_response=credits").body(Body::empty())?)
         .await?;
     assert_eq!(movie.status(), 200);
+    let movie_body = body_json(movie).await?;
+    assert_eq!(movie_body["poster_path"], "/poster.jpg");
     assert_eq!(
-        body_json(movie).await?["poster_path"],
+        movie_body["local_poster_path"],
         "http://media.test/media/movies/42/posters/poster.jpg"
     );
+    assert_eq!(movie_body["backdrop_path"], "/missing.jpg");
+    assert!(movie_body["local_backdrop_path"].is_null());
+    assert_eq!(
+        movie_body["images"]["posters"][0]["file_path"],
+        "/poster.jpg"
+    );
+    assert_eq!(
+        movie_body["images"]["posters"][0]["local_file_path"],
+        "http://media.test/media/movies/42/posters/poster.jpg"
+    );
+    assert_eq!(
+        movie_body["images"]["posters"][1]["file_path"],
+        "/missing-gallery.jpg"
+    );
+    assert!(movie_body["images"]["posters"][1]["local_file_path"].is_null());
+    assert_eq!(
+        movie_body["media_field_fixture"]["logo_path"],
+        "/missing-logo.png"
+    );
+    assert!(movie_body["media_field_fixture"]["local_logo_path"].is_null());
+    assert_eq!(
+        movie_body["media_field_fixture"]["profile_path"],
+        "/missing-profile.jpg"
+    );
+    assert!(movie_body["media_field_fixture"]["local_profile_path"].is_null());
+    assert_eq!(
+        movie_body["media_field_fixture"]["still_path"],
+        "/missing-still.jpg"
+    );
+    assert!(movie_body["media_field_fixture"]["local_still_path"].is_null());
 
     let season = app
         .clone()
@@ -136,25 +184,16 @@ async fn v3_routes_return_captured_tmdb_json_and_tmdb_not_found_shape(
 
     let movie_with_unmatched_query = app
         .clone()
-        .oneshot(
-            Request::get("/3/movie/42?api_key=local-only&language=en-US")
-                .body(Body::empty())?,
-        )
+        .oneshot(Request::get("/3/movie/42?api_key=local-only&language=en-US").body(Body::empty())?)
         .await?;
     assert_eq!(movie_with_unmatched_query.status(), 200);
 
     repository
-        .upsert(
-            "movie/42/reviews",
-            "",
-            &json!({"id": 42, "results": []}),
-        )
+        .upsert("movie/42/reviews", "", &json!({"id": 42, "results": []}))
         .await?;
     let reviews_with_default_query = app
         .clone()
-        .oneshot(
-            Request::get("/3/movie/42/reviews?language=en-US&page=1").body(Body::empty())?,
-        )
+        .oneshot(Request::get("/3/movie/42/reviews?language=en-US&page=1").body(Body::empty())?)
         .await?;
     assert_eq!(reviews_with_default_query.status(), 200);
 

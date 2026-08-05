@@ -6,8 +6,8 @@ secret env file. They do not touch the production Compose project or host data.
 
 ## Prepare and start
 
-Create the ignored secret file and fill in the TMDB v4 read token, v3 API key,
-and optional existing Trawl URL:
+Create the ignored secret file and fill in the TMDB v4 read token, optional v3
+API key, and optional existing Trawl URL:
 
 ```bash
 cp secrets.txt.example secrets.txt
@@ -22,8 +22,10 @@ chmod 600 secrets.txt
   --postgres-port 55433
 ```
 
-The loader reads `secrets.txt`. Secret values are never written to the general
-Compose environment, logs, JSON results, Docker build context, or Git.
+The loader reads `secrets.txt`. An optional `TMDB_ADMIN_API_KEY` entry is
+accepted for shared local secret files but ignored by the stress runtime.
+Secret values are never written to the general Compose environment, logs, JSON
+results, Docker build context, or Git.
 
 The bootstrap builds the pinned Rust image and the local PostgreSQL/pgBackRest
 image, applies migrations, starts the four-container stack, waits for health,
@@ -69,11 +71,22 @@ paths are covered by focused Rust tests and the explicit admin scan contract.
 
 The HTTP result records request count, failures, throughput, p50/p95/p99
 latency, TMDB v3 document routes, season/episode image routes, and
-video-type checks. The artwork and media-asset results also report
+video-type checks. Run it at both 50 and 100 concurrent clients for production
+qualification. The configuration route is reported as `not seeded` when
+the preceding bounded artwork run used `missing_only`; a `full_sweep` seeds
+it. The artwork and media-asset results also report
 gallery counts, original and optimized rows, episode optimized-only rows,
 variant MIME/path violations, video counts by type/provider, HTTP status,
 permissions, worker IDs, and failures. Results and redacted diagnostics remain
 under the ignored runtime directory.
+
+For full-sweep performance checks, report title-census throughput separately
+from enrichment and season throughput. Verify consecutive 500-title census
+batches have no enrichment, season, reusable-gallery, or image-download jobs
+between them; 100-title enrichment and 25-season TV phases start only after
+the preceding phase drains. A separate `daily_sync` run must prove that a
+changed title can add a newly published season or episode without another full
+sweep.
 
 `stress-artwork.sh`, `stress-scan.sh`, and `stress-media-assets.sh` start
 workers through the authenticated admin API before draining work; this is
@@ -88,6 +101,13 @@ modes are `full_sweep`, `missing_only`,
 `prune_cleanup`, and `daily_sync`; every mode is bounded by durable
 continuations. Do not launch a large full sweep against a live catalog until
 queue depth and rate limits are being monitored.
+
+Qualification must also cover Unicode and accent-folded title search, all
+authenticated admin controls, local TMDB v3 account/list/rating writes,
+upstream-plus-local media fields, a 100-session PostgreSQL read burst, backup
+creation, and isolated PITR restore. When stopping both workflows under load,
+cancel catalog ingest first, let active catalog jobs settle, then cancel media
+to clear image jobs committed by work that was already in flight.
 
 The private backup API accepts `{"type":"full"}` or
 `{"type":"differential"}` and requires an idempotency key. It returns a durable

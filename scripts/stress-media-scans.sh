@@ -20,12 +20,15 @@ while (($#)); do
 done
 [[ "$timeout" =~ ^[0-9]+$ ]] && (( timeout >= 30 && timeout <= 1800 )) || die 'invalid timeout'
 
-configure_runtime "$project" "${TMDB_STRESS_API_PORT:-18080}" "$admin_port" "$media_port" "${TMDB_STRESS_PG_PORT:-55433}"
+configure_existing_runtime "$project" "${TMDB_STRESS_API_PORT:-18080}" "$admin_port" "$media_port" "${TMDB_STRESS_PG_PORT:-55433}"
+admin_port="$ADMIN_PORT"
+media_port="$IMAGE_PORT"
 load_runtime
 require_command curl
 require_command python3
 STRESS_ADMIN_KEY="$(env_value TMDB_ADMIN_API_KEY)"
 [[ -n "$STRESS_ADMIN_KEY" ]] || die 'TMDB_ADMIN_API_KEY is missing from the stress runtime'
+password="$(database_password)"
 trap 'unset STRESS_ADMIN_KEY' EXIT
 
 mkdir -p "$RESULT_ROOT"
@@ -258,6 +261,11 @@ import json, sys
 value = json.load(sys.stdin).get("data", {}).get("repairQueuedCount", 0)
 print(value)
 ' 2>/dev/null || printf '0')"
+expected_audited="$(psql_at "$password" "SELECT count(*) FROM assets.image_assets WHERE status = 'ready'")"
+if (( first_audited != expected_audited )); then
+    printf 'FAIL audit scan covered %s of %s ready assets\n' "$first_audited" "$expected_audited" >&2
+    failures=$((failures + 1))
+fi
 
 cat >"$result_file" <<EOF
 {
@@ -268,6 +276,7 @@ cat >"$result_file" <<EOF
   "audit_scan": {
     "run_id": "$audit_run_id",
     "status": "$first_audit_status",
+    "expected_audited_count": $expected_audited,
     "audited_count": $first_audited,
     "invalid_count": $first_invalid,
     "repair_queued_count": $first_repairs
