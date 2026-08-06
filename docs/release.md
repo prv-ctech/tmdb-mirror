@@ -17,10 +17,11 @@ tmdb-media     -> /media
 ```
 
 Keep the runtime environment in a mode-600 file outside the release directory.
-It must contain the PostgreSQL owner credentials, TMDB read token, admin API
-key, and local media settings from `.env.example`. Do not put real credentials
-in a repository `.env`, the release artifact, or shell history. Point the
-release Compose file at that runtime file:
+Start from the current `.env.example`; it contains the PostgreSQL owner
+credentials, TMDB read token, admin API key, logging, local media settings,
+worker identities, and catalog schedules used by the current images. Do not
+put real credentials in a repository `.env`, the release artifact, or shell
+history. Point the release Compose file at that runtime file:
 
 ```bash
 runtime_env=/secure/path/tmdb-mirror-release.env
@@ -54,6 +55,12 @@ The right-hand container paths stay fixed:
 Do not add host paths to `.env`. The PostgreSQL container creates its backup
 repository below `/config/backups/pgbackrest`; the worker and media containers
 use the other fixed children below `/config` and `/media`.
+
+Both workers drain eligible durable work on startup. The main worker also
+evaluates the three configured catalog cron schedules; `full_sweep` remains a
+manual admin operation. Media is submitted only through
+`POST /admin/v1/media/requests`; removed global media scan/audit routes are not
+part of a release.
 
 Run the deliberate integration, recovery, and k6 commands in
 [stress-testing.md](stress-testing.md) before creating a version tag. They are

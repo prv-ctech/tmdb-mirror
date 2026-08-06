@@ -118,7 +118,7 @@ async fn foundation_rows_constraints_and_readiness_projection_are_exact(
         sqlx::query_as("SELECT schema_revision, migrated_at FROM ops.readiness")
             .fetch_one(&pool)
             .await?;
-    assert_eq!(readiness_row.0, "0050");
+    assert_eq!(readiness_row.0, "0052");
     let readiness_columns: Vec<String> = sqlx::query_scalar(
         "SELECT column_name FROM information_schema.columns
           WHERE table_schema = 'ops' AND table_name = 'readiness'
@@ -135,17 +135,41 @@ async fn foundation_rows_constraints_and_readiness_projection_are_exact(
             AND indexname = ANY($1)
           ORDER BY indexname",
     )
-    .bind([
-        "jobs_terminal_retention_idx",
-        "media_scan_runs_terminal_retention_idx",
-    ])
+    .bind(["jobs_terminal_retention_idx", "media_requests_claim_idx"])
     .fetch_all(&pool)
     .await?;
     assert_eq!(
         retention_indexes,
+        ["jobs_terminal_retention_idx", "media_requests_claim_idx"]
+    );
+
+    let removed_media_objects: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT pg_catalog.to_regclass('ops.media_scan_runs')::text,
+                pg_catalog.to_regclass('assets.image_variants')::text",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(removed_media_objects, (None, None));
+
+    let recovery_indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT schemaname || '.' || indexname
+           FROM pg_indexes
+          WHERE indexname = ANY($1)
+          ORDER BY schemaname, indexname",
+    )
+    .bind([
+        "jobs_dead_catalog_refresh_idx",
+        "seasons_missing_enrichment_idx",
+        "titles_missing_enrichment_idx",
+    ])
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        recovery_indexes,
         [
-            "jobs_terminal_retention_idx",
-            "media_scan_runs_terminal_retention_idx"
+            "catalog.seasons_missing_enrichment_idx",
+            "catalog.titles_missing_enrichment_idx",
+            "ops.jobs_dead_catalog_refresh_idx",
         ]
     );
 
@@ -319,7 +343,7 @@ async fn foundation_rows_constraints_and_readiness_projection_are_exact(
 }
 
 #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
-async fn worker_startup_reset_stops_only_running_workers(pool: PgPool) -> sqlx::Result<()> {
+async fn worker_startup_enables_durable_queue_draining(pool: PgPool) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE ops.worker_control
             SET state = CASE worker_kind
@@ -331,14 +355,14 @@ async fn worker_startup_reset_stops_only_running_workers(pool: PgPool) -> sqlx::
     .execute(&pool)
     .await?;
 
-    let ingest_state: String = sqlx::query_scalar("SELECT ops.stop_worker_on_startup('ingest')")
+    let ingest_state: String = sqlx::query_scalar("SELECT ops.start_worker_on_startup('ingest')")
         .fetch_one(&pool)
         .await?;
-    let media_state: String = sqlx::query_scalar("SELECT ops.stop_worker_on_startup('media')")
+    let media_state: String = sqlx::query_scalar("SELECT ops.start_worker_on_startup('media')")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(ingest_state, "stopped");
-    assert_eq!(media_state, "paused");
+    assert_eq!(ingest_state, "running");
+    assert_eq!(media_state, "running");
 
     let states: Vec<(String, String)> = sqlx::query_as(
         "SELECT worker_kind, state
@@ -350,8 +374,8 @@ async fn worker_startup_reset_stops_only_running_workers(pool: PgPool) -> sqlx::
     assert_eq!(
         states,
         [
-            ("ingest".to_owned(), "stopped".to_owned()),
-            ("media".to_owned(), "paused".to_owned())
+            ("ingest".to_owned(), "running".to_owned()),
+            ("media".to_owned(), "running".to_owned())
         ]
     );
     Ok(())
@@ -380,6 +404,13 @@ async fn ingest_writer_can_use_only_the_locked_child_submission_gate(
     .await?;
     assert!(!can_read_control);
     assert!(can_execute_gate);
+    sqlx::query(
+        "UPDATE ops.worker_control
+            SET state = 'stopped', updated_at = clock_timestamp()
+          WHERE worker_kind = 'ingest'",
+    )
+    .execute(&owner_pool)
+    .await?;
     assert!(
         !sqlx::query_scalar::<_, bool>("SELECT ops.ingest_child_submissions_enabled()")
             .fetch_one(&ingest)
@@ -402,7 +433,7 @@ async fn ingest_writer_can_use_only_the_locked_child_submission_gate(
 }
 
 #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
-async fn media_restart_blocks_claims_until_an_admin_start(pool: PgPool) -> sqlx::Result<()> {
+async fn media_restart_immediately_drains_durable_work(pool: PgPool) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE ops.worker_control
             SET state = 'running', updated_at = clock_timestamp()
@@ -420,29 +451,10 @@ async fn media_restart_blocks_claims_until_an_admin_start(pool: PgPool) -> sqlx:
     .fetch_one(&pool)
     .await?;
 
-    let startup_state: String = sqlx::query_scalar("SELECT ops.stop_worker_on_startup('media')")
+    let startup_state: String = sqlx::query_scalar("SELECT ops.start_worker_on_startup('media')")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(startup_state, "stopped");
-    let blocked_claim: Option<String> = sqlx::query_scalar(
-        "SELECT job_id::text
-           FROM ops.claim_job_for_types(
-               'media-restart-test', 1000000, ARRAY['image.download']::text[]
-           )",
-    )
-    .fetch_optional(&pool)
-    .await?;
-    assert!(blocked_claim.is_none());
-
-    let admin_state: String = sqlx::query_scalar(
-        "SELECT state
-           FROM ops.set_media_worker_state(
-               'start', 'media-restart-admin-start', gen_random_uuid()
-           )",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(admin_state, "running");
+    assert_eq!(startup_state, "running");
     let claimed_job: String = sqlx::query_scalar(
         "SELECT job_id::text
            FROM ops.claim_job_for_types(
@@ -716,7 +728,7 @@ async fn readiness_is_sanitized_read_only_and_requires_api_reader(
         .await
         .map_err(db_error)?;
     assert_eq!(report.postgres_major, 18);
-    assert_eq!(report.schema_revision, "0050");
+    assert_eq!(report.schema_revision, "0052");
     assert_eq!(
         report.extensions,
         ["pg_stat_statements", "pg_trgm", "unaccent"]
@@ -741,7 +753,7 @@ async fn readiness_rejects_an_extra_successful_migration(owner_pool: PgPool) -> 
     sqlx::query(
         "INSERT INTO ops._sqlx_migrations(
              version, description, installed_on, success, checksum, execution_time
-         ) VALUES (51, 'unexpected', clock_timestamp(), true, decode('00', 'hex'), 0)",
+         ) VALUES (53, 'unexpected', clock_timestamp(), true, decode('00', 'hex'), 0)",
     )
     .execute(&owner_pool)
     .await?;
@@ -753,7 +765,7 @@ async fn readiness_rejects_a_failed_migration_row(owner_pool: PgPool) -> sqlx::R
     sqlx::query(
         "INSERT INTO ops._sqlx_migrations(
              version, description, installed_on, success, checksum, execution_time
-         ) VALUES (51, 'failed', clock_timestamp(), false, decode('00', 'hex'), 0)",
+         ) VALUES (53, 'failed', clock_timestamp(), false, decode('00', 'hex'), 0)",
     )
     .execute(&owner_pool)
     .await?;
@@ -912,7 +924,7 @@ async fn representative_version_one_database_upgrades_through_two_three_and_four
     MIGRATOR
         .run(&owner_pool)
         .await
-        .map_err(|_| test_error("0001 fixture did not upgrade through 0050"))?;
+        .map_err(|_| test_error("0001 fixture did not upgrade through 0052"))?;
     let upgraded_versions: Vec<i64> = sqlx::query_scalar(
         "SELECT version FROM ops._sqlx_migrations WHERE success ORDER BY version",
     )
@@ -923,7 +935,7 @@ async fn representative_version_one_database_upgrades_through_two_three_and_four
         [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49, 50
+            47, 48, 49, 50, 51, 52
         ]
     );
 
@@ -1055,7 +1067,7 @@ async fn representative_version_one_database_upgrades_through_two_three_and_four
         sqlx::query_scalar("SELECT count(*) FROM ops._sqlx_migrations WHERE success")
             .fetch_one(&owner_pool)
             .await?;
-    assert_eq!(repeat_count, 50);
+    assert_eq!(repeat_count, 52);
     let scheduler_table: Option<String> =
         sqlx::query_scalar("SELECT to_regclass('ops.scheduler_runs')::text")
             .fetch_one(&owner_pool)
@@ -1120,7 +1132,7 @@ async fn representative_version_one_database_upgrades_through_two_three_and_four
             .await
             .map_err(db_error)?
             .schema_revision,
-        "0050"
+        "0052"
     );
     Ok(())
 }
@@ -1277,7 +1289,7 @@ async fn round_one_three_database_is_repaired_by_four(owner_pool: PgPool) -> sql
     let report = migrate(&migrator_pool, TEST_SHARED_DATABASE_OWNER)
         .await
         .map_err(db_error)?;
-    assert_eq!(report.applied, 47);
+    assert_eq!(report.applied, 49);
 
     let versions: Vec<i64> = sqlx::query_scalar(
         "SELECT version FROM ops._sqlx_migrations WHERE success ORDER BY version",
@@ -1289,7 +1301,7 @@ async fn round_one_three_database_is_repaired_by_four(owner_pool: PgPool) -> sql
         [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49, 50
+            47, 48, 49, 50, 51, 52
         ]
     );
     let claimable_exists: bool = sqlx::query_scalar(
@@ -1489,7 +1501,7 @@ async fn round_one_three_database_is_repaired_by_four(owner_pool: PgPool) -> sql
         sqlx::query_scalar::<_, String>("SELECT schema_revision FROM ops.readiness")
             .fetch_one(&owner_pool)
             .await?,
-        "0050"
+        "0052"
     );
     migrator_pool.close().await;
     Ok(())
@@ -1510,7 +1522,7 @@ async fn actual_migrator_applies_once_then_preserves_snapshot(
             .await
             .map_err(db_error)?
             .applied,
-        50
+        52
     );
     let first = foundation_snapshot(&migrator_pool).await?;
     sqlx::query(
@@ -1632,9 +1644,142 @@ async fn actual_migrator_applies_once_then_preserves_snapshot(
             .iter()
             .any(|line| line == "seed|job|ingest.trending|1|true")
     );
-    assert!(first.iter().any(|line| line == "seed|metadata|schema|0050"));
+    assert!(first.iter().any(|line| line == "seed|metadata|schema|0052"));
 
     migrator_pool.close().await;
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+async fn catalog_recovery_migration_preserves_completed_enrichment(
+    owner_pool: PgPool,
+) -> sqlx::Result<()> {
+    grant_generated_database_create(&owner_pool).await?;
+    MIGRATOR
+        .run_to(50, &owner_pool)
+        .await
+        .map_err(|_| test_error("migration 0050 fixture setup failed"))?;
+
+    sqlx::query(
+        "INSERT INTO catalog.titles (media_type, tmdb_id, display_title)
+         VALUES ('movie', 51, 'Complete movie'),
+                ('movie', 52, 'Incomplete movie'),
+                ('tv', 700, 'Complete TV')",
+    )
+    .execute(&owner_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO catalog.seasons (id, title_id, media_type, season_number)
+         SELECT 1000 + season_number, id, 'tv', season_number
+           FROM catalog.titles
+          CROSS JOIN generate_series(1, 2) AS season_number
+          WHERE media_type = 'tv' AND tmdb_id = 700",
+    )
+    .execute(&owner_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO ops.jobs (
+             id, job_type, payload_version, payload, status, attempts,
+             max_attempts, available_at, dedup_key, result_summary, created_at,
+             updated_at, finished_at
+         ) VALUES
+             (gen_random_uuid(), 'ingest.enrich_movie', 1,
+              '{\"tmdb_id\":51}'::jsonb, 'succeeded', 1, 8,
+              statement_timestamp() - interval '1 second',
+              'migration-enrich-movie', '{}'::jsonb,
+              statement_timestamp() - interval '1 second', statement_timestamp(),
+              statement_timestamp()),
+             (gen_random_uuid(), 'ingest.enrich_tv', 1,
+              '{\"tmdb_id\":700}'::jsonb, 'succeeded', 1, 8,
+              statement_timestamp() - interval '1 second',
+              'migration-enrich-tv', '{}'::jsonb,
+              statement_timestamp() - interval '1 second', statement_timestamp(),
+              statement_timestamp()),
+             (gen_random_uuid(), 'ingest.refresh_season', 1,
+              '{\"tv_id\":700,\"season_number\":1}'::jsonb,
+              'succeeded', 1, 8, statement_timestamp() - interval '1 second',
+              'migration-refresh-season', '{}'::jsonb,
+              statement_timestamp() - interval '1 second', statement_timestamp(),
+              statement_timestamp())",
+    )
+    .execute(&owner_pool)
+    .await?;
+
+    MIGRATOR
+        .run_to(51, &owner_pool)
+        .await
+        .map_err(|_| test_error("migration 0051 application failed"))?;
+    sqlx::query(
+        "INSERT INTO source.tmdb_documents (endpoint_path, response)
+         VALUES ('movie/51', '{\"id\":51,\"title\":\"Complete movie\"}')",
+    )
+    .execute(&owner_pool)
+    .await?;
+    sqlx::query(
+        "WITH asset AS (
+             INSERT INTO assets.image_assets (
+                 title_id, image_kind, source, source_key, source_url,
+                 source_mime_type, source_width, source_height,
+                 source_file_size_bytes, source_sha256, source_storage_path,
+                 storage_path, mime_type, width, height, file_size_bytes,
+                 sha256, status, downloaded_at
+             )
+             SELECT id, 'poster', 'tmdb', '/legacy.jpg',
+                    'https://image.tmdb.org/t/p/original/legacy.jpg',
+                    'image/jpeg', 1000, 1500, 3, repeat('a', 64),
+                    'movies/51/posters/poster.jpg',
+                    'movies/51/optimized/posters/poster-w640.jpg',
+                    'image/jpeg', 640, 960, 3, repeat('b', 64),
+                    'ready', clock_timestamp()
+               FROM catalog.titles WHERE tmdb_id = 51
+             RETURNING id
+         )
+         INSERT INTO assets.image_variants (
+             image_asset_id, variant_key, storage_path, mime_type,
+             width, height, file_size_bytes, sha256
+         )
+         SELECT id, 'jpeg_w640',
+                'movies/51/optimized/posters/poster-w640.jpg',
+                'image/jpeg', 640, 960, 3, repeat('b', 64)
+           FROM asset",
+    )
+    .execute(&owner_pool)
+    .await?;
+
+    MIGRATOR
+        .run(&owner_pool)
+        .await
+        .map_err(|_| test_error("migration 0052 application failed"))?;
+
+    let title_state: Vec<(i64, bool)> = sqlx::query_as(
+        "SELECT tmdb_id, enriched_at IS NOT NULL
+           FROM catalog.titles
+          ORDER BY tmdb_id",
+    )
+    .fetch_all(&owner_pool)
+    .await?;
+    assert_eq!(title_state, [(51, true), (52, false), (700, true)]);
+    let season_state: Vec<(i32, bool)> = sqlx::query_as(
+        "SELECT season_number, enriched_at IS NOT NULL
+           FROM catalog.seasons
+          ORDER BY season_number",
+    )
+    .fetch_all(&owner_pool)
+    .await?;
+    assert_eq!(season_state, [(1, true), (2, false)]);
+    let preserved_document: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM source.tmdb_documents WHERE endpoint_path = 'movie/51'",
+    )
+    .fetch_one(&owner_pool)
+    .await?;
+    assert_eq!(preserved_document, 1);
+    let removed_media: (i64, bool) = sqlx::query_as(
+        "SELECT count(*), to_regclass('assets.image_variants') IS NULL
+           FROM assets.image_assets",
+    )
+    .fetch_one(&owner_pool)
+    .await?;
+    assert_eq!(removed_media, (0, true));
     Ok(())
 }
 
@@ -1667,7 +1812,7 @@ async fn concurrent_actual_migrators_report_exactly_one_application(
         second.map_err(db_error)?.applied,
     ];
     applied.sort_unstable();
-    assert_eq!(applied, [0, 50]);
+    assert_eq!(applied, [0, 52]);
 
     first_pool.close().await;
     second_pool.close().await;

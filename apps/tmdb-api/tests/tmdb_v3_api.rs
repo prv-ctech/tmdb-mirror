@@ -121,7 +121,7 @@ async fn v3_routes_return_captured_tmdb_json_and_tmdb_not_found_shape(
     assert_eq!(movie_body["poster_path"], "/poster.jpg");
     assert_eq!(
         movie_body["local_poster_path"],
-        "http://media.test/media/movies/42/posters/poster.jpg"
+        "http://media.test/media/movies/42/posters/poster.jpg?v=aaaaaaaaaaaaaaaa"
     );
     assert_eq!(movie_body["backdrop_path"], "/missing.jpg");
     assert!(movie_body["local_backdrop_path"].is_null());
@@ -131,7 +131,7 @@ async fn v3_routes_return_captured_tmdb_json_and_tmdb_not_found_shape(
     );
     assert_eq!(
         movie_body["images"]["posters"][0]["local_file_path"],
-        "http://media.test/media/movies/42/posters/poster.jpg"
+        "http://media.test/media/movies/42/posters/poster.jpg?v=aaaaaaaaaaaaaaaa"
     );
     assert_eq!(
         movie_body["images"]["posters"][1]["file_path"],

@@ -38,9 +38,13 @@ repository work, not the current health of a running deployment.
 
 ## Scan controls
 
-- [x] Keep worker startup idle until an authenticated admin action starts it.
+- [x] Start both workers in queue-draining state while retaining authenticated
+  start, pause, resume, and cancel controls.
 - [x] Bound export and missing-catalog fan-out with cursor continuations.
-- [x] Add explicit `full_sweep`, `missing_only`, `prune_cleanup`, and
-  `daily_sync` catalog modes.
+- [x] Add explicit `full_sweep`, `missing_only`, `recovery`, `prune_cleanup`,
+  `daily_sync`, and `reconcile` catalog modes with durable schedules for the
+  three incremental/repair modes.
+- [x] Replace global media scans/audits with durable one-to-100-title
+  `/admin/v1/media/requests`, bounded expansion, and exact CDN renditions.
 - [x] Run the Docker Desktop stress matrix against the current local image.
 - [x] Verify the live catalog queue remains bounded during a real TMDB scan.

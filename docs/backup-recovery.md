@@ -8,10 +8,10 @@ untrusted container.
 ## Normal operation
 
 WAL archiving is enabled with `wal_level=replica`, `archive_mode=on`, and
-pgBackRest's archive command. The built-in PostgreSQL runner uses
-`TZ=America/New_York`:
+pgBackRest's archive command. The built-in PostgreSQL runner uses the configured
+`TZ`; `.env.example` defaults it to `America/New_York`:
 
-| Local time | Backup |
+| Configured local time | Backup |
 | --- | --- |
 | Sunday 05:00 | Full |
 | Monday–Friday 05:00 | Differential |
@@ -34,13 +34,13 @@ admin_key='<TMDB_ADMIN_API_KEY>'
 curl -sS -X POST "$admin_base/admin/v1/backups" \
   -H "X-API-Key: $admin_key" \
   -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: backup-full-20260803' \
+  -H 'Idempotency-Key: backup-full-example-001' \
   -d '{"type":"full"}'
 
 curl -sS -X POST "$admin_base/admin/v1/backups" \
   -H "X-API-Key: $admin_key" \
   -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: backup-differential-20260803' \
+  -H 'Idempotency-Key: backup-differential-example-001' \
   -d '{"type":"differential"}'
 
 curl -sS "$admin_base/admin/v1/backups" \
@@ -90,7 +90,7 @@ Start PostgreSQL against that replacement volume, validate the selected data
 point with application queries, then switch the Compose volume mapping only
 after validation. `--type=name` with a previously created restore point is
 also valid when an operator needs a named boundary. All target timestamps are
-UTC even though schedules and terminal logs use America/New_York.
+UTC even though schedules and terminal logs use the configured `TZ`.
 
 The repository has no encryption key because it is a local recovery copy. Use
 storage access controls and add an independently managed off-host backup if

@@ -1,6 +1,6 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{net::SocketAddr, path::Path};
 
 use crate::image::{
     DownloadPolicy, HttpTrawlFallback, ImageDownloader, ImageError, ImageJobPayload, ImageStore,
@@ -8,19 +8,16 @@ use crate::image::{
 };
 use crate::media_server;
 use crate::persistence::persist_ready;
+use crate::requests::{self, CoordinatorConfig};
 use anyhow::Context;
 use async_trait::async_trait;
-use image::GenericImageView;
 use reqwest::Url;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use sqlx::{FromRow, PgPool};
+use sqlx::PgPool;
 use tmdb_config::{ConfigSource, EnvSource, Environment, load_database_for_role};
 use tmdb_db::{PoolPolicy, connect_direct};
 use tmdb_jobs::{
-    ClaimedJob, JobExecutionError, JobExecutor, JobRepository, NewJob, Worker, WorkerConfig,
-    WorkerId,
+    ClaimedJob, JobExecutionError, JobExecutor, JobRepository, Worker, WorkerConfig, WorkerId,
 };
 use tmdb_media::{RuntimeStorageRole, prepare_runtime_storage};
 use tmdb_observability::init_tracing_from_env;
@@ -28,48 +25,14 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const MEDIA_AUDIT_JOB: &str = "admin.media_audit";
-const MEDIA_AUDIT_PAYLOAD_VERSION: i32 = 1;
-const MEDIA_AUDIT_BATCH_SIZE: i64 = 500;
-const MAX_AUDIT_FILE_BYTES: u64 = 32 * 1024 * 1024;
 const COMPONENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-const IMAGE_JOB_TYPES: &[&str] = &[crate::image::IMAGE_JOB_TYPE, MEDIA_AUDIT_JOB, "system.noop"];
+const IMAGE_JOB_TYPES: &[&str] = &[crate::image::IMAGE_JOB_TYPE, "system.noop"];
 const IMAGE_QUEUE_READY_RETRY: Duration = Duration::from_secs(1);
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MediaAuditPayload {
-    repair: bool,
-    #[serde(default)]
-    after_asset_id: Option<i64>,
-    #[serde(default)]
-    run_id: Option<Uuid>,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ImageWorkerJob {
     Noop,
     Download(ImageJobPayload),
-    MediaAudit(MediaAuditPayload),
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MediaAuditSummary {
-    skipped: bool,
-    audited: u64,
-    valid: u64,
-    invalid: u64,
-    repair_queued: u64,
-    unrepairable: u64,
-    next_audit_queued: bool,
-}
-
-fn disabled_media_audit_summary(allow_local_media: bool) -> Option<MediaAuditSummary> {
-    (!allow_local_media).then_some(MediaAuditSummary {
-        skipped: true,
-        ..MediaAuditSummary::default()
-    })
 }
 
 /// Starts the direct-database image worker shell.
@@ -81,6 +44,11 @@ pub async fn run() -> anyhow::Result<()> {
     let environment = load_environment(source)?;
     let database = load_database_for_role(&source, environment, "image_writer")?;
     let worker_config = load_worker_config(source, "tmdb-images")?;
+    let coordinator_config = CoordinatorConfig {
+        worker_id: format!("{}-requests", worker_config.worker_id.as_str()),
+        lease_duration: worker_config.lease_duration,
+        idle_poll_interval: worker_config.idle_poll_interval,
+    };
     let worker_concurrency = load_image_worker_concurrency(source)?;
     let store = load_image_store()?;
     let downloader = load_downloader(source)?;
@@ -139,15 +107,21 @@ pub async fn run() -> anyhow::Result<()> {
         pool.close().await;
         return Ok(());
     }
-    let startup_state: String = sqlx::query_scalar("SELECT ops.stop_worker_on_startup('media')")
+    let startup_state: String = sqlx::query_scalar("SELECT ops.start_worker_on_startup('media')")
         .fetch_one(&pool)
         .await
-        .context("reset media worker state after restart")?;
+        .context("start media worker queue")?;
     tracing::info!(event = "media_worker_control_ready", startup_state);
     let heartbeat = spawn_component_heartbeat(pool.clone(), cancellation.clone());
+    let coordinator = tokio::spawn(requests::run(
+        pool.clone(),
+        coordinator_config,
+        cancellation.clone(),
+    ));
     let result = run_workers(workers, cancellation.clone()).await;
     cancellation.cancel();
     let _ = heartbeat.await;
+    let _ = coordinator.await;
     if let Ok(Err(error)) = media_server.await {
         tracing::error!(event = "media_server_stopped", error = %error);
     }
@@ -236,7 +210,8 @@ async fn image_job_queue_ready(pool: &PgPool) -> sqlx::Result<bool> {
 const IMAGE_JOB_QUEUE_READY_SQL: &str = concat!(
     "SELECT pg_catalog.to_regprocedure('ops.claim_job_for_types(text,bigint,text[])') IS NOT NULL ",
     "AND pg_catalog.to_regprocedure('ops.record_component_heartbeat(text,text)') IS NOT NULL ",
-    "AND pg_catalog.to_regclass('assets.image_variants') IS NOT NULL",
+    "AND pg_catalog.to_regprocedure('ops.claim_media_request(text,bigint)') IS NOT NULL ",
+    "AND pg_catalog.to_regprocedure('assets.select_media_request_sources(uuid,bigint,integer)') IS NOT NULL",
 );
 
 async fn run_workers<E>(
@@ -282,372 +257,6 @@ struct ImageExecutor<T, F = Arc<dyn TrawlFallback>> {
     allow_local_media: bool,
 }
 
-impl<T, F> ImageExecutor<T, F>
-where
-    T: ImageTransport,
-{
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the bounded audit loop keeps validation, repair submission, and continuation state together"
-    )]
-    async fn audit_media(
-        &self,
-        payload: MediaAuditPayload,
-    ) -> Result<MediaAuditSummary, JobExecutionError> {
-        if let Some(summary) = disabled_media_audit_summary(self.allow_local_media) {
-            tracing::info!(
-                event = "media_audit_skipped",
-                reason = "local_media_disabled",
-                repair_requested = payload.repair,
-            );
-            return Ok(summary);
-        }
-        let after_asset_id = payload.after_asset_id.unwrap_or_default();
-        let rows = sqlx::query_as::<_, MediaAuditAssetRow>(
-            "SELECT asset.id,
-                    asset.source_key,
-                    asset.source_url,
-                    asset.storage_path,
-                    asset.mime_type,
-                    asset.width,
-                    asset.height,
-                    asset.file_size_bytes,
-                    asset.sha256,
-                    asset.image_kind,
-                    asset.gallery_index,
-                    asset.iso_639_1 AS language,
-                    CASE
-                        WHEN asset.title_id IS NOT NULL THEN title.media_type
-                        WHEN asset.person_id IS NOT NULL THEN 'person'
-                        WHEN asset.company_id IS NOT NULL THEN 'company'
-                        WHEN asset.network_id IS NOT NULL THEN 'network'
-                        WHEN asset.collection_id IS NOT NULL THEN 'collection'
-                        WHEN asset.season_id IS NOT NULL THEN 'season'
-                        WHEN asset.episode_id IS NOT NULL THEN 'episode'
-                    END AS entity_type,
-                    CASE
-                        WHEN asset.title_id IS NOT NULL THEN title.tmdb_id
-                        ELSE asset.owner_id
-                    END AS entity_id,
-                    season.season_number,
-                    episode.episode_number,
-                    COALESCE(season_title.tmdb_id, episode_title.tmdb_id) AS title_tmdb_id
-               FROM assets.image_assets AS asset
-               LEFT JOIN catalog.titles AS title ON title.id = asset.title_id
-               LEFT JOIN catalog.seasons AS season ON season.id = asset.season_id
-               LEFT JOIN catalog.titles AS season_title ON season_title.id = season.title_id
-               LEFT JOIN catalog.episodes AS episode ON episode.id = asset.episode_id
-               LEFT JOIN catalog.titles AS episode_title ON episode_title.id = episode.title_id
-              WHERE asset.status = 'ready'
-                AND asset.id > $1
-              ORDER BY asset.id
-              LIMIT $2",
-        )
-        .bind(after_asset_id)
-        .bind(MEDIA_AUDIT_BATCH_SIZE)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
-
-        let canonical_root = tokio::fs::canonicalize(tmdb_media::MEDIA_ROOT)
-            .await
-            .map_err(|_| JobExecutionError::retry("media_unavailable", Duration::from_secs(5)))?;
-        let repository = JobRepository::new(self.pool.clone());
-        let mut summary = MediaAuditSummary::default();
-        for row in &rows {
-            summary.audited += 1;
-            let primary_valid = verify_primary_asset(&canonical_root, row).await;
-            let variants_valid = verify_asset_variants(&self.pool, &canonical_root, row.id).await?;
-            if primary_valid && variants_valid {
-                summary.valid += 1;
-                continue;
-            }
-            summary.invalid += 1;
-            if payload.repair && self.allow_local_media {
-                match repair_job(row) {
-                    Some(job) => match repository.submit(job).await {
-                        Ok(_) => summary.repair_queued += 1,
-                        Err(_) => {
-                            return Err(JobExecutionError::retry(
-                                "database_unavailable",
-                                Duration::from_secs(5),
-                            ));
-                        }
-                    },
-                    None => summary.unrepairable += 1,
-                }
-            }
-        }
-        if i64::try_from(rows.len()).ok() == Some(MEDIA_AUDIT_BATCH_SIZE) {
-            let last_asset_id = rows.last().map(|row| row.id).ok_or_else(|| {
-                JobExecutionError::retry("execution_failed", Duration::from_secs(5))
-            })?;
-            let mut follow_up_payload = json!({
-                "repair": payload.repair,
-                "afterAssetId": last_asset_id
-            });
-            if let Some(run_id) = payload.run_id {
-                follow_up_payload["runId"] = json!(run_id);
-            }
-            let scan_key = payload
-                .run_id
-                .map_or_else(|| "standalone".to_owned(), |run_id| run_id.to_string());
-            let follow_up = NewJob::new(
-                MEDIA_AUDIT_JOB,
-                MEDIA_AUDIT_PAYLOAD_VERSION,
-                follow_up_payload,
-                &format!(
-                    "admin.media_audit:{scan_key}:{}:{last_asset_id}",
-                    payload.repair
-                ),
-            )
-            .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
-            let outcome = repository.submit(follow_up).await.map_err(|_| {
-                JobExecutionError::retry("database_unavailable", Duration::from_secs(5))
-            })?;
-            if let Some(run_id) = payload.run_id {
-                sqlx::query_scalar::<_, bool>("SELECT ops.link_media_scan_audit_job($1, $2)")
-                    .bind(run_id)
-                    .bind(outcome.job_id().as_uuid())
-                    .fetch_one(&self.pool)
-                    .await
-                    .map_err(|_| {
-                        JobExecutionError::retry("database_unavailable", Duration::from_secs(5))
-                    })?;
-            }
-            summary.next_audit_queued = true;
-        }
-        tracing::info!(
-            event = "media_audit_completed",
-            audited = summary.audited,
-            valid = summary.valid,
-            invalid = summary.invalid,
-            repair_queued = summary.repair_queued,
-            unrepairable = summary.unrepairable,
-            next_audit_queued = summary.next_audit_queued,
-        );
-        Ok(summary)
-    }
-}
-
-#[derive(Clone, Debug, FromRow)]
-struct MediaAuditAssetRow {
-    id: i64,
-    source_key: String,
-    source_url: Option<String>,
-    storage_path: Option<String>,
-    mime_type: Option<String>,
-    width: Option<i32>,
-    height: Option<i32>,
-    file_size_bytes: Option<i64>,
-    sha256: Option<String>,
-    image_kind: String,
-    gallery_index: i16,
-    language: Option<String>,
-    entity_type: Option<String>,
-    entity_id: Option<i64>,
-    season_number: Option<i32>,
-    episode_number: Option<i32>,
-    title_tmdb_id: Option<i64>,
-}
-
-#[derive(Clone, Debug, FromRow)]
-struct MediaAuditVariantRow {
-    storage_path: String,
-    mime_type: String,
-    width: i32,
-    height: i32,
-    file_size_bytes: i64,
-    sha256: String,
-}
-
-async fn verify_asset_variants(
-    pool: &PgPool,
-    canonical_root: &Path,
-    asset_id: i64,
-) -> Result<bool, JobExecutionError> {
-    let variants = sqlx::query_as::<_, MediaAuditVariantRow>(
-        "SELECT storage_path, mime_type, width, height, file_size_bytes, sha256
-           FROM assets.image_variants
-          WHERE image_asset_id = $1
-          ORDER BY variant_key",
-    )
-    .bind(asset_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
-    for variant in variants {
-        if !verify_media_file(
-            canonical_root,
-            &variant.storage_path,
-            &variant.mime_type,
-            variant.width,
-            variant.height,
-            variant.file_size_bytes,
-            &variant.sha256,
-        )
-        .await
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-async fn verify_primary_asset(canonical_root: &Path, row: &MediaAuditAssetRow) -> bool {
-    let (
-        Some(storage_path),
-        Some(mime_type),
-        Some(width),
-        Some(height),
-        Some(file_size_bytes),
-        Some(sha256),
-    ) = (
-        row.storage_path.as_deref(),
-        row.mime_type.as_deref(),
-        row.width,
-        row.height,
-        row.file_size_bytes,
-        row.sha256.as_deref(),
-    )
-    else {
-        return false;
-    };
-    verify_media_file(
-        canonical_root,
-        storage_path,
-        mime_type,
-        width,
-        height,
-        file_size_bytes,
-        sha256,
-    )
-    .await
-}
-
-async fn verify_media_file(
-    canonical_root: &Path,
-    storage_path: &str,
-    mime_type: &str,
-    width: i32,
-    height: i32,
-    file_size_bytes: i64,
-    sha256: &str,
-) -> bool {
-    if !tmdb_media::is_public_relative(storage_path)
-        || !matches!(
-            mime_type,
-            "image/jpeg" | "image/png" | "image/webp" | "image/gif"
-        )
-        || width <= 0
-        || height <= 0
-        || file_size_bytes <= 0
-        || u64::try_from(file_size_bytes)
-            .ok()
-            .is_none_or(|size| size > MAX_AUDIT_FILE_BYTES)
-        || sha256.len() != 64
-        || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return false;
-    }
-    let candidate = canonical_root.join(storage_path);
-    let canonical_file = match tokio::fs::canonicalize(candidate).await {
-        Ok(file) if file.starts_with(canonical_root) => file,
-        Ok(_) | Err(_) => return false,
-    };
-    let metadata = match tokio::fs::metadata(&canonical_file).await {
-        Ok(metadata) if metadata.is_file() => metadata,
-        Ok(_) | Err(_) => return false,
-    };
-    if metadata.len() != u64::try_from(file_size_bytes).unwrap_or_default()
-        || mime_type_for_path(&canonical_file) != Some(mime_type)
-    {
-        return false;
-    }
-    let bytes = match tokio::fs::read(&canonical_file).await {
-        Ok(bytes) if bytes.len() as u64 == metadata.len() => bytes,
-        Ok(_) | Err(_) => return false,
-    };
-    let Ok(Ok(dimensions)) = tokio::task::spawn_blocking({
-        let bytes = bytes.clone();
-        move || image::load_from_memory(&bytes).map(|decoded| decoded.dimensions())
-    })
-    .await
-    else {
-        return false;
-    };
-    if dimensions != (width.cast_unsigned(), height.cast_unsigned()) {
-        return false;
-    }
-    let actual = Sha256::digest(bytes);
-    hex_digest_matches(&actual, sha256)
-}
-
-fn hex_digest_matches(digest: &[u8], expected: &str) -> bool {
-    let mut actual = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut actual, "{byte:02x}");
-    }
-    actual.eq_ignore_ascii_case(expected)
-}
-
-fn mime_type_for_path(path: &Path) -> Option<&'static str> {
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("jpg" | "jpeg") => Some("image/jpeg"),
-        Some("png") => Some("image/png"),
-        Some("webp") => Some("image/webp"),
-        Some("gif") => Some("image/gif"),
-        _ => None,
-    }
-}
-
-fn repair_job(row: &MediaAuditAssetRow) -> Option<NewJob> {
-    let entity_type = row.entity_type.as_deref()?;
-    let entity_id = row.entity_id?;
-    let season_number = row
-        .season_number
-        .and_then(|number| u32::try_from(number).ok());
-    let episode_number = row
-        .episode_number
-        .and_then(|number| u16::try_from(number).ok());
-    let mut value = json!({
-        "schemaVersion": crate::image::IMAGE_JOB_PAYLOAD_VERSION,
-        "entityType": entity_type,
-        "entityId": entity_id,
-        "kind": row.image_kind,
-        "tmdbPath": row.source_key,
-        "sourceUrl": row.source_url,
-        "language": row.language,
-        "sourceRevision": Value::Null,
-        "seasonNumber": season_number,
-        "episodeNumber": episode_number,
-        "titleTmdbId": row.title_tmdb_id,
-        "assetIndex": row.gallery_index,
-    });
-    let payload = ImageJobPayload::from_json(&value).ok()?;
-    value = payload.to_json().ok()?;
-    let dedup_key = format!(
-        "image:{entity_type}:{entity_id}:{}:{}:{}",
-        row.image_kind,
-        row.gallery_index,
-        source_digest(&row.source_key),
-    );
-    NewJob::new(
-        crate::image::IMAGE_JOB_TYPE,
-        crate::image::IMAGE_JOB_PAYLOAD_VERSION,
-        value,
-        &dedup_key,
-    )
-    .and_then(|job| job.with_priority(50))
-    .and_then(|job| job.with_max_attempts(8))
-    .ok()
-}
-
-fn source_digest(source_key: &str) -> String {
-    format!("{:x}", Sha256::digest(source_key.as_bytes()))
-}
-
 #[async_trait]
 impl<T> JobExecutor for ImageExecutor<T>
 where
@@ -665,16 +274,7 @@ where
         let worker_job =
             parse_image_worker_job(job.job_type(), job.payload_version(), job.payload())?;
         let ImageWorkerJob::Download(payload) = worker_job else {
-            return match worker_job {
-                ImageWorkerJob::Noop => Ok(json!({"ok": true})),
-                ImageWorkerJob::MediaAudit(payload) => {
-                    let summary = self.audit_media(payload).await?;
-                    serde_json::to_value(summary).map_err(|_| {
-                        JobExecutionError::retry("execution_failed", Duration::from_secs(5))
-                    })
-                }
-                ImageWorkerJob::Download(_) => unreachable!(),
-            };
+            return Ok(json!({"ok": true}));
         };
         tracing::debug!(
             event = "image_job_started",
@@ -685,12 +285,12 @@ where
             image_kind = image_kind_name(payload.kind),
         );
         if !self.allow_local_media {
-            tracing::debug!(
-                event = "image_job_skipped",
+            tracing::error!(
+                event = "image_job_rejected",
                 job_id = %job.job_id().as_uuid(),
                 reason = "local_media_disabled",
             );
-            return Ok(json!({"skipped": "local_media_disabled"}));
+            return Err(JobExecutionError::dead_letter("local_media_disabled"));
         }
         {
             let image = match self.downloader.download(&payload).await {
@@ -787,14 +387,6 @@ fn parse_image_worker_job(
 ) -> Result<ImageWorkerJob, JobExecutionError> {
     if job_type == "system.noop" && payload_version == 1 {
         return Ok(ImageWorkerJob::Noop);
-    }
-    if job_type == MEDIA_AUDIT_JOB && payload_version == MEDIA_AUDIT_PAYLOAD_VERSION {
-        let parsed: MediaAuditPayload = serde_json::from_value(payload.clone())
-            .map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
-        if parsed.after_asset_id.is_some_and(|id| id <= 0) {
-            return Err(JobExecutionError::dead_letter("invalid_payload"));
-        }
-        return Ok(ImageWorkerJob::MediaAudit(parsed));
     }
     if job_type != crate::image::IMAGE_JOB_TYPE
         || payload_version != crate::image::IMAGE_JOB_PAYLOAD_VERSION
@@ -901,7 +493,6 @@ fn storage_error_reason(error: &StorageError) -> &'static str {
         StorageError::DigestMismatch => "digest_mismatch",
         StorageError::Io { .. } => "io",
         StorageError::DestinationConflict => "destination_conflict",
-        StorageError::Derivative => "derivative_failed",
     }
 }
 
@@ -1101,7 +692,7 @@ mod tests {
     #[test]
     fn image_queue_readiness_sql_keeps_boolean_terms_separated() {
         assert!(!IMAGE_JOB_QUEUE_READY_SQL.contains("NULLAND"));
-        assert_eq!(IMAGE_JOB_QUEUE_READY_SQL.matches(" AND ").count(), 2);
+        assert_eq!(IMAGE_JOB_QUEUE_READY_SQL.matches(" AND ").count(), 3);
     }
 
     #[test]
@@ -1125,97 +716,11 @@ mod tests {
             parse_image_worker_job("system.noop", 1, &json!({}))?,
             ImageWorkerJob::Noop
         ));
-        assert!(matches!(
-            parse_image_worker_job(
-                MEDIA_AUDIT_JOB,
-                1,
-                &json!({"repair": true, "runId": "019fd066-b5a8-7d33-adb4-a7b666d15c7b"})
-            )?,
-            ImageWorkerJob::MediaAudit(MediaAuditPayload {
-                repair: true,
-                after_asset_id: None,
-                run_id: Some(_),
-            })
-        ));
         assert!(parse_image_worker_job(crate::image::IMAGE_JOB_TYPE, 2, &value).is_err());
         assert!(parse_image_worker_job(crate::image::IMAGE_JOB_TYPE, 1, &json!({})).is_err());
-        assert!(
-            parse_image_worker_job(
-                MEDIA_AUDIT_JOB,
-                1,
-                &json!({"repair": true, "rawSql": "DROP"})
-            )
-            .is_err()
-        );
+        assert!(parse_image_worker_job("media.audit", 1, &json!({})).is_err());
+        assert!(parse_image_worker_job("admin.media_scan", 1, &json!({})).is_err());
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn media_audit_verifies_exact_file_metadata_without_paths_outside_media()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let root = tempfile::tempdir()?;
-        let public_dir = root.path().join("movies/1");
-        tokio::fs::create_dir_all(&public_dir).await?;
-        let mut encoded = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::new_rgb8(8, 4).write_to(&mut encoded, image::ImageFormat::Jpeg)?;
-        let bytes = encoded.into_inner();
-        let path = public_dir.join("posters/poster.jpg");
-        tokio::fs::create_dir_all(path.parent().ok_or("poster path has no parent")?).await?;
-        tokio::fs::write(&path, &bytes).await?;
-        let root = tokio::fs::canonicalize(root.path()).await?;
-        let digest = format!("{:x}", Sha256::digest(&bytes));
-        assert!(
-            verify_media_file(
-                &root,
-                "movies/1/posters/poster.jpg",
-                "image/jpeg",
-                8,
-                4,
-                i64::try_from(bytes.len())?,
-                &digest,
-            )
-            .await
-        );
-        assert!(
-            !verify_media_file(
-                &root,
-                "../cover.jpg",
-                "image/jpeg",
-                8,
-                4,
-                i64::try_from(bytes.len())?,
-                &digest,
-            )
-            .await
-        );
-        assert!(
-            !verify_media_file(
-                &root,
-                "movies/1/posters/poster.jpg",
-                "image/jpeg",
-                8,
-                4,
-                i64::try_from(bytes.len())?,
-                &"0".repeat(64),
-            )
-            .await
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn media_audit_is_skipped_when_local_media_is_disabled() {
-        let maybe_summary = disabled_media_audit_summary(false);
-        assert!(
-            maybe_summary.is_some(),
-            "disabled media must produce an audit summary"
-        );
-        let Some(summary) = maybe_summary else {
-            return;
-        };
-        assert!(summary.skipped);
-        assert_eq!(summary.audited, 0);
-        assert_eq!(summary.repair_queued, 0);
     }
 
     #[test]
@@ -1299,7 +804,14 @@ mod tests {
         assert!(!image_job_queue_ready(&pool).await?);
 
         sqlx::query("CREATE SCHEMA assets").execute(&pool).await?;
-        sqlx::query("CREATE TABLE assets.image_variants (id bigint PRIMARY KEY)")
+        sqlx::query(
+            "CREATE FUNCTION ops.claim_media_request(text, bigint) RETURNS boolean LANGUAGE sql AS $$ SELECT true $$",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "CREATE FUNCTION assets.select_media_request_sources(uuid, bigint, integer) RETURNS boolean LANGUAGE sql AS $$ SELECT true $$",
+        )
             .execute(&pool)
             .await?;
         sqlx::query(

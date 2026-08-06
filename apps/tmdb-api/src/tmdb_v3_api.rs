@@ -216,6 +216,13 @@ const LOCAL_MEDIA_FIELDS: &[(&str, &str)] = &[
 struct LocalMediaPathRow {
     source_key: String,
     storage_path: String,
+    sha256: String,
+}
+
+#[derive(Debug)]
+struct LocalMediaPath {
+    storage_path: String,
+    sha256: String,
 }
 
 async fn add_local_media_paths(
@@ -228,10 +235,11 @@ async fn add_local_media_paths(
     let mut local_paths = HashMap::new();
     if !source_keys.is_empty() {
         let rows = sqlx::query_as::<_, LocalMediaPathRow>(
-            "SELECT source_key, storage_path
+            "SELECT source_key, storage_path, sha256
                FROM assets.image_assets
               WHERE status = 'ready'
                 AND storage_path IS NOT NULL
+                AND sha256 IS NOT NULL
                 AND source_key = ANY($1::text[])
               ORDER BY id",
         )
@@ -239,9 +247,10 @@ async fn add_local_media_paths(
         .fetch_all(&state.read_pool)
         .await?;
         for row in rows {
-            local_paths
-                .entry(row.source_key)
-                .or_insert(row.storage_path);
+            local_paths.entry(row.source_key).or_insert(LocalMediaPath {
+                storage_path: row.storage_path,
+                sha256: row.sha256,
+            });
         }
     }
     insert_local_media_paths(&mut value, state.media_base_url.as_deref(), &local_paths);
@@ -275,7 +284,7 @@ fn collect_media_source_keys(value: &Value, source_keys: &mut HashSet<String>) {
 fn insert_local_media_paths(
     value: &mut Value,
     media_base_url: Option<&str>,
-    local_paths: &HashMap<String, String>,
+    local_paths: &HashMap<String, LocalMediaPath>,
 ) {
     match value {
         Value::Array(values) => {
@@ -291,9 +300,15 @@ fn insert_local_media_paths(
                         .as_str()
                         .filter(|source_key| is_tmdb_source_key(source_key))
                         .and_then(|source_key| local_paths.get(source_key))
-                        .filter(|storage_path| is_safe_storage_path(storage_path))
-                        .and_then(|storage_path| {
-                            media_base_url.map(|base| format!("{base}/{storage_path}"))
+                        .filter(|local| {
+                            is_safe_storage_path(&local.storage_path)
+                                && local.sha256.len() == 64
+                                && local.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+                        .and_then(|local| {
+                            media_base_url.map(|base| {
+                                format!("{base}/{}?v={}", local.storage_path, &local.sha256[..16])
+                            })
                         });
                     additions.push((
                         local_field.to_owned(),

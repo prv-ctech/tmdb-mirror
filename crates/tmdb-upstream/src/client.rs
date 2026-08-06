@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
+use chrono::NaiveDate;
 use http::{HeaderMap, StatusCode, header::RETRY_AFTER};
 use reqwest::{Client, Url};
 use secrecy::{ExposeSecret, SecretString};
@@ -721,13 +722,41 @@ impl TmdbClient {
         media_type: MediaType,
         page: u32,
     ) -> Result<(Value, ChangePage), TmdbClientError> {
+        self.fetch_changes_window_with_raw(media_type, page, None, None)
+            .await
+    }
+
+    /// Fetches one changed-ID page for an optional inclusive date window.
+    /// TMDB permits at most fourteen calendar days per request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TmdbClientError::InvalidPath`] for invalid pages or windows,
+    /// otherwise a sanitized transport, HTTP, policy, or JSON-decoding error.
+    pub async fn fetch_changes_window_with_raw(
+        &self,
+        media_type: MediaType,
+        page: u32,
+        start_date: Option<NaiveDate>,
+        end_date: Option<NaiveDate>,
+    ) -> Result<(Value, ChangePage), TmdbClientError> {
         if page == 0 {
             return Err(TmdbClientError::InvalidPath);
         }
+        if start_date.is_some() != end_date.is_some()
+            || start_date
+                .zip(end_date)
+                .is_some_and(|(start, end)| start > end || (end - start).num_days() > 13)
+        {
+            return Err(TmdbClientError::InvalidPath);
+        }
         let path = format!("{media_type}/changes");
-        let raw: Value = self
-            .fetch_json(&path, &[("page", page.to_string())], true)
-            .await?;
+        let mut query = vec![("page", page.to_string())];
+        if let Some((start_date, end_date)) = start_date.zip(end_date) {
+            query.push(("start_date", start_date.format("%Y-%m-%d").to_string()));
+            query.push(("end_date", end_date.format("%Y-%m-%d").to_string()));
+        }
+        let raw: Value = self.fetch_json(&path, &query, true).await?;
         let changes =
             serde_json::from_value(raw.clone()).map_err(|_| TmdbClientError::MalformedJson {
                 endpoint: bounded_endpoint(&path),

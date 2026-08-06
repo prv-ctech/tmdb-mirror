@@ -95,15 +95,15 @@ async fn repair_application_role_grants(connection: &mut PgConnection) -> Result
         "GRANT SELECT ON TABLE ops.jobs TO ingest_writer",
         "REVOKE INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA search FROM ingest_writer",
         "GRANT USAGE ON SCHEMA assets, ops TO image_writer",
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA assets TO image_writer",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE assets.image_assets TO image_writer",
         "GRANT EXECUTE ON FUNCTION ops.submit_job(uuid, text, integer, text, smallint, integer, timestamptz, text) TO image_writer",
         "GRANT EXECUTE ON FUNCTION ops.job_cancellation_requested(uuid, text) TO ingest_writer, image_writer",
         "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA catalog, source, search TO ingest_writer",
-        "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA assets TO image_writer",
+        "GRANT USAGE, SELECT, UPDATE ON SEQUENCE assets.image_assets_id_seq TO image_writer",
         "ALTER DEFAULT PRIVILEGES FOR ROLE migrator IN SCHEMA catalog, search, assets GRANT SELECT ON TABLES TO api_reader",
         "ALTER DEFAULT PRIVILEGES FOR ROLE migrator IN SCHEMA catalog, source, search GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ingest_writer",
         "GRANT USAGE ON SCHEMA catalog, ops TO monitor",
-        "GRANT SELECT ON TABLE catalog.titles, ops.jobs, ops.job_events, ops.backup_requests, ops.component_heartbeats, ops.readiness, ops.media_scan_runs, ops.media_scan_job_links, ops.worker_control, ops.worker_requests TO monitor",
+        "GRANT SELECT ON TABLE catalog.titles, ops.jobs, ops.job_events, ops.backup_requests, ops.component_heartbeats, ops.readiness, ops.worker_control, ops.worker_requests TO monitor",
     ];
     for statement in STATEMENTS {
         sqlx::query(statement)
@@ -120,7 +120,7 @@ async fn repair_application_role_grants(connection: &mut PgConnection) -> Result
     .map_err(|_| DbError::Migration)?;
     sqlx::query(
         "ALTER DEFAULT PRIVILEGES FOR ROLE migrator IN SCHEMA assets
-         GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO image_writer",
+         REVOKE INSERT, UPDATE, DELETE ON TABLES FROM image_writer",
     )
     .execute(&mut *connection)
     .await

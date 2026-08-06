@@ -9,10 +9,11 @@ mod tmdb_v3_api;
 pub use admin_api::{
     AdminApiError, AdminApiStore, AdminBackupKind, AdminBackupStatus, AdminBuildStatus,
     AdminCatalogCounts, AdminComponentHealth, AdminDatabaseStatus, AdminJob, AdminJobDetail,
-    AdminJobEvent, AdminJobListRequest, AdminJobPage, AdminMediaScanJobSummary, AdminMediaScanMode,
-    AdminMediaScanStatus, AdminMediaScanSubmission, AdminMediaWorkerAction, AdminMediaWorkerStatus,
-    AdminOperation, AdminPoolStatus, AdminQueueSummary, AdminStatus, AdminSubmission,
-    AdminWorkerAction, AdminWorkerStatus, DatabaseAdminStore,
+    AdminJobEvent, AdminJobListRequest, AdminJobPage, AdminMediaRequestItem,
+    AdminMediaRequestOutcome, AdminMediaRequestStatus, AdminMediaRequestSubmission,
+    AdminMediaWorkerAction, AdminMediaWorkerStatus, AdminOperation, AdminPoolStatus,
+    AdminQueueSummary, AdminScanMode, AdminStatus, AdminSubmission, AdminWorkerAction,
+    AdminWorkerStatus, DatabaseAdminStore,
 };
 pub use app::{
     ApiState, DatabaseReadinessProbe, ProbeError, REQUEST_TIMEOUT, ReadinessProbe, RequestId,

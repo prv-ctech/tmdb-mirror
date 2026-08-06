@@ -14,12 +14,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Local TMDB v3-compatible document, search/discover/find, session, account,
   list, favorite/watchlist, and rating routes.
 - Authenticated admin API for durable catalog scans, worker controls, job
-  history, media scans/audits, statistics maintenance, and pgBackRest backups.
-- Dedicated TMDB gallery ingestion for titles, seasons, episodes, people,
-  companies, networks, and collections with deterministic local media paths.
+  history, on-demand media requests, statistics maintenance, and pgBackRest
+  backups.
+- Local-truth on-demand media requests for one to 100 active local titles,
+  with bounded expansion, offline persistence, idempotency, and deterministic
+  TMDB-ID paths.
+- Forward schema revision `0052`, preserving catalog/source documents while
+  replacing legacy media state with least-privilege request/selector state.
 - Additive `local_*` media URLs while preserving upstream TMDB image fields.
 - Bounded daily-export census, phased enrichment, season processing,
-  `daily_sync`, queue backpressure, job retention, and cancellation controls.
+  `daily_sync`, `recovery`, `reconcile`, durable cron slots/watermarks, queue
+  backpressure, job retention, and cancellation controls.
 - PostgreSQL least-privilege roles, SQLx migrations, trigram/unaccent search,
   pg_stat_statements, WAL archiving, scheduled backups, and PITR verification.
 - Linux/Bash Docker stress harness with secret-safe real-TMDB fixtures,
@@ -29,11 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Replaced the legacy Python service and custom catalog routes with the Rust
   TMDB v3-compatible surface.
-- Removed the anime database/API partition, PgBouncer, automatic catalog
-  scheduling, PowerShell scripts, WebP derivatives, `.masters`, and obsolete
-  compatibility paths.
-- Workers now start in a durable stopped state after restart and require an
-  authenticated admin action before claiming work.
+- Replaced global media full/missing/audit scans, original images, derivatives,
+  and local re-encoding with exact bounded TMDB CDN renditions requested only
+  for locally known titles.
+- Removed the anime database/API partition, PgBouncer, PowerShell scripts,
+  image variants, `optimized/`, `.masters`, and obsolete compatibility paths.
+- Workers now drain eligible durable PostgreSQL work on container startup;
+  authenticated controls still start, pause, resume, or cancel each queue.
 
 ### Fixed
 

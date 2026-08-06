@@ -13,8 +13,8 @@ pulls the published Linux AMD64 images and uses relative `./data` bind mounts:
 | --- | ---: | --- |
 | `postgres` | none | PostgreSQL 18, migrations, WAL archiving, and pgBackRest |
 | `api` | `9001`, `8081` | Public catalog and authenticated admin APIs |
-| `worker` | none | Migrations and explicitly submitted ingest jobs |
-| `media` | `9002` | Downloaded public image files |
+| `worker` | none | Migrations, scheduled catalog maintenance, and ingest jobs |
+| `media` | `9002` | On-demand image downloads and public image files |
 
 The API container listens on `8080` for the public catalog API and `8081` for
 the authenticated admin API. Compose publishes them as host ports `9001` and
@@ -69,11 +69,10 @@ standalone file reads `.env` beside it; the production file reads `../.env` by
 default or the file selected by `TMDB_ENV_FILE`.
 
 The current `.env.example` is intentionally minimal. Enter database owner
-credentials, the TMDB read token, admin key, API base URL, media settings, and
-worker tuning shown there. Do not carry forward listener binds, `PGDATA`,
-`POSTGRES_INITDB_ARGS`, host-path variables, per-role credentials, or scheduler
-toggles from an older environment. Host paths and host ports belong in
-Compose.
+credentials, the TMDB read token, admin key, media URL, worker identities, and
+the three catalog schedules. Do not carry forward listener binds, `PGDATA`,
+`POSTGRES_INITDB_ARGS`, host-path variables, or per-role credentials. Host
+paths and host ports belong in Compose.
 
 ## API
 
@@ -93,41 +92,55 @@ authentication/session, list, favorite/watchlist, and rating operations are
 implemented locally in PostgreSQL; other supported reads return documents
 captured by worker scans.
 
-The private admin API supports status, durable job history, explicit
-`full_sweep`, `missing_only`, `prune_cleanup`, and `daily_sync` scans,
-cancellation/retry, media audits, persistent worker controls, and
-full/differential backup requests. Admin writes require an
-`Idempotency-Key`; scans, job operations, and backups return durable operation
-IDs, while worker controls return the persisted worker state.
+The private admin API supports status, durable job history, catalog modes,
+on-demand media requests, worker controls, cancellation/retry, and
+full/differential backups. Admin writes require an `Idempotency-Key`.
 
 A `full_sweep` is phased for throughput. It imports the TMDB daily title-ID
 exports in uninterrupted 500-title scheduling batches, enriches titles in
 100-title batches after census work drains, then processes TV seasons and
-episodes in 25-season batches. Reusable people, company, network, and
-collection galleries remain part of explicit media scans.
+episodes in 25-season batches. Catalog writes never enqueue image downloads.
+
+Use `recovery` after an interrupted or dead-lettered full sweep. It streams the
+latest TMDB exports in 500-ID batches, refreshes only missing/incomplete titles
+or titles with a newer unresolved dead letter, then processes only unfinished
+enrichment in 100-title and 25-season batches. Expected phase waiting schedules
+a delayed continuation without using a job retry attempt.
 
 `daily_sync` is the incremental production scan. It reads TMDB's movie and TV
 change feeds, refreshes changed titles, and discovers newly added seasons and
 episodes through the refreshed TV and season documents.
 
-Neither worker starts queue processing automatically after a restart. A
-previously running worker is reset to stopped; a paused worker remains paused.
-Start the main worker before submitting a catalog scan. Start the media worker
-only when image downloads should run; a catalog scan may create image jobs when
-`ALLOW_LOCAL_MEDIA=true`, but it does not start the media worker.
+The main worker schedules `daily_sync` hourly, `missing_only` nightly, and the
+lightweight `reconcile` census twice monthly by default. The five-field cron
+expressions use `TZ`; an empty value disables that schedule. `full_sweep`
+remains manual. Both workers drain eligible durable work when their containers
+start, while the admin API can still pause, resume, start, or cancel each queue.
 
 See the complete [API reference](docs/api.md) and the private OpenAPI document
 at `/admin/v1/openapi.json`.
 
-## Media galleries
+## On-demand media
 
-TMDB posters, backdrops, logos, season images, episode thumbnails, and
-reusable-entity galleries are downloaded from the dedicated TMDB image
-endpoints. Originals stay in TMDB-ID folders; one JPEG or PNG derivative is
-stored below `optimized/`. Episode thumbnails are optimized-only. Videos are
-stored as metadata (`site`, `key`, type, name, official/language/publication
-fields); no video files are downloaded. The current `/3/.../videos` response
-preserves TMDB's document and does not add a synthesized provider URL.
+Arrbit discovers titles through the local read API and submits one to 100
+active local IDs to `POST /admin/v1/media/requests`. PostgreSQL is the only
+metadata source: unknown IDs reject the whole request, and media requests never
+perform TMDB metadata discovery. The media worker reads stored title, season,
+episode, cast/crew, company, network, and collection paths, then downloads
+bounded renditions from TMDB's image CDN.
+
+Title, season, and episode galleries use English plus untagged image metadata
+(`language=en-US`, `include_image_language=en,null`). Reusable people, company,
+network, and collection assets use only the primary paths already normalized
+from the requested titles.
+
+Only validated final JPEG, PNG, or static WebP bytes are stored. Posters use
+`w500`, backdrops `w1280`, episode stills `w300`, and profiles/logos `w185`
+when those sizes exist in the stored TMDB configuration. There are no original,
+`optimized/`, `.masters`, or variant files and no local re-encoding. Public
+responses preserve upstream path fields and add versioned `local_*` URLs when
+the corresponding file is ready. Videos remain metadata only; no video files
+are downloaded.
 
 ## Development and stress testing
 
@@ -148,9 +161,10 @@ test artifacts.
 
 ## Operations
 
-`TZ=America/New_York` controls the pgBackRest schedule and readable log
-timestamps; persisted API and database timestamps remain UTC. pgBackRest stores
-its same-host recovery repository at `/config/backups/pgbackrest`. See
+`TZ` controls catalog cron evaluation, the pgBackRest schedule, and readable
+log timestamps; `.env.example` uses `America/New_York`. Persisted API and
+database timestamps remain UTC. pgBackRest stores its same-host recovery
+repository at `/config/backups/pgbackrest`. See
 [backup and recovery](docs/backup-recovery.md).
 
 GitHub publishes rolling `main` images, immutable versioned images, and a

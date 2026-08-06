@@ -71,7 +71,6 @@ start_worker() {
 }
 
 start_worker /admin/v1/worker "catalog-scan-start-ingest-$stamp"
-start_worker /admin/v1/media/worker "catalog-scan-start-media-$stamp"
 
 active_work() {
     psql_at "$password" "SELECT count(*) FROM ops.jobs WHERE status IN ('queued', 'running', 'retry_wait')"
@@ -100,7 +99,7 @@ active_peak="$active_before"
 pending_child_jobs=-1
 drain_deadline=$((SECONDS + timeout))
 while (( SECONDS < drain_deadline )); do
-    pending_child_jobs="$(psql_at "$password" "SELECT count(*) FROM ops.jobs WHERE job_type IN ('ingest.refresh_movie', 'ingest.refresh_tv', 'ingest.refresh_season', 'ingest.refresh_reusable_gallery', 'image.download') AND status IN ('queued', 'running', 'retry_wait')" 2>/dev/null || printf '%s' '-1')"
+    pending_child_jobs="$(psql_at "$password" "SELECT count(*) FROM ops.jobs WHERE job_type IN ('ingest.refresh_movie', 'ingest.refresh_tv', 'ingest.refresh_season', 'ingest.enrich_movie', 'ingest.enrich_tv') AND status IN ('queued', 'running', 'retry_wait')" 2>/dev/null || printf '%s' '-1')"
     active_now="$(active_work 2>/dev/null || printf '%s' '-1')"
     if [[ "$active_now" =~ ^[0-9]+$ ]] && (( active_now > active_peak )); then
         active_peak="$active_now"
@@ -124,7 +123,7 @@ cat >"$result_file" <<EOF
   "active_before": $active_before,
   "active_peak": $active_peak,
   "active_after": $active_after,
-  "pending_catalog_or_media_children": $pending_child_jobs,
+  "pending_catalog_children": $pending_child_jobs,
   "max_active": $max_active,
   "dead_letters_before": $dead_letters_before,
   "dead_letters_after": $dead_letters_after,

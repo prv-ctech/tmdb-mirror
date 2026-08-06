@@ -354,13 +354,12 @@ fn normalize_route(route: &str) -> String {
             | "/admin/v1/jobs"
             | "/admin/v1/jobs/{job_id}"
             | "/admin/v1/scans"
-            | "/admin/v1/media/scans"
-            | "/admin/v1/media/scans/{run_id}"
+            | "/admin/v1/media/requests"
+            | "/admin/v1/media/requests/{request_id}"
             | "/admin/v1/media/worker"
             | "/admin/v1/worker"
             | "/admin/v1/jobs/{job_id}/cancel"
             | "/admin/v1/jobs/{job_id}/retry"
-            | "/admin/v1/media/audits"
             | "/admin/v1/maintenance/analyze"
             | "/admin/v1/backups"
             | "/__test/panic"
@@ -384,10 +383,7 @@ fn normalize_job_type(job_type: &str) -> &'static str {
         "ingest.changes_sync" => "ingest.changes_sync",
         "ingest.daily_export" => "ingest.daily_export",
         "ingest.trending" => "ingest.trending",
-        "ingest.refresh_reusable_gallery" => "ingest.refresh_reusable_gallery",
         "admin.scan" => "admin.scan",
-        "admin.media_scan" => "admin.media_scan",
-        "admin.media_audit" => "admin.media_audit",
         "admin.analyze" => "admin.analyze",
         "database.backup_full" => "database.backup_full",
         "database.backup_diff" => "database.backup_diff",

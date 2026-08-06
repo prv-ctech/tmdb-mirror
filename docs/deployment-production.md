@@ -11,18 +11,17 @@ The stack is deliberately only four services:
 1. PostgreSQL 18, including `pg_trgm`, `unaccent`, and `pg_stat_statements`.
 2. API, with the local TMDB v3-compatible surface and bounded read/write
    connection pools.
-3. Main worker, which migrates and runs explicitly submitted ingest jobs.
-4. Media worker, which downloads/verifies images and serves `/media` directly
+3. Main worker, which migrates and runs scheduled or explicitly submitted ingest jobs.
+4. Media worker, which expands on-demand requests, downloads/verifies images, and serves `/media` directly
    through its embedded read-only HTTP server.
 
 There is no PgBouncer, Nginx, migration container, scheduler container, or
-storage-init container in the canonical deployment. The worker also has no
-in-process catalog scheduler: restarts do not submit changes, trending, or
-daily-export jobs. A running worker is reset to stopped on restart, while a
-paused worker remains paused. The disposable stress
-Compose file uses the same four-service shape with isolated named volumes.
-PostgreSQL does run its built-in pgBackRest backup scheduler; that is the only
-automatic scheduled work in the stack.
+storage-init container in the canonical deployment. The main worker has a
+small in-process cron scheduler backed by durable PostgreSQL slots and
+watermarks. Both workers begin draining eligible work when their containers
+start. The disposable stress Compose file uses the same four-service shape
+with isolated named volumes and disables catalog schedules for deterministic
+tests. PostgreSQL runs its independent pgBackRest backup schedule.
 The PostgreSQL service also declares a 2 GiB `/dev/shm`; Docker's 64 MiB
 default is too small for parallel query workers during a 100-client burst.
 
@@ -32,7 +31,7 @@ The application only knows these container paths:
 
 | Container path | Purpose |
 | --- | --- |
-| `/media` | Permanent public gallery originals and optimized images |
+| `/media` | Permanent on-demand final image renditions |
 | `/config` | NVMe worker scratch, raw exports, checkpoints, and logs |
 | `/config/backups/pgbackrest` | PostgreSQL-owned same-host pgBackRest repository |
 | PostgreSQL `/var/lib/postgresql` | PostgreSQL 18 data/WAL |
@@ -94,9 +93,9 @@ build is needed after GitHub Actions has published the images.
 
 The public, admin, and media routes are listed in [api.md](api.md).
 
-`TZ=America/New_York` controls human-readable terminal timestamps. PostgreSQL
-and API timestamps remain UTC. Catalog and media scans are never scheduled by
-the application; the authenticated admin API starts them explicitly.
+`TZ` controls human-readable terminal timestamps, catalog cron evaluation, and
+the pgBackRest schedule. `.env.example` uses `America/New_York`; operators may
+choose another IANA timezone. PostgreSQL and API timestamps remain UTC.
 
 The PostgreSQL service uses `POSTGRES_DB`, `POSTGRES_USER`, and
 `POSTGRES_PASSWORD` for the database owner and health check. Application
@@ -126,11 +125,10 @@ TMDB_ENABLE_SCHEDULER TMDB_ENABLE_DAILY_EXPORT
 The first three listener settings default to the container ports `8080`,
 `8081`, and `8090`; host ports are defined only in Compose. The database
 connection is always `postgres:5432`, and the image supplies PostgreSQL init
-defaults. Scheduler toggles are obsolete: catalog and media work are submitted
-through the authenticated admin API and do not start automatically after a
-restart. Optional retry, timeout, lease, heartbeat, polling, logging, and
-image-policy settings remain supported as advanced overrides but are not
-required in the minimal template.
+defaults. Boolean scheduler toggles are obsolete. The three five-field cron
+values in `.env.example` schedule `daily_sync`, `missing_only`, and `reconcile`;
+set one to an empty value to disable only that schedule. Optional retry,
+timeout, lease, heartbeat, and polling settings remain advanced overrides.
 
 The root `docker-compose-example.yaml` and
 `deploy/compose.production.yaml` describe the same four-service topology and
@@ -180,33 +178,47 @@ docker compose --env-file "$TMDB_ENV_FILE" \
 ```
 
 The main worker applies all embedded SQLx migrations under the PostgreSQL
-advisory lock;
-restarts are safe and reset a running worker to stopped, so they do not start
-catalog or media work. Operators request
-`full_sweep`, `missing_only`, `prune_cleanup`, or `daily_sync` through the
-private admin API. The same API can start, pause, resume, or cancel either
-worker; pausing blocks new claims and does not stop the container. The main
+advisory lock. Both workers begin draining eligible durable work on container
+startup. Operators can request `full_sweep`, `missing_only`, `recovery`,
+`prune_cleanup`, `daily_sync`, or `reconcile` through the private admin API.
+The same API can start, pause, resume, or cancel either worker; pausing blocks
+new claims and does not stop the container. The main
 worker creates one ingest loop per configured `TMDB_MAX_CONNECTIONS`, clamped
 to `1..=64`; the shared upstream request-start limiter remains bounded by
 `TMDB_RATE_LIMIT` at `40` requests per second or less. The media worker waits
 for the durable queue schema before claiming image jobs, so first-boot
 migrations do not cause an image-worker crash.
 
-Use `daily_sync` for incremental production updates. It reads TMDB's movie and
-TV change feeds, refreshes changed titles, and discovers new seasons and
-episodes from refreshed TV and season documents. For an emergency stop,
-cancel the main worker, wait for active catalog jobs to settle, and then cancel
-the media worker so already in-flight catalog work cannot leave newly queued
-image jobs behind.
+Schema revision `0052` preserves the catalog and captured TMDB documents while
+replacing legacy image state, variants, media scans, and audits with durable
+on-demand media requests. The migration does not delete old filesystem media;
+remove the obsolete files separately after deploying and verifying the new
+schema.
+
+The default schedules run `daily_sync` hourly, `missing_only` nightly, and
+`reconcile` on days 1 and 15. `daily_sync` refreshes changed titles and
+discovers new seasons/episodes. `reconcile` adds IDs from official exports,
+repairs new/incomplete/dead-lettered titles, and deactivates absent IDs without
+re-enriching every complete title. `full_sweep` remains manual. A changes gap
+older than 14 days sets `fullSweepRequired` in admin status.
+Busy schedule slots remain pending until incompatible maintenance finishes.
+Unresolved child dead letters prevent the corresponding synchronization
+watermark from advancing.
 
 ## Media policy
 
-`ALLOW_LOCAL_MEDIA=true` causes the main worker to create gallery image jobs in
-the same transaction as committed catalog data. The media worker later records
-verified files in PostgreSQL. The API preserves each upstream TMDB image field
-and adds the corresponding `local_*` URL using `TMDB_MEDIA_BASE_URL`; the local
-field is `null` until an asset is ready. When local media is disabled, no new
-image jobs are created.
+`ALLOW_LOCAL_MEDIA=true` allows the media worker to publish files. Catalog
+writes never create image jobs. Arrbit submits one to 100 active local title IDs
+to `/admin/v1/media/requests`; the media worker expands only the source paths
+already stored in PostgreSQL and downloads bytes from TMDB's image CDN. It
+never performs metadata discovery. The API preserves each upstream field and
+adds a digest-versioned `local_*` URL using `TMDB_MEDIA_BASE_URL`; the local
+field is `null` until a verified asset exists.
+
+Title, season, and episode galleries use English plus untagged images captured
+with `language=en-US` and `include_image_language=en,null`. People, companies,
+networks, and collections contribute only the primary source paths already
+normalized from the requested local title.
 
 Public paths are deterministic and use TMDB IDs:
 
@@ -215,20 +227,20 @@ Public paths are deterministic and use TMDB IDs:
 /media/tv/{tmdb_id}/posters/season01-poster.jpg
 /media/tv/{tmdb_id}/backdrops/backdrop-01.jpg
 /media/tv/{tmdb_id}/logos/logo.png
-/media/tv/{tmdb_id}/optimized/posters/poster-w640.jpg
-/media/tv/{tmdb_id}/optimized/thumbnails/season01-episode01-thumbnails-w640.jpg
+/media/tv/{tmdb_id}/thumbnails/season01-episode01-thumbnails.jpg
 /media/people/{tmdb_person_id}/profile.jpg
-/media/companies/{tmdb_company_id}/logos/logo.png
-/media/networks/{tmdb_network_id}/logos/logo.png
-/media/collections/{tmdb_collection_id}/posters/poster.jpg
+/media/companies/{tmdb_company_id}/logo.png
+/media/networks/{tmdb_network_id}/logo.png
+/media/collections/{tmdb_collection_id}/poster.jpg
 ```
 
-Original bytes are preserved outside `optimized/`. Optimized posters, seasons,
-profiles, and thumbnails are JPEG quality 85 with maximum width 640;
-backdrops use 1280 and logos use transparent PNG width 500. Episode thumbnails
-are optimized-only at width 640. No WebP derivative, `full` variant, video
-file, or `.masters` directory is created. Temporary files are created only
-below `/config/media` and are removed after atomic publication.
+The worker stores exact validated CDN rendition bytes: `w500` posters/season
+posters, `w1280` backdrops, `w300` episode stills, and `w185` profiles/logos.
+It never requests `original`, resizes, recompresses, or generates a derivative.
+JPEG, PNG, and static WebP are accepted; SVG-backed logos request PNG. No
+`optimized/`, `.masters`, variant, original, or video directory is created.
+Publication uses a same-filesystem temporary file and atomic rename.
+Publication, verification, and deletion reject symlinked path components.
 
 ## Validation
 
@@ -242,11 +254,11 @@ docker compose --env-file "$TMDB_ENV_FILE" \
   -f deploy/compose.production.yaml logs --no-color --tail=200 postgres worker api media
 ```
 
-Exercise both `ALLOW_LOCAL_MEDIA` modes, a movie, TV, season zero and regular
-seasons, episodes, cast, network, company, and
-collection galleries. Verify root source digests, optimized dimensions, local
-URLs, stable gallery numbering, duplicate source-path handling, and that a
-worker restart leaves no orphan job lease.
+Exercise authentication, unknown-ID rejection, idempotency, offline worker
+persistence, one- and 100-title media requests, season zero, episodes, cast,
+network, company, and collection paths. Verify exact bytes and MIME, digest
+URLs, stable numbering, lazy repair/deletion, bounded continuations, and that a
+worker restart leaves no orphan lease.
 
 The database remains MVCC/concurrent: independent API requests use separate
 bounded PostgreSQL connections, so one user's metadata read does not hold

@@ -1,13 +1,10 @@
 # Isolated stress testing
 
-Run the harness from Linux/WSL with Docker Desktop available. The scripts use
-an isolated Compose project, named volumes, loopback-only ports, and a local
-secret env file. They do not touch the production Compose project or host data.
+Run the Linux/Bash harness with Docker Desktop available. It uses a unique
+Compose project, named volumes, loopback-only ports, and ignored runtime files.
+It never touches production containers, volumes, networks, or host paths.
 
-## Prepare and start
-
-Create the ignored secret file and fill in the TMDB v4 read token, optional v3
-API key, and optional existing Trawl URL:
+## Start a disposable stack
 
 ```bash
 cp secrets.txt.example secrets.txt
@@ -22,24 +19,16 @@ chmod 600 secrets.txt
   --postgres-port 55433
 ```
 
-The loader reads `secrets.txt`. An optional `TMDB_ADMIN_API_KEY` entry is
-accepted for shared local secret files but ignored by the stress runtime.
-Secret values are never written to the general Compose environment, logs, JSON
-results, Docker build context, or Git.
+The loader reads the real TMDB token only from ignored `secrets.txt`, writes a
+mode-600 runtime secret file, and never puts credentials in Compose output,
+logs, reports, source, or image layers. The disposable environment disables
+catalog cron schedules so tests are deterministic.
 
-The bootstrap builds the pinned Rust image and the local PostgreSQL/pgBackRest
-image, applies migrations, starts the four-container stack, waits for health,
-verifies UID 10001, and checks that the fixed `/config` and `/media`
-subdirectories are writable by the runtime user. The PostgreSQL stress volume
-is initialized with WAL archiving enabled so the explicit backup API and
-pgBackRest checks can be exercised. Use a fresh project name when
-converting an older stock-PostgreSQL stress volume because `archive_mode` is a
-cluster initialization setting. The generated runtime files are under ignored
-`.stress-runtime/<project>/`.
+Bootstrap builds the local app and PostgreSQL/pgBackRest images, applies all
+migrations, waits for four healthy services, verifies the runtime UID, and
+checks `/config` and `/media` permissions.
 
 ## Exercise the stack
-
-Run the bounded checks in this order:
 
 ```bash
 ./scripts/stress-seed.sh --project-name tmdb_stress_test --count 100000
@@ -53,80 +42,52 @@ Run the bounded checks in this order:
 ./scripts/stress-collect.sh --project-name tmdb_stress_test
 ```
 
-The seed creates a large synthetic catalog for indexed list/search/filter
-tests. Artwork uses real TMDB requests for a multi-image movie, TV `119495`
-(posters, backdrops, logos, seasons, and trailers), TV `4586` (Trailer and
-Opening Credits), movie/TV live fixtures, reusable
-people, companies, networks, and collections. Run artwork before HTTP so the
-gallery and video routes have live rows. The Trawl check is skipped when no
-Trawl URL is configured. When configured, `stress-trawl.sh` uses Trawl's
-documented JSON `/scrape` endpoint and verifies its status/metadata response;
-the native endpoint does not provide a binary image body for this worker.
-The catalog-scan check submits a bounded `missing_only` scan through the
-authenticated admin API, starts both workers through that API, drains the
-resulting catalog/media children, and reports active-queue peak separately
-from retained terminal history. It does not submit jobs with a container CLI
-or launch a bulk export scan by default. The export parser and daily-sync
-paths are covered by focused Rust tests and the explicit admin scan contract.
+`stress-artwork.sh` enriches a bounded live fixture set and then submits one
+bulk `/admin/v1/media/requests` request. It verifies that media work starts only
+from active local catalog titles and that catalog writes created no image jobs.
+The fixture includes movie `550`, TV `119495`, TV `4586`, season/episode images,
+cast/crew, companies, networks, collections, and multiple title galleries.
 
-The HTTP result records request count, failures, throughput, p50/p95/p99
-latency, TMDB v3 document routes, season/episode image routes, and
-video-type checks. Run it at both 50 and 100 concurrent clients for production
-qualification. The configuration route is reported as `not seeded` when
-the preceding bounded artwork run used `missing_only`; a `full_sweep` seeds
-it. The artwork and media-asset results also report
-gallery counts, original and optimized rows, episode optimized-only rows,
-variant MIME/path violations, video counts by type/provider, HTTP status,
-permissions, worker IDs, and failures. Results and redacted diagnostics remain
-under the ignored runtime directory.
+`stress-media-assets.sh` verifies deterministic TMDB-ID paths, exact JPEG/PNG/
+static-WebP rendition bytes, MIME and dimensions, SHA-256 metadata, HTTP/ETag
+serving, permissions, and all required owner categories. It requires zero
+`optimized/`, `.masters`, original, or variant files.
 
-For full-sweep performance checks, report title-census throughput separately
-from enrichment and season throughput. Verify consecutive 500-title census
-batches have no enrichment, season, reusable-gallery, or image-download jobs
-between them; 100-title enrichment and 25-season TV phases start only after
-the preceding phase drains. A separate `daily_sync` run must prove that a
-changed title can add a newly published season or episode without another full
-sweep.
+`stress-media-scans.sh` now tests the on-demand request contract despite its
+historical filename: authentication, one- and 100-title submissions, duplicate
+normalization, idempotent replay, conflicting replay, atomic unknown-ID `422`,
+status counts, offline media-container persistence, startup draining,
+pause/resume/cancel, bounded request expansion, and removed legacy scan/audit
+routes. It does not perform a global media scan.
 
-`stress-artwork.sh`, `stress-scan.sh`, and `stress-media-assets.sh` start
-workers through the authenticated admin API before draining work; this is
-required because workers are idle after startup. `stress-media-scans.sh` uses
-the disposable admin key from
-the generated stress environment and never prints it. The real TMDB
-credentials are read from ignored `secrets.txt` for the upstream requests. It
-verifies authentication, scan idempotency, audit counters,
-pause/resume/start/cancel actions, and that a paused state survives a
-media-container restart. It leaves the durable media worker running. Catalog
-modes are `full_sweep`, `missing_only`,
-`prune_cleanup`, and `daily_sync`; every mode is bounded by durable
-continuations. Do not launch a large full sweep against a live catalog until
-queue depth and rate limits are being monitored.
+`stress-http.sh` measures the public read API with 100 concurrent clients and
+records request count, failures, throughput, and p50/p95/p99 latency. It covers
+Unicode/accent-folded search, captured TMDB v3 paths, and upstream plus
+digest-versioned local media fields.
 
-Qualification must also cover Unicode and accent-folded title search, all
-authenticated admin controls, local TMDB v3 account/list/rating writes,
-upstream-plus-local media fields, a 100-session PostgreSQL read burst, backup
-creation, and isolated PITR restore. When stopping both workflows under load,
-cancel catalog ingest first, let active catalog jobs settle, then cancel media
-to clear image jobs committed by work that was already in flight.
+`stress-scan.sh` submits a bounded `missing_only` catalog run and reports active
+queue peak separately from retained history. Full-sweep qualification must
+report 500-ID census, 100-title enrichment, and 25-season throughput separately
+and prove normal phase waiting consumes no retries. Scheduled-path qualification
+must also test hourly `daily_sync`, nightly `missing_only`, twice-monthly
+`reconcile`, durable slots/watermarks, overlap prevention, and
+`fullSweepRequired` after a changes gap beyond 14 days.
 
-The commands above automate Unicode search, worker/media controls, local media
-fields, HTTP concurrency, and the gallery filesystem/database checks. Local
-account/list/rating writes are covered by the Rust PostgreSQL API tests;
-pgBackRest runner/PITR behavior is covered by the two explicit scripts below.
-The repository does not claim that one stress script covers every item in this
-qualification list.
+All reports are written below ignored `.stress-runtime/<project>/`. The
+collector redacts secrets and fails on PostgreSQL deadlocks or lock-timeout
+errors.
 
-The private backup API accepts `{"type":"full"}` or
-`{"type":"differential"}` and requires an idempotency key. It returns a durable
-job ID; poll that job through the admin API, then verify the paired request and
-repository with `GET /admin/v1/backups` and `tmdb-pgbackrest info` inside the
-PostgreSQL container. The runner and PITR checks below cover the offline
-restore path as well.
+## Last full qualification
 
-## k6 load profile
+The 2026-08-06 clean Docker Desktop run applied schema revision `0052`, passed
+the 272-test Rust workspace suite, published 1,650 final media assets, and then
+reused all 1,650 on a repeat request with zero media failures. Its 100-client
+public API sample completed 2,000 requests with no HTTP failures. Full and
+differential backup plus offline PITR checks also passed. These dated results
+qualify that build and host only; rerun the harness for every release and on
+the actual deployment hardware.
 
-The optional k6 runner is an ephemeral test container, not a production
-service. It accepts the same endpoint path overrides as the scenario:
+## Optional k6 profile
 
 ```bash
 ./scripts/k6/run.sh \
@@ -138,24 +99,9 @@ service. It accepts the same endpoint path overrides as the scenario:
   --admin-metrics-url http://127.0.0.1:18081/metrics
 ```
 
-Use smaller values first, for example
-`--profile endpoints --virtual-users 20 --requests-per-endpoint 100`, then
-increase only after the bounded smoke checks pass. A failed run writes
-redacted Docker/PostgreSQL diagnostics beside the k6 output.
+Start with a smaller endpoint profile before the 100-client run.
 
-## Token refresh
-
-Changing an env file does not update an existing container. Recreate the
-disposable services with the Linux wrapper:
-
-```bash
-./scripts/stress-set-token.sh --project-name tmdb_stress_test
-```
-
-If a token has been pasted into a chat, shell history, or log, revoke it and
-issue a replacement before using the environment outside this local test.
-
-## PostgreSQL, backup, and repository checks
+## Backup and repository checks
 
 ```bash
 ./scripts/bootstrap-dev.sh
@@ -166,17 +112,13 @@ issue a replacement before using the environment outside this local test.
 ./infra/postgres/tests/pgbackrest-pitr.test.sh
 ```
 
-The PITR test builds only disposable PostgreSQL resources, creates a full and
-differential backup, restores to a recorded time, and verifies that a later
-record is excluded. Use a unique disposable Docker project for any additional
-backup experiments; do not prune shared Docker resources.
+The backup API accepts `{"type":"full"}` or `{"type":"differential"}`.
+Poll the returned durable job, check `/admin/v1/backups`, then verify the
+pgBackRest repository. Restore remains an offline procedure.
 
-## Stop and clean up
+## Stop
 
 ```bash
 ./scripts/stress-down.sh --project-name tmdb_stress_test
-# Add --remove-volumes only after the disposable data is no longer needed.
+# Add --remove-volumes only for this named disposable project.
 ```
-
-The cleanup script targets only the explicit stress project. Runtime files,
-downloads, exports, logs, and results are ignored by Git and Docker.

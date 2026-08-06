@@ -330,38 +330,36 @@ pub enum ReusableEntity {
     Collection,
 }
 
-/// Deterministic public image variant.
+/// Deterministic public image slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssetVariant {
     /// A title or collection poster. Index one is `poster`, later indexes are padded.
-    Poster { index: u16 },
+    Poster { index: u32 },
     /// A title or collection backdrop. Numbering always starts at one.
-    Backdrop { index: u16 },
+    Backdrop { index: u32 },
     /// A title or reusable entity logo.  Index one is `logo`, later indexes are padded.
-    Logo { index: u16 },
+    Logo { index: u32 },
     /// A reusable person profile image.  Index one is `profile`.
-    Profile { index: u16 },
+    Profile { index: u32 },
     /// A TV season poster.
-    SeasonPoster { season: u32, index: u16 },
+    SeasonPoster { season: u32, index: u32 },
     /// An episode thumbnail, with season zero represented as specials.
     EpisodeThumbnail {
         season: u32,
         episode: u16,
-        index: u16,
+        index: u32,
     },
 }
 
-/// Output encoding for a public derivative.
+/// Validated format of the downloaded public rendition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImageFormat {
-    /// Baseline JPEG derivative.
+    /// JPEG rendition.
     Jpeg,
     /// Source WebP, retained only when TMDB supplies WebP bytes.
     Webp,
-    /// PNG source or optimized logo.
+    /// PNG rendition.
     Png,
-    /// GIF source. No GIF derivative is generated.
-    Gif,
 }
 
 impl ImageFormat {
@@ -372,7 +370,6 @@ impl ImageFormat {
             Self::Jpeg => "jpg",
             Self::Webp => "webp",
             Self::Png => "png",
-            Self::Gif => "gif",
         }
     }
 }
@@ -405,7 +402,7 @@ pub fn title_dir(scope: TitleScope, tmdb_id: i64) -> Result<PathBuf, MediaPathEr
     Ok(PathBuf::from(path))
 }
 
-/// Returns the public title derivative path below [`MEDIA_ROOT`].
+/// Returns the public title rendition path below [`MEDIA_ROOT`].
 ///
 /// # Errors
 ///
@@ -416,31 +413,9 @@ pub fn title_asset(
     variant: AssetVariant,
     format: ImageFormat,
 ) -> Result<PathBuf, MediaPathError> {
-    if matches!(variant, AssetVariant::EpisodeThumbnail { .. }) {
-        return optimized_title_asset(scope, tmdb_id, variant, format, 640);
-    }
     let mut path = title_dir(scope, tmdb_id)?;
     path.push(title_subdirectory(variant));
     path.push(variant_filename(variant, format)?);
-    Ok(path)
-}
-
-/// Returns an optimized title path below `optimized/`.
-///
-/// # Errors
-///
-/// Returns [`MediaPathError`] when the identifier, variant number, or width is invalid.
-pub fn optimized_title_asset(
-    scope: TitleScope,
-    tmdb_id: i64,
-    variant: AssetVariant,
-    format: ImageFormat,
-    width: u32,
-) -> Result<PathBuf, MediaPathError> {
-    let mut path = title_dir(scope, tmdb_id)?;
-    path.push("optimized");
-    path.push(optimized_subdirectory(variant));
-    path.push(optimized_filename(variant, format, width)?);
     Ok(path)
 }
 
@@ -471,39 +446,6 @@ pub fn reusable_asset(
     Ok(path)
 }
 
-/// Returns an optimized path for a reusable entity.
-///
-/// # Errors
-///
-/// Returns [`MediaPathError`] when the TMDB identifier, variant number, or width is invalid.
-pub fn optimized_reusable_asset(
-    entity: ReusableEntity,
-    tmdb_id: i64,
-    variant: AssetVariant,
-    format: ImageFormat,
-    width: u32,
-) -> Result<PathBuf, MediaPathError> {
-    let id = positive_id(tmdb_id)?;
-    let directory = match entity {
-        ReusableEntity::Person => "people",
-        ReusableEntity::Network => "networks",
-        ReusableEntity::Company => "companies",
-        ReusableEntity::Collection => "collections",
-    };
-    let mut path = PathBuf::from(directory)
-        .join(id.to_string())
-        .join("optimized");
-    let subdirectory = match (entity, variant) {
-        (ReusableEntity::Person, AssetVariant::Profile { .. }) => "",
-        _ => optimized_subdirectory(variant),
-    };
-    if !subdirectory.is_empty() {
-        path.push(subdirectory);
-    }
-    path.push(optimized_filename(variant, format, width)?);
-    Ok(path)
-}
-
 /// Returns whether a relative path is safe to expose through the embedded
 /// media server. Hidden and traversal paths are never public.
 #[must_use]
@@ -522,13 +464,13 @@ fn positive_id(id: i64) -> Result<i64, MediaPathError> {
     (id > 0).then_some(id).ok_or(MediaPathError::InvalidId)
 }
 
-fn positive_number(number: u16) -> Result<u16, MediaPathError> {
+fn positive_number(number: u32) -> Result<u32, MediaPathError> {
     (number > 0)
         .then_some(number)
         .ok_or(MediaPathError::InvalidNumber)
 }
 
-fn numbered_name(prefix: &str, index: u16, extension: &str) -> Result<String, MediaPathError> {
+fn numbered_name(prefix: &str, index: u32, extension: &str) -> Result<String, MediaPathError> {
     let index = positive_number(index)?;
     if index == 1 {
         Ok(format!("{prefix}.{extension}"))
@@ -538,16 +480,6 @@ fn numbered_name(prefix: &str, index: u16, extension: &str) -> Result<String, Me
 }
 
 fn title_subdirectory(variant: AssetVariant) -> &'static str {
-    match variant {
-        AssetVariant::Poster { .. } | AssetVariant::SeasonPoster { .. } => "posters",
-        AssetVariant::Backdrop { .. } => "backdrops",
-        AssetVariant::Logo { .. } => "logos",
-        AssetVariant::Profile { .. } => "profiles",
-        AssetVariant::EpisodeThumbnail { .. } => "optimized",
-    }
-}
-
-fn optimized_subdirectory(variant: AssetVariant) -> &'static str {
     match variant {
         AssetVariant::Poster { .. } | AssetVariant::SeasonPoster { .. } => "posters",
         AssetVariant::Backdrop { .. } => "backdrops",
@@ -577,7 +509,7 @@ fn variant_filename(variant: AssetVariant, format: ImageFormat) -> Result<String
             episode,
             index,
         } => {
-            let episode = positive_number(episode)?;
+            let episode = positive_number(u32::from(episode))?;
             let base = if season == 0 {
                 "season-specials".to_owned()
             } else {
@@ -592,16 +524,11 @@ fn variant_filename(variant: AssetVariant, format: ImageFormat) -> Result<String
     }
 }
 
-fn reusable_subdirectory(entity: ReusableEntity, variant: AssetVariant) -> &'static str {
-    match (entity, variant) {
-        (ReusableEntity::Collection, AssetVariant::Poster { .. }) => "posters",
-        (ReusableEntity::Collection, AssetVariant::Backdrop { .. }) => "backdrops",
-        (_, AssetVariant::Logo { .. }) => "logos",
-        _ => "",
-    }
+fn reusable_subdirectory(_entity: ReusableEntity, _variant: AssetVariant) -> &'static str {
+    ""
 }
 
-fn backdrop_name(index: u16, extension: &str) -> Result<String, MediaPathError> {
+fn backdrop_name(index: u32, extension: &str) -> Result<String, MediaPathError> {
     let index = positive_number(index)?;
     Ok(format!("backdrop-{index:02}.{extension}"))
 }
@@ -617,22 +544,6 @@ fn reusable_filename(
         }
         _ => variant_filename(variant, format),
     }
-}
-
-fn optimized_filename(
-    variant: AssetVariant,
-    format: ImageFormat,
-    width: u32,
-) -> Result<String, MediaPathError> {
-    if width == 0 {
-        return Err(MediaPathError::InvalidNumber);
-    }
-    let original = variant_filename(variant, format)?;
-    let stem = Path::new(&original)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .ok_or(MediaPathError::InvalidNumber)?;
-    Ok(format!("{stem}-w{width}.{}", format.extension()))
 }
 
 #[cfg(test)]
@@ -734,23 +645,6 @@ mod tests {
             Some(PathBuf::from("movies/11/posters/poster.jpg"))
         );
         assert_eq!(
-            optimized_title_asset(
-                TitleScope::Tv,
-                12,
-                AssetVariant::EpisodeThumbnail {
-                    season: 0,
-                    episode: 1,
-                    index: 1
-                },
-                ImageFormat::Jpeg,
-                640
-            )
-            .ok(),
-            Some(PathBuf::from(
-                "tv/12/optimized/thumbnails/season-specials-episode01-thumbnails-w640.jpg",
-            ))
-        );
-        assert_eq!(
             title_asset(
                 TitleScope::Tv,
                 12,
@@ -763,7 +657,7 @@ mod tests {
             )
             .ok(),
             Some(PathBuf::from(
-                "tv/12/optimized/thumbnails/season-specials-episode01-thumbnails-w640.jpg",
+                "tv/12/thumbnails/season-specials-episode01-thumbnails.jpg",
             ))
         );
         assert_eq!(
@@ -816,27 +710,18 @@ mod tests {
                 ImageFormat::Png
             )
             .ok(),
-            Some(PathBuf::from("networks/55/logos/logo-02.png"))
-        );
-        assert_eq!(
-            optimized_reusable_asset(
-                ReusableEntity::Person,
-                44,
-                AssetVariant::Profile { index: 1 },
-                ImageFormat::Jpeg,
-                640
-            )
-            .ok(),
-            Some(PathBuf::from("people/44/optimized/profile-w640.jpg"))
+            Some(PathBuf::from("networks/55/logo-02.png"))
         );
     }
 
     #[test]
-    fn optimized_paths_are_public_and_dot_paths_are_private() {
+    fn rendition_paths_are_public_and_dot_paths_are_private() {
         assert!(!is_public_relative(".private/original"));
         assert!(is_public_relative("movies/1/posters/poster.jpg"));
         assert!(!is_public_relative("../movies/1/posters/poster.jpg"));
-        assert!(is_public_relative("tv/1/optimized/posters/poster-w640.jpg"));
+        assert!(is_public_relative(
+            "tv/1/thumbnails/season01-episode01-thumbnails.jpg"
+        ));
     }
 
     #[test]

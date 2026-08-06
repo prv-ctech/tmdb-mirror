@@ -1,14 +1,9 @@
-use std::{
-    collections::BTreeSet,
-    path::{Component, Path},
-};
+use std::path::{Component, Path};
 
 use sqlx::{PgPool, Postgres, Transaction};
 use thiserror::Error;
 
-use crate::image::{
-    ImageEntityType, ImageJobPayload, ImageKind, ImageMetadata, ImageVariantMetadata,
-};
+use crate::image::{ImageEntityType, ImageJobPayload, ImageKind, ImageMetadata};
 
 /// Sanitized failures from the image metadata transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
@@ -59,33 +54,35 @@ pub(crate) async fn persist_ready(
     let height = i32::try_from(metadata.height).map_err(|_| PersistError::InvalidPayload)?;
     let file_size = i64::try_from(metadata.byte_size).map_err(|_| PersistError::InvalidPayload)?;
     let gallery_index =
-        i16::try_from(payload.asset_index).map_err(|_| PersistError::InvalidPayload)?;
+        i32::try_from(payload.asset_index).map_err(|_| PersistError::InvalidPayload)?;
     let image_kind = db_image_kind(payload.kind);
 
-    remove_conflicting_gallery_slot(
-        &mut transaction,
-        owner_type,
-        owner_id,
-        image_kind,
-        gallery_index,
-        &payload.tmdb_path,
-    )
-    .await?;
+    let replacement_queued: bool =
+        sqlx::query_scalar("SELECT assets.queue_image_asset_replacements($1, $2, $3, $4, $5, $6)")
+            .bind(owner_type)
+            .bind(owner_id)
+            .bind(image_kind)
+            .bind(gallery_index)
+            .bind(&payload.tmdb_path)
+            .bind(&metadata.storage_path)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| PersistError::Database)?;
+    if !replacement_queued {
+        return Err(PersistError::Database);
+    }
 
-    let asset_id: i64 = sqlx::query_scalar(
+    sqlx::query(
         "INSERT INTO assets.image_assets (
              title_id, person_id, company_id, network_id, collection_id, season_id, episode_id,
              image_kind, source, source_key, source_url, storage_path, mime_type,
-             width, height, file_size_bytes, sha256, gallery_index,
-             source_mime_type, source_width, source_height, source_file_size_bytes,
-             source_sha256, source_storage_path, status, iso_639_1,
-             downloaded_at, updated_at
+             width, height, file_size_bytes, sha256, gallery_index, status, iso_639_1,
+             downloaded_at, verified_at, updated_at
          ) VALUES (
              $1, $2, $3, $4, $5, $6, $7,
              $8, 'tmdb', $9, $10, $11, $12,
-             $13, $14, $15, $16, $17,
-             $18, $19, $20, $21, $22, $23, 'ready', $24,
-             clock_timestamp(), clock_timestamp()
+             $13, $14, $15, $16, $17, 'ready', $18,
+             clock_timestamp(), clock_timestamp(), clock_timestamp()
          )
          ON CONFLICT (source, source_key, owner_type, owner_id) DO UPDATE SET
              title_id = EXCLUDED.title_id,
@@ -104,17 +101,12 @@ pub(crate) async fn persist_ready(
              file_size_bytes = EXCLUDED.file_size_bytes,
              sha256 = EXCLUDED.sha256,
              gallery_index = EXCLUDED.gallery_index,
-             source_mime_type = EXCLUDED.source_mime_type,
-             source_width = EXCLUDED.source_width,
-             source_height = EXCLUDED.source_height,
-             source_file_size_bytes = EXCLUDED.source_file_size_bytes,
-             source_sha256 = EXCLUDED.source_sha256,
-             source_storage_path = EXCLUDED.source_storage_path,
              status = 'ready',
              iso_639_1 = EXCLUDED.iso_639_1,
              downloaded_at = clock_timestamp(),
+             verified_at = clock_timestamp(),
              updated_at = clock_timestamp()
-         RETURNING id",
+        ",
     )
     .bind(owner.title)
     .bind(owner.person)
@@ -133,84 +125,14 @@ pub(crate) async fn persist_ready(
     .bind(file_size)
     .bind(&metadata.sha256)
     .bind(gallery_index)
-    .bind(&metadata.source_mime_type)
-    .bind(i32::try_from(metadata.source_width).map_err(|_| PersistError::InvalidPayload)?)
-    .bind(i32::try_from(metadata.source_height).map_err(|_| PersistError::InvalidPayload)?)
-    .bind(i64::try_from(metadata.source_byte_size).map_err(|_| PersistError::InvalidPayload)?)
-    .bind(&metadata.source_sha256)
-    .bind(&metadata.source_storage_path)
     .bind(language)
-    .fetch_one(&mut *transaction)
+    .execute(&mut *transaction)
     .await
     .map_err(|_| PersistError::Database)?;
-    replace_variants(&mut transaction, asset_id, &metadata.variants).await?;
     transaction
         .commit()
         .await
         .map_err(|_| PersistError::Database)
-}
-
-async fn remove_conflicting_gallery_slot(
-    transaction: &mut Transaction<'_, Postgres>,
-    owner_type: i16,
-    owner_id: i64,
-    image_kind: &str,
-    gallery_index: i16,
-    source_key: &str,
-) -> Result<(), PersistError> {
-    sqlx::query(
-        "DELETE FROM assets.image_assets
-          WHERE owner_type = $1
-            AND owner_id = $2
-            AND image_kind = $3
-            AND gallery_index = $4
-            AND NOT (source = 'tmdb' AND source_key = $5)",
-    )
-    .bind(owner_type)
-    .bind(owner_id)
-    .bind(image_kind)
-    .bind(gallery_index)
-    .bind(source_key)
-    .execute(&mut **transaction)
-    .await
-    .map_err(|_| PersistError::Database)?;
-    Ok(())
-}
-
-async fn replace_variants(
-    transaction: &mut Transaction<'_, Postgres>,
-    image_asset_id: i64,
-    variants: &[ImageVariantMetadata],
-) -> Result<(), PersistError> {
-    sqlx::query("DELETE FROM assets.image_variants WHERE image_asset_id = $1")
-        .bind(image_asset_id)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|_| PersistError::Database)?;
-    for variant in variants {
-        let width = i32::try_from(variant.width).map_err(|_| PersistError::InvalidPayload)?;
-        let height = i32::try_from(variant.height).map_err(|_| PersistError::InvalidPayload)?;
-        let file_size =
-            i64::try_from(variant.byte_size).map_err(|_| PersistError::InvalidPayload)?;
-        sqlx::query(
-            "INSERT INTO assets.image_variants (
-                 image_asset_id, variant_key, storage_path, mime_type,
-                 width, height, file_size_bytes, sha256, updated_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, clock_timestamp())",
-        )
-        .bind(image_asset_id)
-        .bind(&variant.key)
-        .bind(&variant.storage_path)
-        .bind(&variant.mime_type)
-        .bind(width)
-        .bind(height)
-        .bind(file_size)
-        .bind(&variant.sha256)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|_| PersistError::Database)?;
-    }
-    Ok(())
 }
 
 fn validate_metadata(
@@ -232,96 +154,26 @@ fn validate_metadata(
         || metadata.height == 0
         || !matches!(
             metadata.mime_type.as_str(),
-            "image/jpeg" | "image/png" | "image/webp" | "image/gif"
+            "image/jpeg" | "image/png" | "image/webp"
         )
-        || !matches!(
-            metadata.source_mime_type.as_str(),
-            "image/jpeg" | "image/png" | "image/webp" | "image/gif"
-        )
-        || metadata.source_byte_size == 0
-        || metadata.source_width == 0
-        || metadata.source_height == 0
-        || metadata.source_sha256.len() != 64
-        || !metadata
-            .source_sha256
-            .chars()
-            .all(|value| value.is_ascii_hexdigit())
         || metadata.sha256.len() != 64
         || !metadata
             .sha256
             .chars()
             .all(|value| value.is_ascii_hexdigit())
         || !safe_storage_path(&metadata.storage_path)
-        || metadata
-            .source_storage_path
-            .as_deref()
-            .is_some_and(|path| !safe_storage_path(path))
-        || !valid_variants(metadata)
+        || is_obsolete_layout(&metadata.storage_path)
     {
-        return Err(PersistError::InvalidPayload);
-    }
-    let valid_layout = if payload.entity_type == ImageEntityType::Episode {
-        metadata.source_storage_path.is_none()
-            && is_optimized_thumbnail_path(&metadata.storage_path)
-            && metadata.mime_type == "image/jpeg"
-            && metadata.width <= 640
-            && metadata.variants.is_empty()
-    } else {
-        metadata.source_storage_path.as_deref() == Some(metadata.storage_path.as_str())
-            && !is_optimized_path(&metadata.storage_path)
-    };
-    if !valid_layout {
         return Err(PersistError::InvalidPayload);
     }
     Ok(())
 }
 
-fn valid_variants(metadata: &ImageMetadata) -> bool {
-    if metadata.variants.len() > 8 {
-        return false;
-    }
-    let mut keys = BTreeSet::new();
-    let mut paths = BTreeSet::new();
-    for variant in &metadata.variants {
-        if !valid_variant(variant)
-            || !keys.insert(variant.key.as_str())
-            || !paths.insert(variant.storage_path.as_str())
-        {
-            return false;
-        }
-    }
-    metadata
-        .variants
-        .iter()
-        .all(|variant| variant.storage_path != metadata.storage_path)
-}
-
-fn valid_variant(variant: &ImageVariantMetadata) -> bool {
-    !variant.key.is_empty()
-        && variant.key.len() <= 64
-        && variant
-            .key
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-        && !variant.key.contains("full")
-        && !variant.key.starts_with("webp_")
-        && matches!(variant.mime_type.as_str(), "image/jpeg" | "image/png")
-        && variant.byte_size > 0
-        && variant.width > 0
-        && variant.height > 0
-        && variant.sha256.len() == 64
-        && variant.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && is_optimized_path(&variant.storage_path)
-        && (!is_optimized_thumbnail_path(&variant.storage_path) || variant.width <= 640)
-        && safe_storage_path(&variant.storage_path)
-}
-
-fn is_optimized_path(path: &str) -> bool {
-    path.starts_with("optimized/") || path.contains("/optimized/")
-}
-
-fn is_optimized_thumbnail_path(path: &str) -> bool {
-    path.starts_with("optimized/thumbnails/") || path.contains("/optimized/thumbnails/")
+fn is_obsolete_layout(path: &str) -> bool {
+    path.starts_with("optimized/")
+        || path.contains("/optimized/")
+        || path.starts_with(".masters/")
+        || path.contains("/.masters/")
 }
 
 fn safe_storage_path(value: &str) -> bool {
@@ -507,7 +359,6 @@ mod tests {
     }
 
     fn metadata(payload: &ImageJobPayload, storage_path: &str) -> ImageMetadata {
-        let episode = payload.entity_type == ImageEntityType::Episode;
         ImageMetadata {
             entity_type: payload.entity_type,
             entity_id: payload.entity_id,
@@ -516,24 +367,13 @@ mod tests {
             language: payload.language.clone(),
             source_revision: payload.source_revision.clone(),
             source_url: payload.source_url.clone(),
-            mime_type: if episode {
-                "image/jpeg".to_owned()
-            } else {
-                "image/png".to_owned()
-            },
+            mime_type: "image/png".to_owned(),
             byte_size: 70,
             width: 1,
             height: 1,
             sha256: "a".repeat(64),
             storage_path: storage_path.to_owned(),
-            source_mime_type: "image/png".to_owned(),
-            source_byte_size: 70,
-            source_width: 1,
-            source_height: 1,
-            source_sha256: "a".repeat(64),
-            source_storage_path: (!episode).then(|| storage_path.to_owned()),
             source: ImageSource::Direct,
-            variants: Vec::new(),
         }
     }
 
@@ -631,7 +471,7 @@ mod tests {
         .await
         .map_err(persist_error)?;
 
-        let rows: Vec<(i16, String, String)> = sqlx::query_as(
+        let rows: Vec<(i32, String, String)> = sqlx::query_as(
             "SELECT gallery_index, source_key, storage_path
                FROM assets.image_assets
               WHERE title_id = (SELECT id FROM catalog.titles WHERE tmdb_id = 42)
@@ -701,7 +541,7 @@ mod tests {
         .await
         .map_err(persist_error)?;
 
-        let rows: Vec<(i16, String)> = sqlx::query_as(
+        let rows: Vec<(i32, String)> = sqlx::query_as(
             "SELECT gallery_index, source_key
                FROM assets.image_assets
               WHERE title_id = (SELECT id FROM catalog.titles WHERE tmdb_id = 42)
@@ -714,90 +554,12 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
-    async fn verified_public_variants_replace_prior_variant_metadata(
-        pool: PgPool,
-    ) -> sqlx::Result<()> {
-        sqlx::query(
-            "INSERT INTO catalog.titles (media_type, tmdb_id, display_title, active)
-             VALUES ('movie', 43, 'Variant test', true)",
-        )
-        .execute(&pool)
-        .await?;
-        let payload = ImageJobPayload::new(
-            ImageEntityType::Movie,
-            43,
-            ImageKind::Poster,
-            "/variant-poster.jpg",
-            "https://image.tmdb.org/t/p/original/variant-poster.jpg",
-            None,
-            None,
-        )
-        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-        let mut image = metadata(&payload, "movies/43/posters/poster.jpg");
-        image.mime_type = "image/jpeg".to_owned();
-        image.byte_size = 71;
-        image.sha256 = "b".repeat(64);
-        image.variants = vec![ImageVariantMetadata {
-            key: "jpeg_w640".to_owned(),
-            storage_path: "movies/43/optimized/posters/poster-w640.jpg".to_owned(),
-            mime_type: image.mime_type.clone(),
-            byte_size: image.byte_size,
-            width: image.width,
-            height: image.height,
-            sha256: image.sha256.clone(),
-        }];
-        persist_ready(&pool, &payload, &image)
-            .await
-            .map_err(persist_error)?;
-
-        let rows: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT variant_key, storage_path, sha256
-               FROM assets.image_variants
-              ORDER BY variant_key",
-        )
-        .fetch_all(&pool)
-        .await?;
-        assert_eq!(
-            rows,
-            vec![(
-                "jpeg_w640".to_owned(),
-                "movies/43/optimized/posters/poster-w640.jpg".to_owned(),
-                "b".repeat(64),
-            )]
-        );
-
-        image.variants.push(ImageVariantMetadata {
-            key: "png_w500".to_owned(),
-            storage_path: "movies/43/optimized/posters/poster-w500.png".to_owned(),
-            mime_type: "image/png".to_owned(),
-            byte_size: 53,
-            width: 1,
-            height: 1,
-            sha256: "c".repeat(64),
-        });
-        persist_ready(&pool, &payload, &image)
-            .await
-            .map_err(persist_error)?;
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT variant_key, storage_path
-               FROM assets.image_variants
-              ORDER BY variant_key",
-        )
-        .fetch_all(&pool)
-        .await?;
-        assert_eq!(
-            rows,
-            vec![
-                (
-                    "jpeg_w640".to_owned(),
-                    "movies/43/optimized/posters/poster-w640.jpg".to_owned(),
-                ),
-                (
-                    "png_w500".to_owned(),
-                    "movies/43/optimized/posters/poster-w500.png".to_owned(),
-                ),
-            ]
-        );
+    async fn legacy_variant_table_is_removed(pool: PgPool) -> sqlx::Result<()> {
+        let relation: Option<String> =
+            sqlx::query_scalar("SELECT pg_catalog.to_regclass('assets.image_variants')::text")
+                .fetch_one(&pool)
+                .await?;
+        assert!(relation.is_none());
         Ok(())
     }
 
@@ -873,7 +635,7 @@ mod tests {
             &first,
             &metadata(
                 &first,
-                "tv/100/optimized/thumbnails/season01-episode01-thumbnails-w640.jpg",
+                "tv/100/thumbnails/season01-episode01-thumbnails.jpg",
             ),
         )
         .await
@@ -883,7 +645,7 @@ mod tests {
             &second,
             &metadata(
                 &second,
-                "tv/100/optimized/thumbnails/season01-episode02-thumbnails-w640.jpg",
+                "tv/100/thumbnails/season01-episode02-thumbnails.jpg",
             ),
         )
         .await
@@ -902,11 +664,11 @@ mod tests {
             vec![
                 (
                     300,
-                    "tv/100/optimized/thumbnails/season01-episode01-thumbnails-w640.jpg".to_owned(),
+                    "tv/100/thumbnails/season01-episode01-thumbnails.jpg".to_owned(),
                 ),
                 (
                     301,
-                    "tv/100/optimized/thumbnails/season01-episode02-thumbnails-w640.jpg".to_owned(),
+                    "tv/100/thumbnails/season01-episode02-thumbnails.jpg".to_owned(),
                 ),
             ]
         );

@@ -677,8 +677,7 @@ fn log_failure_code(code: &str) -> &str {
         | "database_unavailable"
         | "export_queue_incomplete"
         | "changes_queue_full"
-        | "missing_queue_full"
-        | "catalog_phase_busy" => code,
+        | "missing_queue_full" => code,
         _ => "custom_failure",
     }
 }
@@ -686,10 +685,7 @@ fn log_failure_code(code: &str) -> &str {
 fn is_expected_backpressure(code: &str) -> bool {
     matches!(
         code,
-        "export_queue_incomplete"
-            | "changes_queue_full"
-            | "missing_queue_full"
-            | "catalog_phase_busy"
+        "export_queue_incomplete" | "changes_queue_full" | "missing_queue_full"
     )
 }
 
@@ -722,7 +718,6 @@ mod tests {
             "export_queue_incomplete",
             "changes_queue_full",
             "missing_queue_full",
-            "catalog_phase_busy",
         ] {
             assert!(is_expected_backpressure(code), "{code}");
         }

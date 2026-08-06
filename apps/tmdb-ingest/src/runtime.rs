@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::jobs::IngestExecutor;
+use crate::scheduler::{self, CatalogSchedulerConfig};
 
 const MAX_INGEST_WORKER_CONCURRENCY: usize = 64;
 const COMPONENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -40,14 +41,19 @@ pub async fn run() -> anyhow::Result<()> {
         MAX_DAILY_EXPORT_BYTES,
     )?;
     let ingest_executor = IngestExecutor::with_export_root(tmdb_client, export_root)
-        .with_local_media(parse_or(source, "ALLOW_LOCAL_MEDIA", false)?)
         .with_export_max_bytes(export_max_bytes)
         .map_err(|error| anyhow::anyhow!(error))?;
     let worker_config = load_worker_config(source, "tmdb-ingest")?;
+    let scheduler_config = load_catalog_scheduler_config(source)?;
     let pool = connect_direct(&database, PoolPolicy::ReadWrite)
         .await
         .map_err(|error| anyhow::anyhow!(error))
         .context("connect ingest database")?;
+    let startup_state: String = sqlx::query_scalar("SELECT ops.start_worker_on_startup('ingest')")
+        .fetch_one(&pool)
+        .await
+        .context("start ingest worker queue")?;
+    tracing::info!(event = "catalog_worker_control_ready", startup_state);
     let ingest_executor = ingest_executor.with_database(pool.clone());
     let worker = Worker::new(
         JobRepository::new(pool.clone()),
@@ -66,7 +72,12 @@ pub async fn run() -> anyhow::Result<()> {
         signal_cancellation.cancel();
     });
     let heartbeat = spawn_component_heartbeat(pool.clone(), "worker", cancellation.clone());
-    let result = worker.run(cancellation).await;
+    let scheduler = spawn_catalog_scheduler(pool.clone(), scheduler_config, cancellation.clone());
+    let result = worker.run(cancellation.clone()).await;
+    cancellation.cancel();
+    if let Some(scheduler) = scheduler {
+        let _ = scheduler.await;
+    }
     let _ = heartbeat.await;
     pool.close().await;
     result.map_err(|error| anyhow::anyhow!(error))
@@ -107,22 +118,20 @@ pub async fn run_worker() -> anyhow::Result<()> {
     )?;
     let ingest_executor =
         IngestExecutor::with_export_root(tmdb_client, std::path::PathBuf::from(RAW_ROOT))
-            .with_local_media(parse_or(source, "ALLOW_LOCAL_MEDIA", false)?)
             .with_export_max_bytes(export_max_bytes)
             .map_err(|error| anyhow::anyhow!(error))?;
     let worker_config = load_worker_config(source, "tmdb-worker")?;
     let worker_concurrency = load_ingest_worker_concurrency(&source)?;
+    let scheduler_config = load_catalog_scheduler_config(source)?;
     let pool = connect_direct(&database, PoolPolicy::ReadWrite)
         .await
         .map_err(|error| anyhow::anyhow!(error))
         .context("connect worker database")?;
-    let startup_state: String = sqlx::query_scalar("SELECT ops.stop_worker_on_startup('ingest')")
+    let startup_state: String = sqlx::query_scalar("SELECT ops.start_worker_on_startup('ingest')")
         .fetch_one(&pool)
         .await
-        .context("reset ingest worker state after restart")?;
-    // A restart must not create an implicit scan or synchronization run.
-    // Operators submit those operations through the authenticated admin API.
-    tracing::info!(event = "catalog_seed_not_automatic", startup_state);
+        .context("start ingest worker queue")?;
+    tracing::info!(event = "catalog_worker_control_ready", startup_state);
     let executor = ingest_executor.with_database(pool.clone());
     let workers = ingest_worker_configs(worker_config, worker_concurrency)?
         .into_iter()
@@ -131,7 +140,7 @@ pub async fn run_worker() -> anyhow::Result<()> {
     tracing::info!(
         event = "main_worker_ready",
         ingest_workers = worker_concurrency,
-        automatic_work_disabled = true,
+        durable_queue_draining = true,
     );
     let cancellation = CancellationToken::new();
     let signal_cancellation = cancellation.clone();
@@ -145,11 +154,29 @@ pub async fn run_worker() -> anyhow::Result<()> {
         signal_cancellation.cancel();
     });
     let heartbeat = spawn_component_heartbeat(pool.clone(), "worker", cancellation.clone());
+    let scheduler = spawn_catalog_scheduler(pool.clone(), scheduler_config, cancellation.clone());
     let result = run_ingest_workers(workers, cancellation.clone()).await;
     cancellation.cancel();
+    if let Some(scheduler) = scheduler {
+        let _ = scheduler.await;
+    }
     let _ = heartbeat.await;
     pool.close().await;
     result.map_err(|error| anyhow::anyhow!(error))
+}
+
+fn spawn_catalog_scheduler(
+    pool: sqlx::PgPool,
+    config: CatalogSchedulerConfig,
+    cancellation: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if config.is_empty() {
+        tracing::info!(event = "catalog_scheduler_disabled");
+        None
+    } else {
+        tracing::info!(event = "catalog_scheduler_started");
+        Some(tokio::spawn(scheduler::run(pool, config, cancellation)))
+    }
 }
 
 fn spawn_component_heartbeat(
@@ -257,6 +284,24 @@ fn load_tmdb_client(source: EnvSource, environment: Environment) -> anyhow::Resu
     )
     .map_err(|error| anyhow::anyhow!(error))?;
     TmdbClient::new(&base_url, token, policy).map_err(|error| anyhow::anyhow!(error))
+}
+
+fn load_catalog_scheduler_config(source: EnvSource) -> anyhow::Result<CatalogSchedulerConfig> {
+    CatalogSchedulerConfig::new(
+        &optional_or(source, "TZ", "UTC")?,
+        &optional_or(source, "TMDB_DAILY_SYNC_CRON", "0 * * * *")?,
+        &optional_or(source, "TMDB_MISSING_ONLY_CRON", "0 3 * * *")?,
+        &optional_or(source, "TMDB_RECONCILE_CRON", "0 4 1,15 * *")?,
+    )
+}
+
+fn optional_or(source: EnvSource, name: &str, default: &str) -> anyhow::Result<String> {
+    match source.get(name) {
+        Some(value) => value
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("configuration field {name} is not valid Unicode")),
+        None => Ok(default.to_owned()),
+    }
 }
 
 fn load_environment(source: EnvSource) -> anyhow::Result<Environment> {

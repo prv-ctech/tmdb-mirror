@@ -33,7 +33,7 @@ async fn database_backed_admin_routes_are_durable_and_idempotent(
     assert_eq!(response.status(), StatusCode::OK);
     let status: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 32 * 1024).await?)?;
-    assert_eq!(status["data"]["build"]["schemaRevision"], "0050");
+    assert_eq!(status["data"]["build"]["schemaRevision"], "0052");
     assert_eq!(status["data"]["database"]["reachable"], true);
 
     let scan_request = || {
@@ -137,11 +137,6 @@ async fn database_backed_admin_routes_are_durable_and_idempotent(
     assert_ne!(retry["data"]["jobId"], scan_id);
 
     for (path, key, body) in [
-        (
-            "/admin/v1/media/audits",
-            "database-audit-1",
-            r#"{"repair":true}"#,
-        ),
         ("/admin/v1/maintenance/analyze", "database-analyze-1", ""),
         (
             "/admin/v1/backups",
@@ -159,38 +154,48 @@ async fn database_backed_admin_routes_are_durable_and_idempotent(
         assert_eq!(response.status(), StatusCode::ACCEPTED, "{path}");
     }
 
-    let media_scan_request = || {
-        Request::post("/admin/v1/media/scans")
+    sqlx::query(
+        "INSERT INTO catalog.titles (media_type, tmdb_id, display_title, active)
+         VALUES ('movie', 42, 'Media request fixture', true)",
+    )
+    .execute(&pool)
+    .await?;
+    let media_request = || {
+        Request::post("/admin/v1/media/requests")
             .header("x-api-key", ADMIN_KEY)
-            .header("idempotency-key", "database-media-scan-1")
+            .header("idempotency-key", "database-media-request-1")
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(r#"{"mode":"audit","repair":true}"#))
+            .body(Body::from(
+                r#"{"items":[{"mediaType":"movie","tmdbId":42}]}"#,
+            ))
     };
-    let response = app.clone().oneshot(media_scan_request()?).await?;
+    let response = app.clone().oneshot(media_request()?).await?;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    let media_scan: serde_json::Value =
+    let media_submission: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 4 * 1024).await?)?;
-    let run_id = media_scan["data"]["runId"]
+    let media_request_id = media_submission["data"]["requestId"]
         .as_str()
-        .ok_or("missing durable media scan run ID")?
+        .ok_or("missing durable media request ID")?
         .to_owned();
-    assert_eq!(media_scan["data"]["duplicate"], false);
+    assert_eq!(media_submission["data"]["duplicate"], false);
 
-    let response = app.clone().oneshot(media_scan_request()?).await?;
+    let response = app.clone().oneshot(media_request()?).await?;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let duplicate: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 4 * 1024).await?)?;
-    assert_eq!(duplicate["data"]["runId"], run_id);
+    assert_eq!(duplicate["data"]["requestId"], media_request_id);
     assert_eq!(duplicate["data"]["duplicate"], true);
 
     let response = app
         .clone()
         .oneshot(
-            Request::post("/admin/v1/media/scans")
+            Request::post("/admin/v1/media/requests")
                 .header("x-api-key", ADMIN_KEY)
-                .header("idempotency-key", "database-media-scan-invalid")
+                .header("idempotency-key", "database-media-request-invalid")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"mode":"full","repair":true}"#))?,
+                .body(Body::from(
+                    r#"{"items":[{"mediaType":"tv","tmdbId":999999999}]}"#,
+                ))?,
         )
         .await?;
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -198,7 +203,7 @@ async fn database_backed_admin_routes_are_durable_and_idempotent(
     let response = app
         .clone()
         .oneshot(
-            Request::get(format!("/admin/v1/media/scans/{run_id}"))
+            Request::get(format!("/admin/v1/media/requests/{media_request_id}"))
                 .header("x-api-key", ADMIN_KEY)
                 .body(Body::empty())?,
         )
@@ -206,8 +211,20 @@ async fn database_backed_admin_routes_are_durable_and_idempotent(
     assert_eq!(response.status(), StatusCode::OK);
     let media_status: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 16 * 1024).await?)?;
-    assert_eq!(media_status["data"]["mode"], "audit");
+    assert_eq!(media_status["data"]["titleCount"], 1);
     assert_eq!(media_status["data"]["status"], "queued");
+
+    for removed_path in ["/admin/v1/media/scans", "/admin/v1/media/audits"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(removed_path)
+                    .header("x-api-key", ADMIN_KEY)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{removed_path}");
+    }
 
     let response = app
         .clone()
@@ -220,7 +237,7 @@ async fn database_backed_admin_routes_are_durable_and_idempotent(
     assert_eq!(response.status(), StatusCode::OK);
     let worker: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 4 * 1024).await?)?;
-    assert_eq!(worker["data"]["state"], "stopped");
+    assert_eq!(worker["data"]["state"], "running");
 
     let worker_request = |action: &'static str, key: &'static str| {
         Request::post("/admin/v1/media/worker")
@@ -284,6 +301,6 @@ async fn database_backed_admin_routes_are_durable_and_idempotent(
     )
     .fetch_one(&pool)
     .await?;
-    assert_eq!(durable_counts, (7, 1));
+    assert_eq!(durable_counts, (5, 1));
     Ok(())
 }

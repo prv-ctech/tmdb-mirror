@@ -8,23 +8,34 @@ changing code. This repository is Linux-first; use Bash, Docker Desktop, and
 
 - The main worker copies TMDB metadata into PostgreSQL.
 - The media worker downloads TMDB images and serves local media.
-- Neither worker starts work automatically after restart. Database migration
-  and health checks may run; catalog and media work require the admin API.
-  A previously `running` state is reset to `stopped` during startup; a
-  `paused` state remains paused for emergency persistence.
-- PostgreSQL's built-in pgBackRest schedule is independent of both worker
-  controls and remains the stack's only automatic scheduled work.
+- Both workers begin draining eligible durable PostgreSQL work when their
+  containers start. Admin `pause` and `cancel` remain operational controls,
+  but a container restart returns that worker to `running`.
+- PostgreSQL's pgBackRest schedule and the main worker's catalog schedules are
+  independent of worker-control requests.
 - Both workers are controlled by the authenticated admin API: `start`,
   `pause`, `resume`, and `cancel`.
-- Catalog and media controls are independent. For an emergency stop, cancel
-  catalog ingest first, wait for active catalog jobs to settle, then cancel
-  media so already in-flight catalog work cannot leave image jobs queued.
+- Catalog and media controls are independent. Catalog writes never create
+  image jobs; only durable on-demand media requests do.
 - Production job submission and scan control use the authenticated admin API;
   do not ship or invoke a direct database job-submission CLI.
-- Catalog scans are explicit and durable: `full_sweep`, `missing_only`,
-  `prune_cleanup`, and `daily_sync`.
+- Catalog modes are `full_sweep`, `missing_only`, `recovery`, `prune_cleanup`,
+  `daily_sync`, and `reconcile`. Full sweeps are manual. Five-field cron
+  schedules submit hourly `daily_sync`, nightly `missing_only`, and twice-
+  monthly `reconcile` work by default; empty schedule values disable a mode.
 - Scan fan-out is bounded. A scan may submit only bounded batches and one
   cursor continuation. Never enqueue an entire TMDB export at once.
+- Expected phase waiting must succeed and schedule one delayed idempotent
+  continuation. Never consume retry attempts while healthy child work drains.
+- A busy cron slot remains durable and pending until incompatible catalog work
+  finishes. Never discard a nightly or twice-monthly slot after one collision,
+  and never advance a synchronization watermark past an unresolved child dead
+  letter.
+- `recovery` streams official exports in 500-ID chunks, refreshes only
+  missing/incomplete title details and unresolved dead letters newer than the
+  stored source, then queues only unfinished title and season enrichment in
+  100-title and 25-season batches. Source refreshes clear completion markers;
+  set them only after catalog and exact TMDB documents are durably stored.
 - Queue status must distinguish live work from retained history: `active` is
   `queued + running + retry_wait`; `retained` also includes terminal rows and
   is not backlog. Use `active` for backlog alarms and prune old terminal
@@ -37,6 +48,13 @@ changing code. This repository is Linux-first; use Bash, Docker Desktop, and
 - `daily_sync` is the incremental production path: consume TMDB movie/TV
   changes, refresh changed titles, and discover new seasons and episodes from
   refreshed TV and season documents.
+- PostgreSQL is the only catalog source visible to media requests. The media
+  worker may download image bytes from TMDB's CDN but must never call TMDB
+  metadata endpoints, discover unknown titles, or create waiting-catalog work.
+- `POST /admin/v1/media/requests` is the only media submission endpoint. It
+  accepts one to 100 unique active local movie/TV IDs, rejects the whole
+  request when any ID is unknown, and persists while the media container is
+  offline. Do not restore global media scans or audits.
 - Preserve TMDB media fields (`file_path`, `poster_path`, `backdrop_path`,
   `profile_path`, `logo_path`, and `still_path`). Add the corresponding
   `local_*` field as a full local URL when a ready asset exists, otherwise
@@ -55,9 +73,9 @@ changing code. This repository is Linux-first; use Bash, Docker Desktop, and
 - Keep full sweeps phased: run the title census first in uninterrupted
   500-title batches, then title enrichment in batches of 100, then TV seasons
   and episodes in batches of 25. Census writes must not enqueue child jobs.
-- Reuse appended title documents from the detail response. Reusable-entity
-  galleries belong to an explicit media scan and must not run per title during
-  a catalog full sweep.
+- Reuse appended title documents from the detail response. On-demand media
+  selection reads those stored documents plus relational primary paths; it
+  never fetches reusable-entity galleries.
 - Use measured concurrency, bulk persistence where it removes round trips, and
   structured timing/count events. Do not add speculative caching, queues,
   abstractions, or a fake TMDB batch API.
@@ -79,15 +97,28 @@ change.
 ## Data and media
 
 - Store TMDB response documents as the source for the local v3 read surface.
-- Use dedicated TMDB image endpoints for titles, seasons, episodes, people,
-  companies, networks, and collections.
-- Request `language=en-US` and `include_image_language=en,null` for image
-  galleries.
-- Use TMDB IDs for reusable entities. Keep original bytes outside `optimized/`.
-- Optimized derivatives are JPEG quality 85, never upscaled: width 640 for
-  posters, seasons, profiles, and thumbnails; 1280 for backdrops; PNG width
-  500 for logos. Never create WebP derivatives, `full` variants, or `.masters`.
-- Episode stills are optimized-only under `optimized/thumbnails/`.
+- The main worker captures image metadata in PostgreSQL. On-demand media
+  selection uses title/season/episode documents plus primary person, company,
+  network, and collection paths already related to the requested titles.
+- Capture and select English plus untagged title/season/episode gallery images
+  with `language=en-US` and `include_image_language=en,null`. Reusable entities
+  use only their primary locally stored paths; do not fetch their galleries.
+- Use real TMDB movie, TV, person, company, network, collection, season, and
+  episode IDs. Never substitute local title IDs in public paths or job payloads.
+- Download exact configured TMDB CDN renditions: `w500` posters/season posters,
+  `w1280` backdrops, `w300` episode stills, and `w185` profiles/logos. Select
+  the largest configured size at or below the target and never use `original`.
+- Accept validated static JPEG, PNG, and WebP bytes. Reject SVG, GIF, animated,
+  malformed, oversized, or MIME-mismatched responses. SVG-backed logos use a
+  PNG rendition. Never resize, recompress, re-encode, or create derivatives.
+- Store only final files in deterministic entity directories. Never create
+  `optimized/`, `.masters`, variant, original, or compatibility directories.
+- Publish atomically, store size/SHA-256/verification time, lazily revalidate
+  requested assets, and restrict stale-file deletion to the exact validated
+  TMDB entity directory. Local URLs include a digest query parameter.
+- Reject symlinks in every publication/deletion path component. Serialize one
+  active image job per owner/kind/index slot, and serialize media cancellation
+  with request expansion so files and database metadata cannot diverge.
 - Videos are metadata only. Do not download video files or create a videos
   folder. The current public `/3/.../videos` response preserves TMDB's `site`
   and `key` and does not synthesize a provider URL. If URL derivation is added,
@@ -128,6 +159,10 @@ change.
 - Verify migrations, roles, queue bounds, deduplication, pause/resume/cancel,
   retries, restart persistence, API authorization, image paths and MIME types,
   local HTTP serving, permissions, backups, and restore/PITR.
+- Verify media requests make zero TMDB metadata calls, atomically reject
+  unknown IDs, persist while the media worker is offline, expand no more than
+  250 sources per continuation, honor the 1,000-title and 10,000-image-job
+  ceilings, and produce no legacy media tables, routes, jobs, or directories.
 - Restricted API write tests must verify both table privileges and schema
   `USAGE`; table grants alone are not sufficient for production roles.
 - Stress tests must report bounded request counts, failures, latency, queue
@@ -141,6 +176,13 @@ change.
 
 - Run `git status --short` before and after work. Preserve unrelated edits;
   never reset or clean the worktree to hide them.
+- Treat `README.md`, `docs/*.md`, `.env.example`, the Compose examples, and
+  `CHANGELOG.md` as one public contract. When routes, migrations, schedules,
+  startup behavior, ports, paths, or media policy change, update every affected
+  document in the same change and remove contradictory historical claims.
+- Derive current documentation from code, SQLx migrations, Compose files, and
+  executable scripts. Keep historical design records clearly labeled and do
+  not present an unverified acceptance checklist as a current test result.
 - Keep behavior, refactors, tests, and docs reviewable and separable.
 - Commit or push only when the user explicitly requests publication.
 - Handoff must state changed files, commands and measured results, fixed
