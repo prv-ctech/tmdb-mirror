@@ -167,6 +167,11 @@ Operational events contain only bounded fields: fixed container paths, job
 IDs/types, retry codes, image entity IDs, safe HTTP status, and safe I/O
 classes such as `permission_denied`. They never print database passwords,
 tokens, image source URLs, payloads, host bind paths, or raw upstream errors.
+When a manual scan overlaps active catalog maintenance, the admin API returns
+HTTP `409` with `code: "catalog_maintenance_active"`, and the canonical
+`http_request_complete` event records that code as `outcome`. Use
+`/admin/v1/status` → `activeCatalogWork` for the bounded mode/phase/page/window
+context; do not infer duplicate work from retained queue totals.
 
 ```bash
 runtime_env=/secure/path/tmdb-mirror.env

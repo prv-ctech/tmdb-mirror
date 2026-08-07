@@ -60,6 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Normal API SIGTERM shutdown now prioritizes the cancellation signal when a
   listener finishes in the same scheduler turn, avoiding a false listener
   failure and restart log.
+- Admin status now includes a bounded, sanitized `activeCatalogWork` projection.
+  Competing catalog scans return a machine-readable
+  `catalog_maintenance_active` conflict, and the canonical request log records
+  the same outcome instead of a generic error.
 
 ### Fixed
 

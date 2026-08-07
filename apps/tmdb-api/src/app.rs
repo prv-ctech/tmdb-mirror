@@ -445,6 +445,19 @@ async fn admin_request_middleware(
     }
     let response = with_request_id(response, &id);
     let status = response.status();
+    let outcome = response
+        .extensions()
+        .get::<problem::ResponseOutcome>()
+        .map_or_else(
+            || {
+                if status.is_success() {
+                    "success"
+                } else {
+                    "error"
+                }
+            },
+            |outcome| outcome.0,
+        );
     metrics.observe_http(
         &HttpRequestLabels::new(
             Listener::Admin,
@@ -463,11 +476,7 @@ async fn admin_request_middleware(
         route: &route,
         status: status.as_u16(),
         duration: started.elapsed(),
-        outcome: if status.is_success() {
-            "success"
-        } else {
-            "error"
-        },
+        outcome,
     });
     response
 }

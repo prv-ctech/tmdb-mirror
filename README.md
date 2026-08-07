@@ -103,6 +103,9 @@ captured by worker scans.
 The private admin API supports status, durable job history, catalog modes,
 on-demand media requests, worker controls, cancellation/retry, and
 full/differential backups. Admin writes require an `Idempotency-Key`.
+Status includes a bounded `activeCatalogWork` projection for current scan
+coordinators and change-feed jobs. A competing catalog scan returns `409` with
+`code: "catalog_maintenance_active"` instead of creating duplicate work.
 
 A `full_sweep` is phased for throughput. It imports the TMDB daily title-ID
 exports in uninterrupted 500-title scheduling batches, enriches titles in

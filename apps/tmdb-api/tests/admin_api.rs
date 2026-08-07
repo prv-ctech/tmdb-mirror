@@ -58,6 +58,7 @@ impl AdminApiStore for FakeAdminStore {
                 full_sweep_required: false,
             },
             queues: Vec::new(),
+            active_catalog_work: Vec::new(),
             ingest: AdminComponentHealth::ready(),
             media: AdminComponentHealth::ready(),
             upstream: AdminComponentHealth::unknown(),

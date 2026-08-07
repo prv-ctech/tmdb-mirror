@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{FromRow, PgPool};
@@ -37,6 +37,9 @@ pub enum AdminApiError {
     /// The request was structurally valid but cannot be performed.
     #[error("admin request is not allowed")]
     Rejected,
+    /// Another catalog maintenance run already owns the durable work boundary.
+    #[error("catalog maintenance is already active")]
+    CatalogMaintenanceActive,
     /// No durable operation or job matches the requested identifier.
     #[error("admin job was not found")]
     NotFound,
@@ -57,6 +60,7 @@ pub struct AdminStatus {
     pub pools: AdminPoolStatus,
     pub catalog: AdminCatalogCounts,
     pub queues: Vec<AdminQueueSummary>,
+    pub active_catalog_work: Vec<AdminCatalogWork>,
     pub ingest: AdminComponentHealth,
     pub media: AdminComponentHealth,
     pub upstream: AdminComponentHealth,
@@ -114,6 +118,34 @@ pub struct AdminQueueSummary {
     pub succeeded: i64,
     pub dead_letter: i64,
     pub cancelled: i64,
+}
+
+/// One bounded active catalog coordinator or incremental changes job.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminCatalogWork {
+    pub job_id: JobId,
+    pub job_type: String,
+    pub status: JobStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<AdminScanMode>,
+    pub media_types: Vec<AdminMediaType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<AdminCatalogPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_start: Option<NaiveDate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_end: Option<NaiveDate>,
+    pub attempts: i32,
+    pub max_attempts: i32,
+    pub available_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Health state intentionally kept independent from secret upstream details.
@@ -296,6 +328,16 @@ pub enum AdminScanMode {
     PruneCleanup,
     DailySync,
     Reconcile,
+}
+
+/// Durable catalog coordinator phase exposed by the bounded status summary.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminCatalogPhase {
+    Start,
+    Enrichment,
+    Seasons,
+    Completion,
 }
 
 /// A catalog media namespace used by scans and on-demand media requests.
@@ -521,6 +563,26 @@ impl AdminApiStore for DatabaseAdminStore {
         .fetch_all(&self.read_pool)
         .await
         .map_err(|error| map_database_error(&error))?;
+        let active_catalog_work = sqlx::query_as::<_, CatalogWorkRow>(
+            "SELECT id, job_type, status, payload, attempts, max_attempts,
+                    available_at, updated_at
+               FROM ops.jobs
+              WHERE status IN ('queued', 'running', 'retry_wait')
+                AND job_type IN ('admin.scan', 'ingest.changes_sync')
+              ORDER BY CASE status
+                           WHEN 'running' THEN 0
+                           WHEN 'retry_wait' THEN 1
+                           ELSE 2
+                       END,
+                       available_at, created_at, id
+              LIMIT 32",
+        )
+        .fetch_all(&self.read_pool)
+        .await
+        .map_err(|error| map_database_error(&error))?
+        .into_iter()
+        .map(CatalogWorkRow::into_model)
+        .collect::<Result<Vec<_>, _>>()?;
         let backup: BackupRow = sqlx::query_as(
             "SELECT CASE
                         WHEN pg_catalog.bool_or(status = 'running') THEN 'running'
@@ -586,6 +648,7 @@ impl AdminApiStore for DatabaseAdminStore {
                 full_sweep_required: status.full_sweep_required,
             },
             queues: queues.into_iter().map(QueueRow::into_model).collect(),
+            active_catalog_work,
             ingest: component_health
                 .remove("worker")
                 .unwrap_or_else(AdminComponentHealth::unknown),
@@ -711,7 +774,7 @@ impl AdminApiStore for DatabaseAdminStore {
             .bind(request_id)
             .fetch_one(&self.write_pool)
             .await
-            .map_err(|error| map_database_error(&error))?
+            .map_err(|error| map_catalog_scan_database_error(&error))?
         } else {
             sqlx::query_as(
                 "SELECT job_id, was_duplicate
@@ -920,6 +983,93 @@ impl QueueRow {
             dead_letter: self.dead_letter,
             cancelled: self.cancelled,
         }
+    }
+}
+
+#[derive(FromRow)]
+struct CatalogWorkRow {
+    id: Uuid,
+    job_type: String,
+    status: String,
+    payload: serde_json::Value,
+    attempts: i32,
+    max_attempts: i32,
+    available_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminScanContext {
+    mode: Option<AdminScanMode>,
+    #[serde(default)]
+    media_types: Vec<AdminMediaType>,
+    phase: Option<AdminCatalogPhase>,
+    cursor: Option<u64>,
+    poll: Option<u32>,
+    window_start: Option<NaiveDate>,
+    window_end: Option<NaiveDate>,
+}
+
+#[derive(Default, Deserialize)]
+struct ChangesSyncContext {
+    media_type: Option<AdminMediaType>,
+    page: Option<u32>,
+    start_date: Option<NaiveDate>,
+    end_date: Option<NaiveDate>,
+}
+
+impl CatalogWorkRow {
+    fn into_model(self) -> Result<AdminCatalogWork, AdminApiError> {
+        let mut mode = None;
+        let mut media_types = Vec::new();
+        let mut phase = None;
+        let mut page = None;
+        let mut cursor = None;
+        let mut poll = None;
+        let mut window_start = None;
+        let mut window_end = None;
+
+        match self.job_type.as_str() {
+            "admin.scan" => {
+                if let Ok(context) = serde_json::from_value::<AdminScanContext>(self.payload) {
+                    mode = context.mode;
+                    media_types = context.media_types;
+                    phase = context.phase;
+                    cursor = context.cursor;
+                    poll = context.poll;
+                    window_start = context.window_start;
+                    window_end = context.window_end;
+                }
+            }
+            "ingest.changes_sync" => {
+                if let Ok(context) = serde_json::from_value::<ChangesSyncContext>(self.payload) {
+                    media_types.extend(context.media_type);
+                    page = context.page;
+                    window_start = context.start_date;
+                    window_end = context.end_date;
+                }
+            }
+            _ => {}
+        }
+
+        Ok(AdminCatalogWork {
+            job_id: self.id.into(),
+            job_type: self.job_type,
+            status: parse_job_status(&self.status)?,
+            mode,
+            media_types,
+            phase,
+            page,
+            cursor,
+            poll,
+            window_start,
+            window_end,
+            attempts: self.attempts,
+            max_attempts: self.max_attempts,
+            available_at: self.available_at,
+            updated_at: self.updated_at,
+        })
     }
 }
 
@@ -1168,6 +1318,18 @@ fn map_database_error(error: &sqlx::Error) -> AdminApiError {
     }
 }
 
+fn map_catalog_scan_database_error(error: &sqlx::Error) -> AdminApiError {
+    if error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .is_some_and(|code| code == "P0001")
+    {
+        AdminApiError::CatalogMaintenanceActive
+    } else {
+        map_database_error(error)
+    }
+}
+
 /// Adds administrative operations to the already-private admin listener.
 pub(crate) fn register_routes(router: Router<AdminState>) -> Router<AdminState> {
     router
@@ -1210,7 +1372,7 @@ async fn openapi() -> Json<serde_json::Value> {
                 "get": {"summary": "Read this private API document", "responses": {"200": {"description": "OpenAPI document"}}}
             },
             "/admin/v1/status": {
-                "get": {"summary": "Read bounded operational status", "responses": {"200": {"description": "Build, database, pools, catalog, queue, component, and backup state"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "503": {"$ref": "#/components/responses/Unavailable"}}}
+                "get": {"summary": "Read bounded operational status", "responses": {"200": {"description": "Build, database, pools, catalog, queue, active catalog work, component, and backup state"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "503": {"$ref": "#/components/responses/Unavailable"}}}
             },
             "/admin/v1/jobs": {
                 "get": {
@@ -1236,7 +1398,7 @@ async fn openapi() -> Json<serde_json::Value> {
                     "summary": "Queue an explicit full_sweep, missing_only, recovery, prune_cleanup, daily_sync, or reconcile catalog scan",
                     "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}],
                     "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ScanRequest"}}}},
-                    "responses": {"202": {"$ref": "#/components/responses/Accepted"}, "400": {"$ref": "#/components/responses/BadRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "409": {"$ref": "#/components/responses/IdempotencyConflict"}, "422": {"$ref": "#/components/responses/Rejected"}, "503": {"$ref": "#/components/responses/Unavailable"}}
+                    "responses": {"202": {"$ref": "#/components/responses/Accepted"}, "400": {"$ref": "#/components/responses/BadRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "409": {"$ref": "#/components/responses/CatalogScanConflict"}, "422": {"$ref": "#/components/responses/Rejected"}, "503": {"$ref": "#/components/responses/Unavailable"}}
                 }
             },
             "/admin/v1/media/requests": {
@@ -1333,6 +1495,7 @@ async fn openapi() -> Json<serde_json::Value> {
                 "Unauthorized": {"description": "Existing admin key was missing or invalid"},
                 "NotFound": {"description": "Durable job was not found"},
                 "IdempotencyConflict": {"description": "Idempotency key was already used with a different payload"},
+                "CatalogScanConflict": {"description": "Idempotency key conflict or catalog maintenance is already active; the latter returns code catalog_maintenance_active"},
                 "Rejected": {"description": "Valid request cannot be performed"},
                 "Unavailable": {"description": "Administrative database dependency is unavailable"}
             }
@@ -1703,6 +1866,13 @@ fn failure(error: AdminApiError, request_id: &str) -> Response {
             "The administrative request cannot be performed.",
             request_id,
         ),
+        AdminApiError::CatalogMaintenanceActive => problem::response_with_code(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "Catalog maintenance is already active.",
+            request_id,
+            "catalog_maintenance_active",
+        ),
         AdminApiError::NotFound => problem::response(
             StatusCode::NOT_FOUND,
             "Not Found",
@@ -1973,5 +2143,60 @@ mod tests {
                 job_type: Some(job_type),
             }) if job_type == "admin.analyze"
         ));
+    }
+
+    #[test]
+    fn active_catalog_work_projects_only_allowlisted_context() -> Result<(), AdminApiError> {
+        let timestamp = Utc::now();
+        let scan = CatalogWorkRow {
+            id: Uuid::now_v7(),
+            job_type: "admin.scan".to_owned(),
+            status: "retry_wait".to_owned(),
+            payload: json!({
+                "mode": "daily_sync",
+                "mediaTypes": ["movie", "tv"],
+                "phase": "completion",
+                "cursor": 500,
+                "poll": 2,
+                "windowStart": "2026-08-05",
+                "windowEnd": "2026-08-06",
+                "ignored": "not projected"
+            }),
+            attempts: 0,
+            max_attempts: 100,
+            available_at: timestamp,
+            updated_at: timestamp,
+        }
+        .into_model()?;
+        assert_eq!(scan.mode, Some(AdminScanMode::DailySync));
+        assert_eq!(
+            scan.media_types,
+            vec![AdminMediaType::Movie, AdminMediaType::Tv]
+        );
+        assert_eq!(scan.phase, Some(AdminCatalogPhase::Completion));
+        assert_eq!(scan.cursor, Some(500));
+        assert_eq!(scan.poll, Some(2));
+
+        let changes = CatalogWorkRow {
+            id: Uuid::now_v7(),
+            job_type: "ingest.changes_sync".to_owned(),
+            status: "running".to_owned(),
+            payload: json!({
+                "media_type": "tv",
+                "page": 3,
+                "start_date": "2026-08-05",
+                "end_date": "2026-08-06"
+            }),
+            attempts: 1,
+            max_attempts: 4,
+            available_at: timestamp,
+            updated_at: timestamp,
+        }
+        .into_model()?;
+        assert_eq!(changes.media_types, vec![AdminMediaType::Tv]);
+        assert_eq!(changes.page, Some(3));
+        assert!(changes.mode.is_none());
+        assert!(changes.phase.is_none());
+        Ok(())
     }
 }

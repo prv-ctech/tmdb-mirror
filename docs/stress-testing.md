@@ -79,7 +79,10 @@ report 500-ID census, 100-title enrichment, and 25-season throughput separately
 and prove normal phase waiting consumes no retries. Scheduled-path qualification
 must also test hourly `daily_sync`, nightly `missing_only`, twice-monthly
 `reconcile`, durable slots/watermarks, overlap prevention, and
-`fullSweepRequired` after a changes gap beyond 14 days.
+`fullSweepRequired` after a changes gap beyond 14 days. API qualification must
+also verify that `activeCatalogWork` is bounded and sanitized and that an
+overlapping manual scan returns `409` with `catalog_maintenance_active` in both
+the problem response and canonical request-log outcome.
 
 All reports are written below ignored `.stress-runtime/<project>/`. The
 collector redacts secrets and fails on PostgreSQL deadlocks or lock-timeout

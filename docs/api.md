@@ -181,6 +181,11 @@ reusing it with a different request returns `409`.
 Queue counts in `/admin/v1/status` are split deliberately. `active` is the
 live backlog (`queued`, `running`, and `retry_wait`); `retained` includes
 terminal history and is not backlog. Use `active` for queue alarms.
+`activeCatalogWork` is a separate bounded list of at most 32 active
+`admin.scan` coordinators and `ingest.changes_sync` jobs. It exposes only safe
+context: job ID/type/status, catalog mode, media types, phase/page/cursor/poll,
+change window, attempts, and UTC availability/update times. Raw payloads and
+idempotency keys are never returned.
 `prune_cleanup` removes old, unreferenced terminal job history in bounded
 batches. Completed media requests retain aggregate counters while old terminal
 job links are released after retention. Cleanup remains an explicit operator
@@ -190,7 +195,8 @@ action.
 `cursor`, `status`, and `jobType`. Job responses omit raw payloads and
 idempotency keys. `/admin/v1/status` reports build/schema identity, database
 size and connections, API pool state, movie/TV totals, bounded queue groups,
-component heartbeats, and backup state; all API timestamps are UTC.
+active catalog work, component heartbeats, and backup state; all API timestamps
+are UTC.
 
 `full_sweep` imports TMDB's daily movie and TV ID exports in uninterrupted
 500-title scheduling batches. Durable 100-title enrichment batches begin only
@@ -218,6 +224,13 @@ window is older than TMDB's 14-day range, status exposes
 `fullSweepRequired: true`. A slot that collides with active catalog maintenance
 remains pending and is retried; a watermark is not advanced while a child job
 from that scan remains unresolved in the dead-letter state.
+
+Only one catalog maintenance run can be active. A different manual scan
+submitted while one is active returns `409 application/problem+json` with
+`code: "catalog_maintenance_active"`; it does not create another job. The
+canonical `http_request_complete` JSONL event uses the same value as its
+`outcome`, so operators can distinguish this expected conflict from an
+unclassified error without logging request payloads.
 
 Example catalog scan:
 

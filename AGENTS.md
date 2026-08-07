@@ -44,6 +44,11 @@ changing code. This repository is Linux-first; use Bash, Docker Desktop, and
   `queued + running + retry_wait`; `retained` also includes terminal rows and
   is not backlog. Use `active` for backlog alarms and prune old terminal
   history explicitly.
+  Admin status must keep `activeCatalogWork` bounded and sanitized so current
+  scan mode/phase/page/window can be distinguished without exposing raw job
+  payloads or idempotency keys. Overlapping manual catalog maintenance returns
+  `409` with `code: catalog_maintenance_active`; never add a global queue-clear
+  action as a substitute for durable deduplication and scoped cancellation.
   Completed-scan child links are released after the retention window so they
   do not pin terminal job history forever; scan root records remain auditable.
   Terminal cleanup is index-backed and remains an explicit operator action.

@@ -83,6 +83,37 @@ async fn database_backed_admin_routes_are_durable_and_idempotent(
     assert_eq!(scan_queue["succeeded"], 0);
     assert_eq!(scan_queue["cancelled"], 0);
 
+    let active_catalog_work = status["data"]["activeCatalogWork"]
+        .as_array()
+        .ok_or("active catalog work was not reported")?;
+    assert_eq!(active_catalog_work.len(), 1);
+    assert_eq!(active_catalog_work[0]["jobId"], scan_id);
+    assert_eq!(active_catalog_work[0]["jobType"], "admin.scan");
+    assert_eq!(active_catalog_work[0]["status"], "queued");
+    assert_eq!(active_catalog_work[0]["mode"], "full_sweep");
+    assert_eq!(
+        active_catalog_work[0]["mediaTypes"],
+        serde_json::json!(["movie", "tv"])
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/admin/v1/scans")
+                .header("x-api-key", ADMIN_KEY)
+                .header("idempotency-key", "database-scan-busy-1")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"mode":"missing_only","mediaTypes":["movie"]}"#,
+                ))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let conflict: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 4 * 1024).await?)?;
+    assert_eq!(conflict["code"], "catalog_maintenance_active");
+    assert_eq!(conflict["detail"], "Catalog maintenance is already active.");
+
     let response = app
         .clone()
         .oneshot(
