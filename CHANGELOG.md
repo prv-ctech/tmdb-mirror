@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Standardized host and container listeners on `9000` for the read API,
+  `9001` for the authenticated admin API, and `9002` for media.
 - Replaced the legacy Python service and custom catalog routes with the Rust
   TMDB v3-compatible surface.
 - Replaced global media full/missing/audit scans, original images, derivatives,

@@ -92,10 +92,18 @@ grep -Fq '$$POSTGRES_DB' "$compose_file" || die 'health check must use POSTGRES_
 for setting in wal_level=replica archive_mode=on 'archive_command=pgbackrest --stanza=tmdb archive-push %p'; do
     grep -Fq -- "$setting" "$compose_file" || die "PITR setting is missing: $setting"
 done
-grep -Eq '^[[:space:]]*-[[:space:]]*"9001:8080"[[:space:]]*$' "$compose_file" \
+grep -Eq '^[[:space:]]*-[[:space:]]*"9000:9000"[[:space:]]*$' "$compose_file" \
     || die 'public API port mapping is missing'
-grep -Eq '^[[:space:]]*-[[:space:]]*"8081:8081"[[:space:]]*$' "$compose_file" \
+grep -Eq '^[[:space:]]*-[[:space:]]*"9001:9001"[[:space:]]*$' "$compose_file" \
     || die 'admin API port mapping is missing'
+grep -Eq '^[[:space:]]*-[[:space:]]*"9002:9002"[[:space:]]*$' "$compose_file" \
+    || die 'media port mapping is missing'
+grep -Fq 'http://127.0.0.1:9000/health/live' "$compose_file" \
+    || die 'public API health check uses the wrong container port'
+grep -Fq 'http://127.0.0.1:9002/health/live' "$compose_file" \
+    || die 'media health check uses the wrong container port'
+! grep -Eq ':[[:space:]]*(8080|8081|8090)([^0-9]|$)' "$compose_file" \
+    || die 'legacy container listener port remains'
 grep -Fq '"your.network":' "$compose_file" || die 'neutral external network placeholder is missing'
 grep -Eq '^[[:space:]]{4}external:[[:space:]]+true[[:space:]]*$' "$compose_file" \
     || die 'application network must be external'

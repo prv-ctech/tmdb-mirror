@@ -19,6 +19,10 @@ chmod 600 secrets.txt
   --postgres-port 55433
 ```
 
+These loopback-only stress host ports intentionally differ from production;
+Compose maps them to the same `9000` read, `9001` admin, and `9002` media
+container listeners used by the production images.
+
 The loader reads the real TMDB token only from ignored `secrets.txt`, writes a
 mode-600 runtime secret file, and never puts credentials in Compose output,
 logs, reports, source, or image layers. The disposable environment disables

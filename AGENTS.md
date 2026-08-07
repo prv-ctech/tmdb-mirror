@@ -146,9 +146,9 @@ change.
 - Put host bind sources and published ports in Compose, not `.env`.
 - Portable sources are `./data/postgres18`, `./data/config`, and
   `./data/media`; operators may edit those Compose lines for their host.
-- Keep the default mappings `9001:8080` for the public API, `8081:8081` for
-  the authenticated admin API, and `9002:8090` for media. Treat host port
-  `8081` as private operational access and protect it with the host firewall.
+- Keep the default mappings `9000:9000` for the public API, `9001:9001` for
+  the authenticated admin API, and `9002:9002` for media. Treat host port
+  `9001` as private operational access and protect it with the host firewall.
 - Use explicit unique project names and loopback ports for disposable stress
   stacks. Never touch unrelated containers, volumes, networks, or databases.
 - Never use `down -v` except for a named disposable stress project.

@@ -87,12 +87,12 @@ impl AppConfig {
         let api_bind = parse_or(
             source,
             "TMDB_API_BIND",
-            SocketAddr::from(([0, 0, 0, 0], 8080)),
+            SocketAddr::from(([0, 0, 0, 0], 9000)),
         )?;
         let admin_bind = parse_or(
             source,
             "TMDB_ADMIN_BIND",
-            SocketAddr::from(([0, 0, 0, 0], 8081)),
+            SocketAddr::from(([0, 0, 0, 0], 9001)),
         )?;
         let database = load_shared_database(source, environment)?;
         let storage_roots = StorageRoots::fixed();

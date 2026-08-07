@@ -76,10 +76,10 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "8080:8080"
-      - "8081:8081"
+      - "9000:9000"
+      - "9001:9001"
     healthcheck:
-      test: [CMD, curl, --fail, --silent, --show-error, http://127.0.0.1:8080/health/live]
+      test: [CMD, curl, --fail, --silent, --show-error, http://127.0.0.1:9000/health/live]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -121,7 +121,7 @@ services:
       - tmdb-media:/media
       - tmdb-config:/config
     ports:
-      - "8090:8090"
+      - "9002:9002"
     cap_add:
       - CHOWN
       - DAC_OVERRIDE
@@ -130,7 +130,7 @@ services:
       - SETUID
       - SETPCAP
     healthcheck:
-      test: [CMD, curl, --fail, --silent, http://127.0.0.1:8090/health/live]
+      test: [CMD, curl, --fail, --silent, http://127.0.0.1:9002/health/live]
       interval: 10s
       timeout: 5s
       retries: 12

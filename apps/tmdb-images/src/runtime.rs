@@ -28,6 +28,7 @@ use uuid::Uuid;
 const COMPONENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const IMAGE_JOB_TYPES: &[&str] = &[crate::image::IMAGE_JOB_TYPE, "system.noop"];
 const IMAGE_QUEUE_READY_RETRY: Duration = Duration::from_secs(1);
+const DEFAULT_MEDIA_BIND: &str = "0.0.0.0:9002";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ImageWorkerJob {
@@ -55,7 +56,7 @@ pub async fn run() -> anyhow::Result<()> {
     let allow_local_media = parse_or(source, "ALLOW_LOCAL_MEDIA", false)?;
     let trawl_fallback_configured =
         std::env::var("TMDB_TRAWL_BASE_URL").is_ok_and(|value| !value.trim().is_empty());
-    let media_bind = parse_or(source, "TMDB_MEDIA_BIND", "0.0.0.0:8090".to_owned())?
+    let media_bind = parse_or(source, "TMDB_MEDIA_BIND", DEFAULT_MEDIA_BIND.to_owned())?
         .parse::<SocketAddr>()
         .map_err(|_| anyhow::anyhow!("configuration field TMDB_MEDIA_BIND is invalid"))?;
     let pool = connect_direct(&database, PoolPolicy::ReadWrite)
@@ -688,6 +689,11 @@ mod tests {
     use super::*;
     use crate::image::{ImageEntityType, ImageKind};
     use std::time::Duration;
+
+    #[test]
+    fn media_listener_default_is_the_container_contract() {
+        assert_eq!(DEFAULT_MEDIA_BIND, "0.0.0.0:9002");
+    }
 
     #[test]
     fn image_queue_readiness_sql_keeps_boolean_terms_separated() {

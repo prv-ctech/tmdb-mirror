@@ -22,13 +22,13 @@ fn file_source(name: &str, path: &Path) -> MapSource {
 fn valid_entries(environment: &str) -> Vec<(OsString, OsString)> {
     [
         ("TMDB_ENVIRONMENT", environment),
-        ("TMDB_API_BIND", "127.0.0.1:8080"),
-        ("TMDB_ADMIN_BIND", "127.0.0.1:8081"),
+        ("TMDB_API_BIND", "127.0.0.1:19000"),
+        ("TMDB_ADMIN_BIND", "127.0.0.1:19001"),
         ("POSTGRES_DB", "example_catalog"),
         ("POSTGRES_USER", "example_owner"),
         ("POSTGRES_PASSWORD", DATABASE_PASSWORD),
         ("TMDB_TRAWL_BASE_URL", "http://trawl.internal:8080"),
-        ("TMDB_MEDIA_BASE_URL", "http://media.internal:8090/media"),
+        ("TMDB_MEDIA_BASE_URL", "http://media.internal:19002/media"),
         ("TMDB_API_KEY", ADMIN_API_KEY),
     ]
     .into_iter()
@@ -224,8 +224,8 @@ fn app_config_parses_typed_settings_and_redacts_secrets() -> Result<(), Box<dyn 
     let config = AppConfig::load(&source)?;
 
     assert_eq!(config.environment, Environment::Development);
-    assert_eq!(config.api_bind.to_string(), "127.0.0.1:8080");
-    assert_eq!(config.admin_bind.to_string(), "127.0.0.1:8081");
+    assert_eq!(config.api_bind.to_string(), "127.0.0.1:19000");
+    assert_eq!(config.admin_bind.to_string(), "127.0.0.1:19001");
     assert_eq!(config.database.host, "postgres");
     assert_eq!(config.database.port, 5432);
     assert_eq!(
@@ -271,8 +271,8 @@ fn app_config_uses_fixed_listener_defaults_when_omitted() -> Result<(), Box<dyn 
     entries.retain(|(key, _)| key != "TMDB_API_BIND" && key != "TMDB_ADMIN_BIND");
 
     let config = AppConfig::load(&source_from_entries(entries))?;
-    assert_eq!(config.api_bind.to_string(), "0.0.0.0:8080");
-    assert_eq!(config.admin_bind.to_string(), "0.0.0.0:8081");
+    assert_eq!(config.api_bind.to_string(), "0.0.0.0:9000");
+    assert_eq!(config.admin_bind.to_string(), "0.0.0.0:9001");
     Ok(())
 }
 

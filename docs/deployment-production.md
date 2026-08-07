@@ -45,9 +45,9 @@ existing host data layout must be retained:
 ./data/media      -> /media
 ```
 
-The API and media services publish host ports `9001`, `8081`, and `9002` to
-container ports `8080`, `8081`, and `8090`. Host mount paths are Compose
-deployment settings, not application environment variables.
+The API and media services publish the fixed public `9000`, admin `9001`, and
+media `9002` container listeners on the same host ports. Host mount paths are
+Compose deployment settings, not application environment variables.
 
 All four services use one external Docker network. The tracked Compose files
 use `your.network` as a neutral placeholder; replace every
@@ -122,8 +122,8 @@ TMDB_INGEST_WRITER_* TMDB_IMAGE_WRITER_* TMDB_MONITOR_*
 TMDB_ENABLE_SCHEDULER TMDB_ENABLE_DAILY_EXPORT
 ```
 
-The first three listener settings default to the container ports `8080`,
-`8081`, and `8090`; host ports are defined only in Compose. The database
+The first three listener settings default to the container ports `9000`,
+`9001`, and `9002`; host ports are defined only in Compose. The database
 connection is always `postgres:5432`, and the image supplies PostgreSQL init
 defaults. Boolean scheduler toggles are obsolete. The three five-field cron
 values in `.env.example` schedule `daily_sync`, `missing_only`, and `reconcile`;
@@ -275,9 +275,9 @@ The existing Trawl instance is used only as the challenge fallback:
 `TMDB_TRAWL_BASE_URL=http://<trawl-host>:8191`.
 
 The API service shares the configured external network with PostgreSQL, the
-worker, and media. The Compose file publishes host port `8081` for the
+worker, and media. The Compose file publishes host port `9001` for the
 authenticated admin listener. It can also be reached by a trusted container
-on the network at `http://tmdb-mirror-api:8081/admin/v1/status` or `/metrics`
+on the network at `http://tmdb-mirror-api:9001/admin/v1/status` or `/metrics`
 using the admin key.
 
 Backup and offline recovery steps are in [backup-recovery.md](backup-recovery.md).

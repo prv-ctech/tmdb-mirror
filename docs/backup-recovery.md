@@ -28,7 +28,7 @@ terminal failures retain the durable failure record.
 From a trusted container on the external network configured in Compose:
 
 ```bash
-admin_base=http://tmdb-mirror-api:8081
+admin_base=http://tmdb-mirror-api:9001
 admin_key='<TMDB_ADMIN_API_KEY>'
 
 curl -sS -X POST "$admin_base/admin/v1/backups" \

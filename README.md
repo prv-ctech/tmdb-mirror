@@ -12,13 +12,13 @@ pulls the published Linux AMD64 images and uses relative `./data` bind mounts:
 | Service | Host port | Purpose |
 | --- | ---: | --- |
 | `postgres` | none | PostgreSQL 18, migrations, WAL archiving, and pgBackRest |
-| `api` | `9001`, `8081` | Public catalog and authenticated admin APIs |
+| `api` | `9000`, `9001` | Public catalog and authenticated admin APIs |
 | `worker` | none | Migrations, scheduled catalog maintenance, and ingest jobs |
 | `media` | `9002` | On-demand image downloads and public image files |
 
-The API container listens on `8080` for the public catalog API and `8081` for
-the authenticated admin API. Compose publishes them as host ports `9001` and
-`8081` respectively.
+The API container listens on `9000` for the public catalog API and `9001` for
+the authenticated admin API. The media container listens on `9002`. The
+default Compose files publish those same three ports on the host.
 
 Keep the real runtime environment outside the repository. The template has
 placeholders only; never commit a token, password, or private key. For a
@@ -61,12 +61,11 @@ permissions, media policy, and validation.
 The [documentation map](docs/README.md) separates current operator contracts
 from historical design records.
 
-These files replace the older deployment contract. The four services and host
-ports remain the same, but the current files use the `tmdb-runtime` startup
-wrapper for worker/media storage preparation, relative Compose bind sources,
-and publish the authenticated admin listener on host port `8081`. The root
-standalone file reads `.env` beside it; the production file reads `../.env` by
-default or the file selected by `TMDB_ENV_FILE`.
+These files replace the older deployment contract. They use the `tmdb-runtime`
+startup wrapper for worker/media storage preparation, relative Compose bind
+sources, and the fixed `9000` read, `9001` admin, and `9002` media listener
+contract. The root standalone file reads `.env` beside it; the production file
+reads `../.env` by default or the file selected by `TMDB_ENV_FILE`.
 
 The current `.env.example` is intentionally minimal. Enter database owner
 credentials, the TMDB read token, admin key, media URL, worker identities, and

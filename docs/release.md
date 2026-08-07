@@ -34,10 +34,9 @@ docker compose --env-file "$TMDB_ENV_FILE" \
 ```
 
 The release template defaults to `./.env` when `TMDB_ENV_FILE` is not set. It
-publishes host ports `8080`, `8081`, and `8090` directly, while the checkout
-production example publishes `9001`, `8081`, and `9002`. Both use the same
-container ports and four-service topology; edit only the Compose `ports:` lines
-when different host ports are required.
+and the checkout production example both publish the fixed container listeners
+as host ports `9000` (read API), `9001` (admin API), and `9002` (media). To use
+different host ports, edit only the left side of the Compose `ports:` mappings.
 
 The release artifact uses the same neutral external network key
 `"your.network"`. Replace every occurrence with an existing Docker network

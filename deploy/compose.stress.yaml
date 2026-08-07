@@ -65,15 +65,15 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - 127.0.0.1:${TMDB_STRESS_API_PORT:-18080}:8080
-      - 127.0.0.1:${TMDB_STRESS_ADMIN_PORT:-18081}:8081
+      - 127.0.0.1:${TMDB_STRESS_API_PORT:-18080}:9000
+      - 127.0.0.1:${TMDB_STRESS_ADMIN_PORT:-18081}:9001
     read_only: true
     tmpfs: [/tmp]
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     init: true
     healthcheck:
-      test: [CMD, curl, --fail, --silent, --show-error, http://127.0.0.1:8080/health/live]
+      test: [CMD, curl, --fail, --silent, --show-error, http://127.0.0.1:9000/health/live]
       interval: 3s
       timeout: 3s
       retries: 30
@@ -115,14 +115,14 @@ services:
           nocopy: true
       - tmdb_stress_config:/config
     ports:
-      - 127.0.0.1:${TMDB_STRESS_IMAGE_PORT:-18090}:8090
+      - 127.0.0.1:${TMDB_STRESS_IMAGE_PORT:-18090}:9002
     read_only: true
     tmpfs: [/tmp]
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SETPCAP]
     healthcheck:
-      test: [CMD, curl, --fail, --silent, http://127.0.0.1:8090/health/live]
+      test: [CMD, curl, --fail, --silent, http://127.0.0.1:9002/health/live]
       interval: 3s
       timeout: 3s
       retries: 30

@@ -7,12 +7,12 @@ schema or an anime namespace, and it never proxies a request to TMDB on demand.
 
 | Listener | Default host port | Contract |
 | --- | ---: | --- |
-| Public API | `9001` | Health and `/3/...` TMDB documents |
-| Admin API | `8081` | Authenticated worker, scan, job, and backup control |
+| Public API | `9000` | Health and `/3/...` TMDB documents |
+| Admin API | `9001` | Authenticated worker, scan, job, and backup control |
 | Media | `9002` | Safe regular files below the local `/media` mount |
 
-These are the checkout Compose mappings. The container listeners are `8080`
-(public), `8081` (admin), and `8090` (media).
+The default host mappings and container listeners are `9000` (public), `9001`
+(admin), and `9002` (media).
 
 ## Public routes
 
@@ -145,7 +145,7 @@ MIME-mismatched responses are rejected. No local resize, re-encoding,
 ## Admin API
 
 The admin listener requires `X-API-Key` or a bearer token containing
-`TMDB_ADMIN_API_KEY`. Production publishes it on host port `8081`; protect
+`TMDB_ADMIN_API_KEY`. Production publishes it on host port `9001`; protect
 that port with the host firewall and keep the key secret.
 
 Every state-changing request requires an `Idempotency-Key`. Scans, job
@@ -217,7 +217,7 @@ from that scan remains unresolved in the dead-letter state.
 Example catalog scan:
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8081/admin/v1/scans \
+curl -sS -X POST http://127.0.0.1:9001/admin/v1/scans \
   -H "X-API-Key: $TMDB_ADMIN_API_KEY" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: full-sweep-example-001' \
@@ -227,7 +227,7 @@ curl -sS -X POST http://127.0.0.1:8081/admin/v1/scans \
 Recovery scan:
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8081/admin/v1/scans \
+curl -sS -X POST http://127.0.0.1:9001/admin/v1/scans \
   -H "X-API-Key: $TMDB_ADMIN_API_KEY" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: catalog-recovery-example-001' \
@@ -238,13 +238,13 @@ Both workers begin draining eligible durable work when their containers start.
 The controls remain useful for an operational pause or cancellation:
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8081/admin/v1/worker \
+curl -sS -X POST http://127.0.0.1:9001/admin/v1/worker \
   -H "X-API-Key: $TMDB_ADMIN_API_KEY" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: worker-start-example-001' \
   -d '{"action":"start"}'
 
-curl -sS -X POST http://127.0.0.1:8081/admin/v1/scans \
+curl -sS -X POST http://127.0.0.1:9001/admin/v1/scans \
   -H "X-API-Key: $TMDB_ADMIN_API_KEY" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: daily-sync-example-001' \
@@ -255,7 +255,7 @@ The media worker is independent. Submit a single or bulk request with the same
 endpoint; the request remains durable if the media container is offline:
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8081/admin/v1/media/requests \
+curl -sS -X POST http://127.0.0.1:9001/admin/v1/media/requests \
   -H "X-API-Key: $TMDB_ADMIN_API_KEY" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: dashboard-example-001' \
