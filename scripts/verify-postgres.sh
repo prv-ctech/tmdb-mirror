@@ -36,7 +36,8 @@ dev_compose_checked() {
     printf '%s' "$output"
 }
 
-container_name="${project}-postgres-1"
+postgres_service=tmdb-mirror-postgres
+container_name="${project}-${postgres_service}-1"
 volume_name="${project}_tmdb_pg18_data"
 internal_network="${project}_tmdb-internal"
 loopback_network="${project}_tmdb-loopback"
@@ -52,16 +53,16 @@ dev_env_value() {
 }
 
 dev_compose_checked config --quiet >/dev/null
-existing="$(docker_command ps -aq --filter "label=com.docker.compose.project=$project" --filter 'label=com.docker.compose.service=postgres')"
+existing="$(docker_command ps -aq --filter "label=com.docker.compose.project=$project" --filter "label=com.docker.compose.service=$postgres_service")"
 if [[ -z "$existing" ]] && command -v ss >/dev/null 2>&1 && ss -ltn "sport = :$port" | tail -n +2 | grep -q .; then
     die "127.0.0.1:$port is occupied by an unrelated process"
 fi
-dev_compose_checked up -d postgres >/dev/null
+dev_compose_checked up -d "$postgres_service" >/dev/null
 
 container_id=''
 deadline=$((SECONDS + 180))
 while (( SECONDS < deadline )); do
-    container_id="$(dev_compose ps -q postgres 2>/dev/null || true)"
+    container_id="$(dev_compose ps -q "$postgres_service" 2>/dev/null || true)"
     if [[ -n "$container_id" ]]; then
         health="$(docker_command inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container_id" 2>/dev/null || true)"
         [[ "$health" == 'running|healthy' ]] && break
@@ -98,7 +99,7 @@ database_name="$(dev_env_value POSTGRES_DB)"
 database_user="$(dev_env_value POSTGRES_USER)"
 database_password="$(dev_env_value POSTGRES_PASSWORD)"
 psql_scalar() {
-    dev_compose exec -T -e "PGPASSWORD=$database_password" postgres psql -X -v ON_ERROR_STOP=1 -At \
+    dev_compose exec -T -e "PGPASSWORD=$database_password" "$postgres_service" psql -X -v ON_ERROR_STOP=1 -At \
         --username "$database_user" --dbname "$database_name" -c "$1"
 }
 [[ "$(psql_scalar 'SHOW server_version')" =~ ^18\. ]] || die 'PostgreSQL server major version is not 18'

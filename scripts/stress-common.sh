@@ -13,6 +13,7 @@ API_PORT="${TMDB_STRESS_API_PORT:-18080}"
 ADMIN_PORT="${TMDB_STRESS_ADMIN_PORT:-18081}"
 IMAGE_PORT="${TMDB_STRESS_IMAGE_PORT:-18090}"
 POSTGRES_PORT="${TMDB_STRESS_PG_PORT:-55433}"
+POSTGRES_SERVICE=tmdb-mirror-postgres
 COMPOSE_FILE="$REPO_ROOT/deploy/compose.stress.yaml"
 RUNTIME_ROOT="$REPO_ROOT/.stress-runtime/$PROJECT_NAME"
 SECRET_RUNTIME_ROOT="${TMDB_STRESS_SECRET_RUNTIME_ROOT:-/tmp/tmdb-stress-secrets}"
@@ -221,18 +222,18 @@ database_name() { env_value POSTGRES_DB; }
 database_user() { env_value POSTGRES_USER; }
 
 database_password() {
-    compose exec -T postgres printenv POSTGRES_PASSWORD
+    compose exec -T "$POSTGRES_SERVICE" printenv POSTGRES_PASSWORD
 }
 
 psql_query() {
     local password="$1" sql="$2"
-    compose exec -T -e "PGPASSWORD=$password" postgres psql -X -v ON_ERROR_STOP=1 \
+    compose exec -T -e "PGPASSWORD=$password" "$POSTGRES_SERVICE" psql -X -v ON_ERROR_STOP=1 \
         --username "$(database_user)" --dbname "$(database_name)" -c "$sql"
 }
 
 psql_at() {
     local password="$1" sql="$2"
-    compose exec -T -e "PGPASSWORD=$password" postgres psql -X -v ON_ERROR_STOP=1 -At \
+    compose exec -T -e "PGPASSWORD=$password" "$POSTGRES_SERVICE" psql -X -v ON_ERROR_STOP=1 -At \
         --username "$(database_user)" --dbname "$(database_name)" -c "$sql"
 }
 

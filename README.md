@@ -11,7 +11,7 @@ pulls the published Linux AMD64 images and uses relative `./data` bind mounts:
 
 | Service | Host port | Purpose |
 | --- | ---: | --- |
-| `postgres` | none | PostgreSQL 18, migrations, WAL archiving, and pgBackRest |
+| `tmdb-mirror-postgres` | none | PostgreSQL 18, migrations, WAL archiving, and pgBackRest |
 | `api` | `9000`, `9001` | Public catalog and authenticated admin APIs |
 | `worker` | none | Migrations, scheduled catalog maintenance, and ingest jobs |
 | `media` | `9002` | On-demand image downloads and public image files |
@@ -54,6 +54,9 @@ The external network named in the Compose file must already exist. The Git
 examples use `your.network` as a neutral placeholder; replace every
 `"your.network"` network reference with your existing Docker network name
 before starting the stack. All four services use this one external network.
+The database service is deliberately named `tmdb-mirror-postgres`; do not
+shorten it to `postgres` on a network shared with other Compose projects.
+Published host ports do not affect container-to-container DNS or port `5432`.
 The application paths inside containers are fixed: `/config` for raw catalog
 exports, persistent logs, and backups; `/media` for final public image files.
 The media worker publishes through temporary files beside their final
@@ -159,7 +162,7 @@ The development Compose file starts only an isolated PostgreSQL fixture:
 
 ```bash
 docker compose --env-file deploy/env.example \
-  -f deploy/compose.dev.yaml up -d postgres
+  -f deploy/compose.dev.yaml up -d tmdb-mirror-postgres
 ./scripts/verify-postgres.sh
 ```
 
@@ -180,8 +183,9 @@ repository at `/config/backups/pgbackrest`. See
 
 All four services stream JSONL to Docker and persist the same stream below
 `/config/logs`. The first process start uses `api.log`, `worker.log`,
-`media.log`, or `postgres.log`; later starts add a numeric suffix. Each service
-retains only its newest 10 files.
+`media.log`, or `postgres.log`. A restart or 10 MiB size rollover creates the
+next numeric file, and each service retains its newest 10 files. Compose also
+limits Docker's own `json-file` output to three 10 MiB files per container.
 
 GitHub publishes rolling `main` images, immutable versioned images, and a
 digest-pinned release Compose artifact. See [release notes](docs/release.md).

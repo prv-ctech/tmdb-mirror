@@ -2,6 +2,12 @@ name: tmdb-mirror
 
 # Standalone Compose example. Keep .env beside this file.
 
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 x-app-common: &app-common
   image: ghcr.io/prv-ctech/tmdb-mirror:main
   restart: unless-stopped
@@ -16,9 +22,10 @@ x-app-common: &app-common
     - ALL
   init: true
   stop_grace_period: 45s
+  logging: *default-logging
 
 services:
-  postgres:
+  tmdb-mirror-postgres:
     image: ghcr.io/prv-ctech/tmdb-mirror-postgres:main
     user: "0:0"
     container_name: tmdb-mirror-postgres
@@ -27,6 +34,7 @@ services:
       - .env
     shm_size: 2gb
     stop_grace_period: 2m
+    logging: *default-logging
     command:
       - postgres
       - -c
@@ -84,7 +92,7 @@ services:
     container_name: tmdb-mirror-api
     entrypoint: [/usr/local/bin/tmdb-runtime, api]
     depends_on:
-      postgres:
+      tmdb-mirror-postgres:
         condition: service_healthy
     volumes:
       - type: bind
@@ -113,7 +121,7 @@ services:
     user: "0:0"
     init: false
     depends_on:
-      postgres:
+      tmdb-mirror-postgres:
         condition: service_healthy
     volumes:
       - type: bind
@@ -132,7 +140,7 @@ services:
     user: "0:0"
     init: false
     depends_on:
-      postgres:
+      tmdb-mirror-postgres:
         condition: service_healthy
     volumes:
       - type: bind

@@ -28,7 +28,7 @@ raw_logs="$(mktemp)"
 raw_postgres="$(mktemp)"
 trap 'rm -f "$raw_logs" "$raw_postgres"' EXIT
 compose logs --no-color --timestamps >"$raw_logs" 2>&1 || true
-compose logs --no-color --timestamps postgres >"$raw_postgres" 2>&1 || true
+compose logs --no-color --timestamps "$POSTGRES_SERVICE" >"$raw_postgres" 2>&1 || true
 redact_file "$raw_logs" "$logs_file"
 redact_file "$raw_postgres" "$postgres_logs"
 container_ids=()

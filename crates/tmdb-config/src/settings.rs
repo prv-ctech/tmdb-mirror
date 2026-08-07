@@ -75,7 +75,8 @@ impl AppConfig {
     /// `POSTGRES_USER`, and `POSTGRES_PASSWORD`. Listener overrides are
     /// optional; the four-container deployment defaults them to the fixed
     /// internal ports. The database host and port are fixed to
-    /// `postgres:5432`; filesystem roots are fixed to `/media` and `/config`.
+    /// `tmdb-mirror-postgres:5432`; filesystem roots are fixed to `/media` and
+    /// `/config`.
     ///
     /// # Errors
     ///
@@ -141,8 +142,9 @@ fn optional_secret(
 
 /// Loads the base database identity used for initialization and compatibility.
 ///
-/// The four-container deployment always connects to the Compose service at
-/// `postgres:5432`. The standard `POSTGRES_*` values initialize `PostgreSQL`.
+/// The four-container deployment always connects to the product-unique
+/// Compose service at `tmdb-mirror-postgres:5432`. The standard `POSTGRES_*`
+/// values initialize `PostgreSQL`.
 ///
 /// # Errors
 ///
@@ -164,7 +166,7 @@ pub fn load_shared_database(
     }
 
     Ok(DatabaseConfig {
-        host: "postgres".to_owned(),
+        host: "tmdb-mirror-postgres".to_owned(),
         port: 5432,
         database,
         username,

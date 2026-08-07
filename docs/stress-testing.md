@@ -144,6 +144,10 @@ Start with a smaller endpoint profile before the 100-client run.
 ./infra/postgres/tests/pgbackrest-pitr.test.sh
 ```
 
+The Compose validator verifies the three-file, 10 MiB Docker log limit for all
+four services. The runtime test verifies both restart generations and 10 MiB
+in-process rollover while retaining only the newest 10 persistent JSONL files.
+
 The backup API accepts `{"type":"full"}` or `{"type":"differential"}`.
 Poll the returned durable job, check `/admin/v1/backups`, then verify the
 pgBackRest repository. Restore remains an offline procedure.

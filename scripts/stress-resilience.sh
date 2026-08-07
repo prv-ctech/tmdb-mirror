@@ -86,11 +86,11 @@ after_media="$(container_state media)"
 after_media_restart_control="$(admin_worker_state /admin/v1/media/worker)"
 start_worker /admin/v1/media/worker "resilience-restart-start-media-$stamp"
 
-compose_checked stop postgres >/dev/null
+compose_checked stop "$POSTGRES_SERVICE" >/dev/null
 sleep 5
 during_ready="$(http_status "$ready_url")"
-compose_checked start postgres >/dev/null
-wait_for_health postgres 90
+compose_checked start "$POSTGRES_SERVICE" >/dev/null
+wait_for_health "$POSTGRES_SERVICE" 90
 
 after_ready=000
 deadline=$((SECONDS + 90))
@@ -108,7 +108,7 @@ start_worker /admin/v1/media/worker "resilience-recovery-start-media-$stamp"
 final_ingest_control="$(admin_worker_state /admin/v1/worker)"
 final_media_control="$(admin_worker_state /admin/v1/media/worker)"
 
-compose logs --no-color --timestamps api postgres worker media >"$log_file" 2>&1 || true
+compose logs --no-color --timestamps api "$POSTGRES_SERVICE" worker media >"$log_file" 2>&1 || true
 redact "$(<"$log_file")" >"$log_file.redacted"
 mv -f "$log_file.redacted" "$log_file"
 

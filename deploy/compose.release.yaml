@@ -4,6 +4,12 @@
 
 name: tmdb-mirror
 
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 x-app-common: &app-common
   image: __TMDB_MIRROR_APP_IMAGE__
   restart: unless-stopped
@@ -18,9 +24,10 @@ x-app-common: &app-common
     - ALL
   init: true
   stop_grace_period: 45s
+  logging: *default-logging
 
 services:
-  postgres:
+  tmdb-mirror-postgres:
     image: __TMDB_MIRROR_POSTGRES_IMAGE__
     user: "0:0"
     restart: unless-stopped
@@ -28,6 +35,7 @@ services:
       - ${TMDB_ENV_FILE:-./.env}
     shm_size: 2gb
     stop_grace_period: 2m
+    logging: *default-logging
     command:
       - postgres
       - -c
@@ -76,7 +84,7 @@ services:
     <<: *app-common
     entrypoint: [/usr/local/bin/tmdb-runtime, api]
     depends_on:
-      postgres:
+      tmdb-mirror-postgres:
         condition: service_healthy
     volumes:
       - tmdb-config:/config
@@ -100,7 +108,7 @@ services:
     entrypoint: [/usr/local/bin/tmdb-runtime, worker]
     user: "0:0"
     depends_on:
-      postgres:
+      tmdb-mirror-postgres:
         condition: service_healthy
     volumes:
       - tmdb-config:/config
@@ -120,7 +128,7 @@ services:
     entrypoint: [/usr/local/bin/tmdb-runtime, media]
     user: "0:0"
     depends_on:
-      postgres:
+      tmdb-mirror-postgres:
         condition: service_healthy
     volumes:
       - tmdb-media:/media

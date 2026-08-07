@@ -81,9 +81,11 @@ grep -Eq 'target:[[:space:]]*/media([[:space:]]|$)' "$compose_file" || die 'Comp
 grep -Eq 'target:[[:space:]]*/config([[:space:]]|$)' "$compose_file" || die 'Compose is missing the fixed /config mount'
 [[ "$(grep -Ec 'target:[[:space:]]*/config([[:space:]]|$)' "$compose_file")" -eq 4 ]] \
     || die 'all four services must mount the shared /config appdata root'
-for service in postgres api worker media; do
+for service in tmdb-mirror-postgres api worker media; do
     grep -Eq "^[[:space:]]{2}${service}:" "$compose_file" || die "Compose is missing service: $service"
 done
+! grep -Eq '^[[:space:]]{2}postgres:' "$compose_file" \
+    || die 'generic postgres service name is unsafe on a shared external network'
 for legacy in pgbouncer image-server admin-migrate storage-init; do
     ! grep -Eq "^[[:space:]]{2}${legacy}:" "$compose_file" || die "legacy service remains: $legacy"
 done
@@ -130,12 +132,25 @@ grep -Eq 'cap_add:[[:space:]]*\[[[:space:]]*CHOWN,[[:space:]]*DAC_OVERRIDE,[[:sp
 # file is tested without exposing its values in command output.
 mkdir -p "$REPO_ROOT/.stress-runtime"
 interpolation_file="$REPO_ROOT/.stress-runtime/compose-validator.$$.env"
-trap 'rm -f "$interpolation_file"' EXIT
+rendered_file="$REPO_ROOT/.stress-runtime/compose-validator.$$.yaml"
+trap 'rm -f "$interpolation_file" "$rendered_file"' EXIT
 printf 'TMDB_ENV_FILE=%s\n' "$(docker_path "$env_file")" >"$interpolation_file"
 chmod 600 "$interpolation_file"
 docker_command compose \
     --env-file "$(docker_path "$interpolation_file")" \
-    --file "$(docker_path "$compose_file")" config --quiet >/dev/null \
+    --file "$(docker_path "$compose_file")" config --no-env-resolution >"$rendered_file" \
     || die 'Docker Compose rejected the production template or interpolation'
+for service in tmdb-mirror-postgres api worker media; do
+    awk -v service="$service" '
+        $0 == "  " service ":" { found = 1; inside = 1; next }
+        inside && ($0 ~ /^[^ ]/ || $0 ~ /^  [^ ]/) { exit }
+        inside && $0 == "    logging:" { logging = 1 }
+        inside && $0 == "      driver: json-file" { driver = 1 }
+        inside && $0 == "        max-file: \"3\"" { files = 1 }
+        inside && $0 == "        max-size: 10m" { size = 1 }
+        END { exit !(found && logging && driver && files && size) }
+    ' "$rendered_file" \
+        || die "$service must limit Docker json-file logs to three 10 MiB files"
+done
 
 printf '%s\n' 'Production Compose interpolation and fixed four-container contracts passed.'

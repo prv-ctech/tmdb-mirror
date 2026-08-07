@@ -24,14 +24,14 @@ seed_file="$REPO_ROOT/scripts/stress-seed.sql"
 
 password="$(database_password)"
 [[ -n "$password" ]] || die 'disposable database password is empty'
-container="$(compose ps -q postgres)"
+container="$(compose ps -q "$POSTGRES_SERVICE")"
 [[ -n "$container" ]] || die 'postgres container is unavailable'
 container_seed_path=/tmp/tmdb-stress-seed.sql
 docker_command cp "$(docker_path "$seed_file")" "$container:$container_seed_path"
-cleanup() { compose exec -T postgres rm -f "$container_seed_path" >/dev/null 2>&1 || true; }
+cleanup() { compose exec -T "$POSTGRES_SERVICE" rm -f "$container_seed_path" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
-compose exec -T -e "PGPASSWORD=$password" postgres psql -X -v ON_ERROR_STOP=1 \
+compose exec -T -e "PGPASSWORD=$password" "$POSTGRES_SERVICE" psql -X -v ON_ERROR_STOP=1 \
     --username "$(database_user)" --dbname "$(database_name)" \
     --set="seed_count=$count" --set='seed_base=900000000' --set='seed_limit=2000000' \
     --file "$container_seed_path"

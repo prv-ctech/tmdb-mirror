@@ -31,8 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Linux/Bash Docker stress harness with secret-safe real-TMDB fixtures,
   media checks, worker-state checks, HTTP load, and resilience tests.
 - Persistent JSONL logs for PostgreSQL, API, worker, and media under the shared
-  `/config/logs` appdata root, with per-restart generations and 10-file
-  retention per service.
+  `/config/logs` appdata root, with restart and 10 MiB size generations plus
+  10-file retention per service.
 
 ### Changed
 
@@ -64,9 +64,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Competing catalog scans return a machine-readable
   `catalog_maintenance_active` conflict, and the canonical request log records
   the same outcome instead of a generic error.
+- Compose now caps Docker `json-file` output at three 10 MiB files per
+  container so each container's Docker/Unraid log storage remains bounded.
 
 ### Fixed
 
+- Replaced the generic shared-network database hostname `postgres` with the
+  product-unique `tmdb-mirror-postgres`, preventing cross-project DNS alias
+  collisions from causing intermittent internal-role authentication failures.
 - Catalog phase contention, queue-capacity deadlocks and lock timeouts,
   cancellation races, source-path media reconciliation, API schema grants,
   and transient queue failures that previously could terminate a worker

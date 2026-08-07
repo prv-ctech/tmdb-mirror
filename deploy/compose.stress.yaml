@@ -1,10 +1,17 @@
 # Disposable four-container stress environment. Runtime settings are written
 # once to the ignored compose.env file by scripts/stress-bootstrap.sh.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
-  postgres:
+  tmdb-mirror-postgres:
     image: ${TMDB_STRESS_POSTGRES_IMAGE:-tmdb-stress-postgres:local}
     user: "0:0"
     restart: unless-stopped
+    logging: *default-logging
     env_file: ["${TMDB_STRESS_ENV_FILE:?TMDB_STRESS_ENV_FILE must be set}"]
     shm_size: 1gb
     stop_grace_period: 2m
@@ -61,10 +68,11 @@ services:
   api:
     image: ${TMDB_STRESS_APP_IMAGE:-tmdb-stress-app:local}
     restart: on-failure
+    logging: *default-logging
     env_file: ["${TMDB_STRESS_ENV_FILE:?TMDB_STRESS_ENV_FILE must be set}"]
     entrypoint: [/usr/local/bin/tmdb-runtime, api]
     depends_on:
-      postgres:
+      tmdb-mirror-postgres:
         condition: service_healthy
     volumes:
       - tmdb_stress_config:/config
@@ -88,11 +96,12 @@ services:
   worker:
     image: ${TMDB_STRESS_APP_IMAGE:-tmdb-stress-app:local}
     restart: on-failure
+    logging: *default-logging
     env_file: ["${TMDB_STRESS_ENV_FILE:?TMDB_STRESS_ENV_FILE must be set}"]
     entrypoint: [/usr/local/bin/tmdb-runtime, worker]
     user: "0:0"
     depends_on:
-      postgres:
+      tmdb-mirror-postgres:
         condition: service_healthy
     volumes:
       - tmdb_stress_config:/config
@@ -107,11 +116,12 @@ services:
   media:
     image: ${TMDB_STRESS_APP_IMAGE:-tmdb-stress-app:local}
     restart: on-failure
+    logging: *default-logging
     env_file: ["${TMDB_STRESS_ENV_FILE:?TMDB_STRESS_ENV_FILE must be set}"]
     entrypoint: [/usr/local/bin/tmdb-runtime, media]
     user: "0:0"
     depends_on:
-      postgres:
+      tmdb-mirror-postgres:
         condition: service_healthy
     volumes:
       - type: volume

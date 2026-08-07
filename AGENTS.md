@@ -150,8 +150,9 @@ change.
   `/config/media` are obsolete and must not be recreated.
 - API, worker, media, and PostgreSQL must emit JSONL to Docker and persist the
   identical stream under `/config/logs`. Use `api.log`, `worker.log`,
-  `media.log`, and `postgres.log` for the first process start, increment a
-  numeric suffix on each restart, and retain only the newest 10 per service.
+  `media.log`, and `postgres.log` for the first process start. Increment the
+  numeric suffix on each restart or 10 MiB size rollover, and retain only the
+  newest 10 per service.
 
 ## Compose contract
 
@@ -160,6 +161,12 @@ change.
 - Portable sources are `./data/postgres18`, `./data/config`, and
   `./data/media`; operators may edit those Compose lines for their host.
 - All four services mount the same `/config` appdata root so logs are durable.
+- Keep the database Compose service and fixed application hostname named
+  `tmdb-mirror-postgres`. Never use the generic `postgres` service name on the
+  shared external network; aliases shared by multiple projects resolve
+  nondeterministically, and host port changes do not affect internal DNS.
+- All services must limit Docker's `json-file` output to three 10 MiB files.
+  Logging-option changes require container recreation, not only restart.
 - Keep the default mappings `9000:9000` for the public API, `9001:9001` for
   the authenticated admin API, and `9002:9002` for media. Treat host port
   `9001` as private operational access and protect it with the host firewall.

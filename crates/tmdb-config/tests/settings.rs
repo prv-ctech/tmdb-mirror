@@ -50,17 +50,26 @@ fn shared_database_entries(environment: &str) -> MapSource {
 }
 
 #[test]
-fn role_database_uses_fixed_identity_and_shared_password() -> Result<(), Box<dyn std::error::Error>>
-{
+fn all_role_databases_use_fixed_identities_and_one_shared_password()
+-> Result<(), Box<dyn std::error::Error>> {
     let source = MapSource::from([
         ("TMDB_ENVIRONMENT", "test"),
         ("POSTGRES_DB", "example_catalog"),
         ("POSTGRES_USER", "database_owner"),
         ("POSTGRES_PASSWORD", "owner-password"),
     ]);
-    let role = load_database_for_role(&source, Environment::Test, "api_reader")?;
-    assert_eq!(role.username, "api_reader");
-    assert_eq!(role.password.expose_secret(), "owner-password");
+    for role_name in [
+        "migrator",
+        "api_reader",
+        "api_job_submitter",
+        "ingest_writer",
+        "image_writer",
+        "monitor",
+    ] {
+        let role = load_database_for_role(&source, Environment::Test, role_name)?;
+        assert_eq!(role.username, role_name);
+        assert_eq!(role.password.expose_secret(), "owner-password");
+    }
     Ok(())
 }
 
@@ -225,7 +234,7 @@ fn app_config_parses_typed_settings_and_redacts_secrets() -> Result<(), Box<dyn 
     assert_eq!(config.environment, Environment::Development);
     assert_eq!(config.api_bind.to_string(), "127.0.0.1:19000");
     assert_eq!(config.admin_bind.to_string(), "127.0.0.1:19001");
-    assert_eq!(config.database.host, "postgres");
+    assert_eq!(config.database.host, "tmdb-mirror-postgres");
     assert_eq!(config.database.port, 5432);
     assert_eq!(config.storage_roots.images, std::path::Path::new("/media"));
     assert_eq!(
@@ -276,7 +285,7 @@ fn postgres_settings_accept_custom_identity() -> Result<(), Box<dyn std::error::
     let source = shared_database_entries("production");
     let config = load_shared_database(&source, Environment::Production)?;
 
-    assert_eq!(config.host, "postgres");
+    assert_eq!(config.host, "tmdb-mirror-postgres");
     assert_eq!(config.port, 5432);
     assert_eq!(config.database, "example_catalog");
     assert_eq!(config.username, "example_owner");

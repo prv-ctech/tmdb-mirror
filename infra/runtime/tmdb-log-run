@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 readonly TMDB_LOG_DIRECTORY=/config/logs
 readonly TMDB_LOG_RETENTION=10
+readonly TMDB_LOG_MAX_BYTES=$((10 * 1024 * 1024))
 
 log_run_error() {
     jq --null-input --compact-output \
@@ -112,6 +113,33 @@ allocate_log_file() {
     printf '%s\n' "$candidate"
 }
 
+persist_log_stream() {
+    local directory="$1"
+    local service="$2"
+    local max_bytes="$3"
+    local log_file="$4"
+    local current_size line line_bytes log_fd
+    local LC_ALL=C
+
+    [[ "$max_bytes" =~ ^[1-9][0-9]*$ ]] || return 64
+    current_size="$(stat -c %s "$log_file")" || return 74
+    exec {log_fd}>>"$log_file" || return 74
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line_bytes=$((${#line} + 1))
+        if ((current_size > 0 && current_size + line_bytes > max_bytes)); then
+            exec {log_fd}>&-
+            log_file="$(allocate_log_file "$directory" "$service")" || return 74
+            current_size=0
+            exec {log_fd}>>"$log_file" || return 74
+        fi
+        printf '%s\n' "$line"
+        printf '%s\n' "$line" >&"$log_fd"
+        current_size=$((current_size + line_bytes))
+    done
+    exec {log_fd}>&-
+}
+
 forward_signal() {
     local signal="$1"
     if [[ -n "${child_pid:-}" ]]; then
@@ -155,7 +183,9 @@ run_logged() {
                       fields: {event: "process_output", message: $line}
                   }
               end
-        ' <"$fifo" | tee -a "$log_file"
+        ' <"$fifo" \
+            | persist_log_stream \
+                "$TMDB_LOG_DIRECTORY" "$service" "$TMDB_LOG_MAX_BYTES" "$log_file"
     ) &
     logger_pid=$!
 

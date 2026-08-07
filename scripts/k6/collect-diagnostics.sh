@@ -79,7 +79,7 @@ fi
 postgres_status='not_requested'
 postgres_id=''
 if [[ -n "$compose_project" ]]; then
-    postgres_id="$(docker_command ps -q --filter "label=com.docker.compose.project=$compose_project" --filter 'label=com.docker.compose.service=postgres' | head -n 1 || true)"
+    postgres_id="$(docker_command ps -q --filter "label=com.docker.compose.project=$compose_project" --filter "label=com.docker.compose.service=$POSTGRES_SERVICE" | head -n 1 || true)"
 fi
 if [[ -n "$postgres_id" ]]; then
     postgres_status='captured'

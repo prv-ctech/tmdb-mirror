@@ -53,6 +53,10 @@ All four services use one external Docker network. The tracked Compose files
 use `your.network` as a neutral placeholder; replace every
 `"your.network"` service and top-level network reference with an existing
 network name before starting the stack. No `tmdb-private` network is created.
+The database service name is the product-unique `tmdb-mirror-postgres` so a
+shared external network cannot confuse it with another project's database.
+Do not rename it to `postgres`. Host port mappings are irrelevant to internal
+DNS; application connections always use container port `5432`.
 
 The API, worker, and media processes run as UID/GID `10001`. PostgreSQL prepares
 the shared log directory before it becomes healthy. The API validates that
@@ -107,9 +111,10 @@ The PostgreSQL service uses `POSTGRES_DB`, `POSTGRES_USER`, and
 `POSTGRES_PASSWORD` for the database owner and health check. Application
 processes use the fixed `migrator`, `api_reader`, `api_job_submitter`,
 `ingest_writer`, `image_writer`, and `monitor` roles with that shared password.
-Their database permissions remain separate. The connection is fixed to the
-internal Compose service `postgres:5432`; do not add `DATABASE_*`, `TMDB_DB_*`,
-role identity, or per-process database settings.
+Their database permissions remain separate; operators do not configure six
+additional passwords. The connection is fixed to the internal Compose service
+`tmdb-mirror-postgres:5432`; do not add `DATABASE_*`, `TMDB_DB_*`, role
+identity, or per-process database settings.
 The PostgreSQL service starts as `0:0` so its entrypoint can prepare mounted
 data and pgBackRest children, then drops to PostgreSQL's unprivileged user.
 
@@ -130,11 +135,12 @@ TMDB_ENABLE_SCHEDULER TMDB_ENABLE_DAILY_EXPORT
 
 The first three listener settings default to the container ports `9000`,
 `9001`, and `9002`; host ports are defined only in Compose. The database
-connection is always `postgres:5432`, and the image supplies PostgreSQL init
-defaults. Boolean scheduler toggles are obsolete. The three five-field cron
-values in `.env.example` schedule `daily_sync`, `missing_only`, and `reconcile`;
-set one to an empty value to disable only that schedule. Optional retry,
-timeout, lease, heartbeat, and polling settings remain advanced overrides.
+connection is always `tmdb-mirror-postgres:5432`, and the image supplies
+PostgreSQL init defaults. Boolean scheduler toggles are obsolete. The three
+five-field cron values in `.env.example` schedule `daily_sync`, `missing_only`,
+and `reconcile`; set one to an empty value to disable only that schedule.
+Optional retry, timeout, lease, heartbeat, and polling settings remain
+advanced overrides.
 
 The root `docker-compose-example.yaml` and
 `deploy/compose.production.yaml` describe the same four-service topology and
@@ -151,9 +157,15 @@ before it starts upstream requests.
 
 All four containers emit JSONL to Docker/Unraid and write the identical stream
 to `/config/logs`. The first start creates `api.log`, `worker.log`, `media.log`,
-and `postgres.log`. Each later process start creates the next numeric file,
-such as `worker-1.log`; only the newest 10 files for each service are retained.
-Rotation is automatic and has no environment setting.
+and `postgres.log`. A restart or a 10 MiB size rollover creates the next
+numeric file, such as `worker-1.log`; only the newest 10 files for each service
+are retained. Compose separately limits Docker's `json-file` stream to three
+10 MiB files per container. Both limits are fixed and need no environment
+setting.
+
+Docker applies logging options when a container is created. After adopting a
+Compose file with these limits, recreate the four containers once; restarting
+an existing container does not change its Docker logging configuration.
 
 `TMDB_LOG_FORMAT` defaults to `json`. `TMDB_LOG_LEVEL=info` shows startup,
 storage checks, worker lifecycle, retries, dead letters, and media failures
@@ -282,7 +294,8 @@ workspace checks:
 ./scripts/validate-production-compose.sh --env-file "$TMDB_ENV_FILE"
 docker compose --env-file "$TMDB_ENV_FILE" -f deploy/compose.production.yaml ps
 docker compose --env-file "$TMDB_ENV_FILE" \
-  -f deploy/compose.production.yaml logs --no-color --tail=200 postgres worker api media
+  -f deploy/compose.production.yaml logs --no-color --tail=200 \
+  tmdb-mirror-postgres worker api media
 ```
 
 Exercise authentication, unknown-ID rejection, idempotency, offline worker

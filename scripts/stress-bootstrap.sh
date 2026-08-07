@@ -97,9 +97,9 @@ fi
 compose_checked config --quiet >/dev/null
 
 printf 'Starting isolated PostgreSQL project %s...\n' "$PROJECT_NAME"
-compose_checked up -d --remove-orphans postgres
-wait_for_health postgres
-compose exec -T postgres sh -ec \
+compose_checked up -d --remove-orphans "$POSTGRES_SERVICE"
+wait_for_health "$POSTGRES_SERVICE"
+compose exec -T "$POSTGRES_SERVICE" sh -ec \
     'test -x /usr/local/bin/tmdb-pgbackrest && pgbackrest version >/dev/null && test -d /config/backups/pgbackrest && test "$(stat -c %U /config/backups/pgbackrest)" = postgres' \
     || die 'PostgreSQL pgBackRest runtime contract is not ready'
 
@@ -133,7 +133,7 @@ ensure_owner_paths api 'test -w /config/logs'
 ensure_owner_paths worker 'test -w /config/raw && test -w /config/logs'
 ensure_owner_paths media 'test ! -e /config/media && test -w /media/movies && test -w /media/tv && test -w /media/people && test -w /media/networks && test -w /media/companies && test -w /media/collections'
 
-for service in postgres api worker media; do
+for service in api worker media; do
     compose exec -T "$service" sh -ec \
         'for path in "/config/logs/$1.log" /config/logs/"$1"-*.log; do
             if test -s "$path" && head -n 1 "$path" | jq -e '\''type == "object"'\'' >/dev/null; then
@@ -144,6 +144,14 @@ for service in postgres api worker media; do
         sh "$service" \
         || die "$service JSONL file log is not ready"
 done
+compose exec -T "$POSTGRES_SERVICE" sh -ec \
+    'for path in /config/logs/postgres.log /config/logs/postgres-*.log; do
+        if test -s "$path" && head -n 1 "$path" | jq -e '\''type == "object"'\'' >/dev/null; then
+            exit 0
+        fi
+     done
+     exit 1' \
+    || die 'postgres JSONL file log is not ready'
 
 printf 'Stress stack is ready: http://127.0.0.1:%s\n' "$api_port"
 printf 'Runtime metadata: %s\n' "$METADATA_FILE"
