@@ -59,24 +59,42 @@ async fn jobs_migration_has_exact_readiness_indexes_and_hardened_functions(
         [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49, 50, 51, 52
+            47, 48, 49, 50, 51, 52, 53
         ]
     );
     let revision: String = sqlx::query_scalar("SELECT schema_revision FROM ops.readiness")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(revision, "0052");
+    assert_eq!(revision, "0053");
 
-    let queue_limit_function: String = sqlx::query_scalar(
+    let queue_slot_function: String = sqlx::query_scalar(
         "SELECT pg_catalog.pg_get_functiondef(
-                    'ops.enforce_image_queue_limit()'::pg_catalog.regprocedure
+                    'ops.sync_job_queue_slot()'::pg_catalog.regprocedure
                 )",
     )
     .fetch_one(&pool)
     .await?;
-    assert!(queue_limit_function.contains("queue:capacity"));
-    assert!(queue_limit_function.contains("tmdb.queue_capacity_count"));
-    assert!(!queue_limit_function.contains("'queue:' || queue_name"));
+    assert!(queue_slot_function.contains("FOR UPDATE SKIP LOCKED"));
+    assert!(queue_slot_function.contains("job queue capacity reached"));
+    assert!(!queue_slot_function.contains("pg_advisory"));
+
+    let queue_capacities: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT queue_name, count(*)::bigint
+           FROM ops.job_queue_slots
+          GROUP BY queue_name
+          ORDER BY queue_name",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        queue_capacities,
+        [
+            ("image.download".to_owned(), 10_000),
+            ("season.refresh".to_owned(), 1_000),
+            ("title.enrichment".to_owned(), 1_000),
+            ("title.refresh".to_owned(), 1_000),
+        ]
+    );
 
     let indexes: Vec<(String, String)> = sqlx::query_as(
         "SELECT indexname, indexdef
@@ -234,30 +252,138 @@ async fn jobs_migration_has_exact_readiness_indexes_and_hardened_functions(
 }
 
 #[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
-async fn queue_capacity_count_is_cached_per_transaction(pool: PgPool) -> sqlx::Result<()> {
-    let mut transaction = pool.begin().await?;
-    for suffix in ["first", "second"] {
-        sqlx::query(
-            "SELECT job_id, was_duplicate
-               FROM ops.submit_job(
-                    gen_random_uuid(), 'image.download', 1, '{}'::text,
-                    0::smallint, 3, NULL::timestamptz, $1
-               )",
-        )
-        .bind(format!("capacity-cache-{suffix}"))
-        .execute(&mut *transaction)
-        .await?;
-    }
-    let cached: (Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT current_setting('tmdb.queue_capacity_name', true),
-                current_setting('tmdb.queue_capacity_count', true)",
+async fn queue_slots_track_unique_active_jobs_and_release_terminal_capacity(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let first: uuid::Uuid = sqlx::query_scalar(
+        "SELECT job_id
+           FROM ops.submit_job(
+                gen_random_uuid(), 'image.download', 1, '{}'::text,
+                0::smallint, 3, NULL::timestamptz, 'slot-first'
+           )",
     )
-    .fetch_one(&mut *transaction)
+    .fetch_one(&pool)
+    .await?;
+    let duplicate: uuid::Uuid = sqlx::query_scalar(
+        "SELECT job_id
+           FROM ops.submit_job(
+                gen_random_uuid(), 'image.download', 1, '{}'::text,
+                0::smallint, 3, NULL::timestamptz, 'slot-first'
+           )",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(duplicate, first);
+
+    let occupied: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ops.job_queue_slots
+          WHERE queue_name = 'image.download' AND job_id IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(occupied, 1);
+
+    sqlx::query(
+        "UPDATE ops.jobs
+            SET status = 'cancelled', finished_at = clock_timestamp(),
+                updated_at = clock_timestamp()
+          WHERE id = $1",
+    )
+    .bind(first)
+    .execute(&pool)
+    .await?;
+    let occupied: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ops.job_queue_slots
+          WHERE queue_name = 'image.download' AND job_id IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(occupied, 0);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+async fn concurrent_enrichment_admission_does_not_wait_for_peer_transactions(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let barrier = std::sync::Arc::new(Barrier::new(9));
+    let mut tasks = JoinSet::new();
+    for index in 0..8 {
+        let task_pool = pool.clone();
+        let task_barrier = std::sync::Arc::clone(&barrier);
+        tasks.spawn(async move {
+            task_barrier.wait().await;
+            let mut transaction = task_pool.begin().await?;
+            sqlx::query("SET LOCAL lock_timeout = '100ms'")
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query(
+                "SELECT job_id, was_duplicate
+                   FROM ops.submit_job(
+                        gen_random_uuid(), 'ingest.enrich_movie', 1,
+                        jsonb_build_object('tmdb_id', $1)::text,
+                        0::smallint, 3, NULL::timestamptz, $2
+                   )",
+            )
+            .bind(i64::from(index) + 1)
+            .bind(format!("concurrent-enrichment-{index}"))
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query("SELECT pg_catalog.pg_sleep(0.2)")
+                .execute(&mut *transaction)
+                .await?;
+            transaction.commit().await
+        });
+    }
+    barrier.wait().await;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(result) = tasks.join_next().await {
+            result??;
+        }
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })
+    .await??;
+
+    let active: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM ops.jobs
+          WHERE job_type = 'ingest.enrich_movie'
+            AND status IN ('queued', 'running', 'retry_wait')",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(active, 8);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "tmdb_db::MIGRATOR")]
+async fn exact_queue_ceiling_returns_typed_capacity_error(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    sqlx::query(
+        "INSERT INTO ops.jobs (
+             id, job_type, payload_version, payload, status, dedup_key
+         )
+         SELECT gen_random_uuid(), 'ingest.enrich_movie', 1,
+                jsonb_build_object('tmdb_id', sequence), 'queued',
+                'typed-capacity-' || sequence::text
+           FROM generate_series(1, 1000) AS sequence",
+    )
+    .execute(&pool)
     .await?;
 
-    assert_eq!(cached.0.as_deref(), Some("image.download"));
-    assert_eq!(cached.1.as_deref(), Some("2"));
-    transaction.rollback().await?;
+    let repository = JobRepository::new(pool);
+    let overflow = NewJob::new(
+        "ingest.enrich_movie",
+        1,
+        json!({"tmdb_id": 1001}),
+        "typed-capacity-overflow",
+    )?;
+    assert!(matches!(
+        repository.submit(overflow).await,
+        Err(JobError::Capacity)
+    ));
     Ok(())
 }
 

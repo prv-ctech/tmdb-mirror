@@ -25,6 +25,10 @@ changing code. This repository is Linux-first; use Bash, Docker Desktop, and
   monthly `reconcile` work by default; empty schedule values disable a mode.
 - Scan fan-out is bounded. A scan may submit only bounded batches and one
   cursor continuation. Never enqueue an entire TMDB export at once.
+- Exact active-job ceilings use durable queue-slot rows claimed with
+  `FOR UPDATE SKIP LOCKED`. Never restore a shared transaction-level capacity
+  lock or a count-before-insert admission check. Multi-job title-refresh
+  producers use only the short non-blocking batch admission turn.
 - Expected phase waiting must succeed and schedule one delayed idempotent
   continuation. Never consume retry attempts while healthy child work drains.
 - A busy cron slot remains durable and pending until incompatible catalog work

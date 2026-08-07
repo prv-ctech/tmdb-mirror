@@ -118,7 +118,7 @@ async fn foundation_rows_constraints_and_readiness_projection_are_exact(
         sqlx::query_as("SELECT schema_revision, migrated_at FROM ops.readiness")
             .fetch_one(&pool)
             .await?;
-    assert_eq!(readiness_row.0, "0052");
+    assert_eq!(readiness_row.0, "0053");
     let readiness_columns: Vec<String> = sqlx::query_scalar(
         "SELECT column_name FROM information_schema.columns
           WHERE table_schema = 'ops' AND table_name = 'readiness'
@@ -728,7 +728,7 @@ async fn readiness_is_sanitized_read_only_and_requires_api_reader(
         .await
         .map_err(db_error)?;
     assert_eq!(report.postgres_major, 18);
-    assert_eq!(report.schema_revision, "0052");
+    assert_eq!(report.schema_revision, "0053");
     assert_eq!(
         report.extensions,
         ["pg_stat_statements", "pg_trgm", "unaccent"]
@@ -753,7 +753,7 @@ async fn readiness_rejects_an_extra_successful_migration(owner_pool: PgPool) -> 
     sqlx::query(
         "INSERT INTO ops._sqlx_migrations(
              version, description, installed_on, success, checksum, execution_time
-         ) VALUES (53, 'unexpected', clock_timestamp(), true, decode('00', 'hex'), 0)",
+         ) VALUES (54, 'unexpected', clock_timestamp(), true, decode('00', 'hex'), 0)",
     )
     .execute(&owner_pool)
     .await?;
@@ -765,7 +765,7 @@ async fn readiness_rejects_a_failed_migration_row(owner_pool: PgPool) -> sqlx::R
     sqlx::query(
         "INSERT INTO ops._sqlx_migrations(
              version, description, installed_on, success, checksum, execution_time
-         ) VALUES (53, 'failed', clock_timestamp(), false, decode('00', 'hex'), 0)",
+         ) VALUES (54, 'failed', clock_timestamp(), false, decode('00', 'hex'), 0)",
     )
     .execute(&owner_pool)
     .await?;
@@ -924,7 +924,7 @@ async fn representative_version_one_database_upgrades_through_two_three_and_four
     MIGRATOR
         .run(&owner_pool)
         .await
-        .map_err(|_| test_error("0001 fixture did not upgrade through 0052"))?;
+        .map_err(|_| test_error("0001 fixture did not upgrade through 0053"))?;
     let upgraded_versions: Vec<i64> = sqlx::query_scalar(
         "SELECT version FROM ops._sqlx_migrations WHERE success ORDER BY version",
     )
@@ -935,7 +935,7 @@ async fn representative_version_one_database_upgrades_through_two_three_and_four
         [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49, 50, 51, 52
+            47, 48, 49, 50, 51, 52, 53
         ]
     );
 
@@ -1067,7 +1067,7 @@ async fn representative_version_one_database_upgrades_through_two_three_and_four
         sqlx::query_scalar("SELECT count(*) FROM ops._sqlx_migrations WHERE success")
             .fetch_one(&owner_pool)
             .await?;
-    assert_eq!(repeat_count, 52);
+    assert_eq!(repeat_count, 53);
     let scheduler_table: Option<String> =
         sqlx::query_scalar("SELECT to_regclass('ops.scheduler_runs')::text")
             .fetch_one(&owner_pool)
@@ -1132,7 +1132,7 @@ async fn representative_version_one_database_upgrades_through_two_three_and_four
             .await
             .map_err(db_error)?
             .schema_revision,
-        "0052"
+        "0053"
     );
     Ok(())
 }
@@ -1289,7 +1289,7 @@ async fn round_one_three_database_is_repaired_by_four(owner_pool: PgPool) -> sql
     let report = migrate(&migrator_pool, TEST_SHARED_DATABASE_OWNER)
         .await
         .map_err(db_error)?;
-    assert_eq!(report.applied, 49);
+    assert_eq!(report.applied, 50);
 
     let versions: Vec<i64> = sqlx::query_scalar(
         "SELECT version FROM ops._sqlx_migrations WHERE success ORDER BY version",
@@ -1301,7 +1301,7 @@ async fn round_one_three_database_is_repaired_by_four(owner_pool: PgPool) -> sql
         [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49, 50, 51, 52
+            47, 48, 49, 50, 51, 52, 53
         ]
     );
     let claimable_exists: bool = sqlx::query_scalar(
@@ -1501,7 +1501,7 @@ async fn round_one_three_database_is_repaired_by_four(owner_pool: PgPool) -> sql
         sqlx::query_scalar::<_, String>("SELECT schema_revision FROM ops.readiness")
             .fetch_one(&owner_pool)
             .await?,
-        "0052"
+        "0053"
     );
     migrator_pool.close().await;
     Ok(())
@@ -1522,7 +1522,7 @@ async fn actual_migrator_applies_once_then_preserves_snapshot(
             .await
             .map_err(db_error)?
             .applied,
-        52
+        53
     );
     let first = foundation_snapshot(&migrator_pool).await?;
     sqlx::query(
@@ -1644,7 +1644,7 @@ async fn actual_migrator_applies_once_then_preserves_snapshot(
             .iter()
             .any(|line| line == "seed|job|ingest.trending|1|true")
     );
-    assert!(first.iter().any(|line| line == "seed|metadata|schema|0052"));
+    assert!(first.iter().any(|line| line == "seed|metadata|schema|0053"));
 
     migrator_pool.close().await;
     Ok(())
@@ -1749,7 +1749,7 @@ async fn catalog_recovery_migration_preserves_completed_enrichment(
     MIGRATOR
         .run(&owner_pool)
         .await
-        .map_err(|_| test_error("migration 0052 application failed"))?;
+        .map_err(|_| test_error("migrations through 0053 failed"))?;
 
     let title_state: Vec<(i64, bool)> = sqlx::query_as(
         "SELECT tmdb_id, enriched_at IS NOT NULL
@@ -1784,6 +1784,80 @@ async fn catalog_recovery_migration_preserves_completed_enrichment(
 }
 
 #[sqlx::test(migrations = false)]
+async fn queue_slot_migration_preserves_and_backfills_active_production_jobs(
+    owner_pool: PgPool,
+) -> sqlx::Result<()> {
+    grant_generated_database_create(&owner_pool).await?;
+    MIGRATOR
+        .run_to(52, &owner_pool)
+        .await
+        .map_err(|_| test_error("schema 0052 setup failed"))?;
+
+    sqlx::query(
+        "INSERT INTO ops.jobs (
+             id, job_type, payload_version, payload, status, dedup_key
+         ) VALUES
+             (gen_random_uuid(), 'image.download', 1, '{}'::jsonb, 'queued',
+              'upgrade-image'),
+             (gen_random_uuid(), 'ingest.refresh_movie', 1, '{}'::jsonb, 'queued',
+              'upgrade-refresh-movie'),
+             (gen_random_uuid(), 'ingest.refresh_tv', 1, '{}'::jsonb, 'queued',
+              'upgrade-refresh-tv'),
+             (gen_random_uuid(), 'ingest.enrich_movie', 1, '{}'::jsonb, 'queued',
+              'upgrade-enrich-movie'),
+             (gen_random_uuid(), 'ingest.enrich_tv', 1, '{}'::jsonb, 'queued',
+              'upgrade-enrich-tv'),
+             (gen_random_uuid(), 'ingest.refresh_season', 1, '{}'::jsonb, 'queued',
+              'upgrade-season')",
+    )
+    .execute(&owner_pool)
+    .await?;
+
+    MIGRATOR
+        .run(&owner_pool)
+        .await
+        .map_err(|_| test_error("schema 0053 queue migration failed"))?;
+
+    let occupied: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT queue_name, count(*)::bigint
+           FROM ops.job_queue_slots
+          WHERE job_id IS NOT NULL
+          GROUP BY queue_name
+          ORDER BY queue_name",
+    )
+    .fetch_all(&owner_pool)
+    .await?;
+    assert_eq!(
+        occupied,
+        [
+            ("image.download".to_owned(), 1),
+            ("season.refresh".to_owned(), 1),
+            ("title.enrichment".to_owned(), 2),
+            ("title.refresh".to_owned(), 2),
+        ]
+    );
+    let preserved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ops.jobs
+          WHERE dedup_key LIKE 'upgrade-%' AND status = 'queued'",
+    )
+    .fetch_one(&owner_pool)
+    .await?;
+    assert_eq!(preserved, 6);
+    let legacy_function: Option<String> =
+        sqlx::query_scalar("SELECT to_regprocedure('ops.enforce_image_queue_limit()')::text")
+            .fetch_one(&owner_pool)
+            .await?;
+    assert!(legacy_function.is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT schema_revision FROM ops.readiness")
+            .fetch_one(&owner_pool)
+            .await?,
+        "0053"
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
 async fn concurrent_actual_migrators_report_exactly_one_application(
     owner_pool: PgPool,
 ) -> sqlx::Result<()> {
@@ -1812,7 +1886,7 @@ async fn concurrent_actual_migrators_report_exactly_one_application(
         second.map_err(db_error)?.applied,
     ];
     applied.sort_unstable();
-    assert_eq!(applied, [0, 52]);
+    assert_eq!(applied, [0, 53]);
 
     first_pool.close().await;
     second_pool.close().await;

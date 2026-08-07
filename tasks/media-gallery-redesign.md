@@ -1,6 +1,7 @@
 # Local-Truth On-Demand Media Redesign
 
-Status: implemented in schema revision `0052` and qualified on 2026-08-06.
+Status: media redesign implemented in schema revision `0052`; current schema
+revision is `0053`. The bounded media contract was qualified on 2026-08-06.
 
 ## Contract
 

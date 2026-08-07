@@ -100,8 +100,7 @@ impl JobRepository {
 
     /// Submits a bounded group using the caller's transaction.
     ///
-    /// This is used when a queue-capacity check and its submission must share
-    /// one advisory lock and commit boundary.
+    /// This is used when submission must share the caller's commit boundary.
     ///
     /// # Errors
     ///
@@ -501,6 +500,7 @@ fn map_database_error(error: &sqlx::Error) -> JobError {
     match sqlstate(error).as_deref() {
         Some("P0002") => JobError::NotFound,
         Some("P0001") => JobError::LeaseLost,
+        Some("P0004") => JobError::Capacity,
         Some("22023") => JobError::Rejected,
         _ => JobError::Database,
     }

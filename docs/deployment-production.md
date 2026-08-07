@@ -191,9 +191,11 @@ migrations do not cause an image-worker crash.
 
 Schema revision `0052` preserves the catalog and captured TMDB documents while
 replacing legacy image state, variants, media scans, and audits with durable
-on-demand media requests. The migration does not delete old filesystem media;
-remove the obsolete files separately after deploying and verifying the new
-schema.
+on-demand media requests. Revision `0053` preserves that data and replaces the
+shared queue-capacity advisory lock with exact queue-slot admission so parallel
+catalog transactions do not serialize or fail on that lock. The migrations do
+not delete old filesystem media; remove obsolete files separately after
+deploying and verifying the new schema.
 
 The default schedules run `daily_sync` hourly, `missing_only` nightly, and
 `reconcile` on days 1 and 15. `daily_sync` refreshes changed titles and

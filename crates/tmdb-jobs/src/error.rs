@@ -54,6 +54,9 @@ pub enum JobError {
     /// The database boundary rejected the requested job type, version, or state.
     #[error("job request was rejected")]
     Rejected,
+    /// The bounded queue has no free admission slot.
+    #[error("job queue capacity reached")]
+    Capacity,
     /// A database operation failed without exposing its internal message.
     #[error("job database operation failed")]
     Database,

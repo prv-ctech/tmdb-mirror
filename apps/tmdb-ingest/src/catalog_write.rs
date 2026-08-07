@@ -730,22 +730,16 @@ async fn enqueue_season_refresh(
     tv_id: i64,
     season_number: u32,
 ) -> Result<(), JobExecutionError> {
-    if !season_refresh_queue_has_capacity(transaction).await? {
-        tracing::debug!(
-            event = "season_refresh_queue_capacity_deferred",
-            tv_id,
-            season_number,
-            max_active_jobs = super::MAX_PENDING_REFRESH_JOBS,
-            "deferring season refresh until a later explicit scan"
-        );
-        return Ok(());
-    }
     let payload = serde_json::json!({
         "tv_id": tv_id,
         "season_number": season_number,
     });
     let dedup_key = format!("{}:{tv_id}:{season_number}", super::REFRESH_SEASON_JOB);
-    sqlx::query(
+    sqlx::query("SAVEPOINT season_queue_admission")
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+    let submitted = sqlx::query(
         "SELECT job_id, was_duplicate
            FROM ops.submit_job($1, $2, $3, $4, $5, $6, $7, $8)",
     )
@@ -758,9 +752,35 @@ async fn enqueue_season_refresh(
     .bind(Option::<chrono::DateTime<Utc>>::None)
     .bind(dedup_key)
     .fetch_one(&mut **transaction)
-    .await
-    .map_err(database_error)?;
-    Ok(())
+    .await;
+    match submitted {
+        Ok(_) => {
+            sqlx::query("RELEASE SAVEPOINT season_queue_admission")
+                .execute(&mut **transaction)
+                .await
+                .map_err(database_error)?;
+            Ok(())
+        }
+        Err(error) if is_queue_capacity_error(&error) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT season_queue_admission")
+                .execute(&mut **transaction)
+                .await
+                .map_err(database_error)?;
+            sqlx::query("RELEASE SAVEPOINT season_queue_admission")
+                .execute(&mut **transaction)
+                .await
+                .map_err(database_error)?;
+            tracing::debug!(
+                event = "season_refresh_queue_capacity_deferred",
+                tv_id,
+                season_number,
+                max_active_jobs = super::MAX_PENDING_REFRESH_JOBS,
+                "deferring season refresh until a later explicit scan"
+            );
+            Ok(())
+        }
+        Err(error) => Err(database_error(error)),
+    }
 }
 
 async fn enqueue_title_enrichment(
@@ -786,32 +806,6 @@ async fn enqueue_title_enrichment(
     .await
     .map_err(database_error)?;
     Ok(())
-}
-
-async fn season_refresh_queue_has_capacity(
-    transaction: &mut Transaction<'_, Postgres>,
-) -> Result<bool, JobExecutionError> {
-    sqlx::query(
-        "SELECT pg_catalog.pg_advisory_xact_lock(
-             pg_catalog.hashtextextended('queue:capacity', 0)
-         )",
-    )
-    .execute(&mut **transaction)
-    .await
-    .map_err(database_error)?;
-
-    let active_jobs: i64 = sqlx::query_scalar(
-        "SELECT pg_catalog.count(*)::bigint
-           FROM ops.jobs
-          WHERE job_type = $1
-            AND status IN ('queued', 'running', 'retry_wait')",
-    )
-    .bind(super::REFRESH_SEASON_JOB)
-    .fetch_one(&mut **transaction)
-    .await
-    .map_err(database_error)?;
-
-    Ok(active_jobs < super::MAX_PENDING_REFRESH_JOBS)
 }
 
 async fn upsert_person(
@@ -1439,6 +1433,14 @@ fn parse_source_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
 
 fn database_error(_: sqlx::Error) -> JobExecutionError {
     JobExecutionError::retry("database_unavailable", Duration::from_secs(5))
+}
+
+fn is_queue_capacity_error(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .as_deref()
+        == Some("P0004")
 }
 
 #[cfg(test)]

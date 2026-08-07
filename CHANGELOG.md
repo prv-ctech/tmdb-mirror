@@ -19,8 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Local-truth on-demand media requests for one to 100 active local titles,
   with bounded expansion, offline persistence, idempotency, and deterministic
   TMDB-ID paths.
-- Forward schema revision `0052`, preserving catalog/source documents while
-  replacing legacy media state with least-privilege request/selector state.
+- Forward schema revisions `0052` and `0053`: `0052` preserves catalog/source
+  documents while replacing legacy media state; `0053` replaces serialized
+  queue admission with exact non-blocking queue slots.
 - Additive `local_*` media URLs while preserving upstream TMDB image fields.
 - Bounded daily-export census, phased enrichment, season processing,
   `daily_sync`, `recovery`, `reconcile`, durable cron slots/watermarks, queue
@@ -44,9 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Catalog phase contention, queue-capacity deadlocks, cancellation races,
-  source-path media reconciliation, API schema grants, and transient queue
-  failures that previously could terminate a worker process.
+- Catalog phase contention, queue-capacity deadlocks and lock timeouts,
+  cancellation races, source-path media reconciliation, API schema grants,
+  and transient queue failures that previously could terminate a worker
+  process.
 
 ## [1.1.0] - 2025-11-26
 

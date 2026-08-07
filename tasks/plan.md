@@ -1,6 +1,6 @@
 # TMDB Mirror implementation plan
 
-Status: implemented through schema revision `0052`; current operational
+Status: implemented through schema revision `0053`; current operational
 details live in `README.md` and `docs/`.
 
 ## Current contract

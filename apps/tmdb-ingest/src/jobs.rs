@@ -4804,8 +4804,6 @@ async fn submit_refresh_jobs_with_capacity(
     if jobs.is_empty() {
         return Ok(0);
     }
-    let reserve =
-        i64::try_from(jobs.len()).map_err(|_| JobExecutionError::dead_letter("invalid_payload"))?;
     let mut transaction = pool
         .begin()
         .await
@@ -4816,32 +4814,36 @@ async fn submit_refresh_jobs_with_capacity(
         })?;
         return Ok(0);
     }
-    sqlx::query(
-        "SELECT pg_catalog.pg_advisory_xact_lock(
-             pg_catalog.hashtextextended('queue:capacity', 0)
+    let admission_turn: bool = sqlx::query_scalar(
+        "SELECT pg_catalog.pg_try_advisory_xact_lock(
+             pg_catalog.hashtextextended('queue:title.refresh:batch', 0)
          )",
-    )
-    .execute(&mut *transaction)
-    .await
-    .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
-    let pending_refreshes: i64 = sqlx::query_scalar(
-        "SELECT count(*)
-           FROM ops.jobs
-          WHERE job_type IN ('ingest.refresh_movie', 'ingest.refresh_tv')
-            AND status IN ('queued', 'running', 'retry_wait')",
     )
     .fetch_one(&mut *transaction)
     .await
     .map_err(|_| JobExecutionError::retry("database_unavailable", Duration::from_secs(5)))?;
-    if pending_refreshes.saturating_add(reserve) > MAX_PENDING_REFRESH_JOBS {
+    if !admission_turn {
+        transaction.rollback().await.map_err(|_| {
+            JobExecutionError::retry("database_unavailable", Duration::from_secs(5))
+        })?;
         return Err(JobExecutionError::retry(
             failure_code,
             Duration::from_secs(10),
         ));
     }
-    let outcomes = JobRepository::submit_many_in_transaction(&mut transaction, jobs)
-        .await
-        .map_err(map_submission_error)?;
+    let outcomes = match JobRepository::submit_many_in_transaction(&mut transaction, jobs).await {
+        Ok(outcomes) => outcomes,
+        Err(JobError::Capacity) => {
+            transaction.rollback().await.map_err(|_| {
+                JobExecutionError::retry("database_unavailable", Duration::from_secs(5))
+            })?;
+            return Err(JobExecutionError::retry(
+                failure_code,
+                Duration::from_secs(10),
+            ));
+        }
+        Err(error) => return Err(map_submission_error(error)),
+    };
     transaction
         .commit()
         .await
@@ -4883,7 +4885,11 @@ fn validate_refresh_tmdb_id(tmdb_id: u64) -> Result<u32, JobExecutionError> {
 fn map_submission_error(error: JobError) -> JobExecutionError {
     match error {
         JobError::Validation(_) => JobExecutionError::dead_letter("invalid_payload"),
-        JobError::NotFound | JobError::LeaseLost | JobError::Rejected | JobError::Database => {
+        JobError::NotFound
+        | JobError::LeaseLost
+        | JobError::Rejected
+        | JobError::Capacity
+        | JobError::Database => {
             JobExecutionError::retry("database_unavailable", Duration::from_secs(5))
         }
     }

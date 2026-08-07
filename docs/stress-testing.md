@@ -87,6 +87,12 @@ differential backup plus offline PITR checks also passed. These dated results
 qualify that build and host only; rerun the harness for every release and on
 the actual deployment hardware.
 
+The schema `0053` queue-contention qualification then started a fresh isolated
+four-container stack and submitted 64 concurrent held title-enrichment jobs
+with a 100 ms PostgreSQL lock timeout. All 64 committed, occupied exactly 64
+durable queue slots, released all slots on cancellation, and produced no lock
+timeout, deadlock, migration, or container-health failure.
+
 ## Optional k6 profile
 
 ```bash

@@ -586,21 +586,24 @@ async fn admit_source(
     }
     let job_id = if let Some(job) = job {
         mark_existing_asset_pending(&mut transaction, source).await?;
-        let mut outcomes =
-            match JobRepository::submit_many_in_transaction(&mut transaction, &[job]).await {
-                Ok(outcomes) => outcomes,
-                Err(JobError::Rejected) => {
-                    transaction
-                        .rollback()
-                        .await
-                        .map_err(|_| "database_unavailable")?;
-                    return Ok(SourceAdmission::CapacityWait);
-                }
-                Err(JobError::Validation(_)) => return Err("catalog_source_invalid"),
-                Err(JobError::NotFound | JobError::LeaseLost | JobError::Database) => {
-                    return Err("database_unavailable");
-                }
-            };
+        let mut outcomes = match JobRepository::submit_many_in_transaction(&mut transaction, &[job])
+            .await
+        {
+            Ok(outcomes) => outcomes,
+            Err(JobError::Capacity) => {
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(|_| "database_unavailable")?;
+                return Ok(SourceAdmission::CapacityWait);
+            }
+            Err(JobError::Validation(_)) => return Err("catalog_source_invalid"),
+            Err(
+                JobError::NotFound | JobError::LeaseLost | JobError::Rejected | JobError::Database,
+            ) => {
+                return Err("database_unavailable");
+            }
+        };
         let outcome = outcomes.pop().ok_or("database_unavailable")?;
         if outcome.was_duplicate() {
             let existing_source: Option<String> =
