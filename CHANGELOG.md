@@ -52,6 +52,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed the redundant `/config/media` staging tree. Validated image bytes now
   publish directly through a destination-local temporary file and atomic rename
   under `/media`.
+- API health now gates on database/schema readiness, service startup retries
+  transient PostgreSQL connections in-process, and Compose grants enough stop
+  time for PostgreSQL checkpoints and bounded application shutdown.
+- Repeated unchanged pending catalog schedule slots now log at `debug`; new
+  submissions and state transitions remain at `info`.
+- Normal API SIGTERM shutdown now prioritizes the cancellation signal when a
+  listener finishes in the same scheduler turn, avoiding a false listener
+  failure and restart log.
 
 ### Fixed
 

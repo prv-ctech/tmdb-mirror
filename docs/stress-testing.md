@@ -32,7 +32,9 @@ Bootstrap builds the local app and PostgreSQL/pgBackRest images, applies all
 migrations, waits for four healthy services, verifies the runtime UID, checks
 `/config` and `/media` permissions, confirms obsolete `/config/media` is not
 created, and validates one JSON object from each of `postgres.log`, `api.log`,
-`worker.log`, and `media.log`.
+`worker.log`, and `media.log`. API health is readiness-based, and the Compose
+contract preserves the PostgreSQL and application shutdown grace periods used
+by the production stack.
 
 ## Exercise the stack
 
@@ -106,6 +108,12 @@ published and served 1,636 assets (79,082,815 bytes) with zero failed assets,
 dead letters, leftover temporary files, or `/config/media` directory. Temporary
 TMDB `429` responses retried successfully; the final request was `succeeded`
 and local media returned HTTP `200`.
+
+The startup-lifecycle regression qualification then held PostgreSQL offline
+long enough to force an application connection retry. The worker stayed
+running, retried once, reached ready without a Docker restart, and a subsequent
+four-service stop/start recorded one clean PostgreSQL shutdown, zero crash-
+recovery events, zero API shutdown errors, and HTTP `200` from `/health/ready`.
 
 ## Optional k6 profile
 

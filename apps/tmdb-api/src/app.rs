@@ -637,6 +637,7 @@ where
     let mut admin_result = None;
 
     tokio::select! {
+        biased;
         () = cancellation.cancelled() => {}
         result = &mut public => {
             early_completion = true;

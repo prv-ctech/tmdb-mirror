@@ -495,6 +495,25 @@ async fn shutdown_cancellation_joins_both_listeners() -> Result<(), Box<dyn std:
 }
 
 #[tokio::test]
+async fn shutdown_cancellation_wins_when_listeners_finish_simultaneously() {
+    for _ in 0..32 {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        assert_eq!(
+            supervise_shutdown(
+                async { Ok::<(), std::io::Error>(()) },
+                async { Ok::<(), std::io::Error>(()) },
+                cancellation,
+                std::time::Duration::from_millis(100),
+            )
+            .await,
+            Ok(())
+        );
+    }
+}
+
+#[tokio::test]
 async fn shutdown_deadline_aborts_blocked_listeners() -> Result<(), Box<dyn std::error::Error>> {
     #[derive(Debug)]
     struct DropFlag(Arc<AtomicUsize>);

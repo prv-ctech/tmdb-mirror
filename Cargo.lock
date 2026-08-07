@@ -2257,6 +2257,7 @@ dependencies = [
  "tmdb-config",
  "tmdb-domain",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

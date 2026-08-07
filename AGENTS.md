@@ -163,6 +163,14 @@ change.
 - Never use `down -v` except for a named disposable stress project.
 - Validate interpolation, health, read-only roots, capability drops, mounts,
   runtime-created folders, and port bindings before declaring a stack healthy.
+- Gate the API Compose health check on `/health/ready`; liveness alone does not
+  prove migrations and PostgreSQL are ready. A brief startup state is valid
+  during recovery or migration.
+- Keep `stop_grace_period: 2m` for PostgreSQL and `45s` for application
+  services. Do not override PostgreSQL with a shorter stop timeout that can
+  force crash recovery on the next start.
+- Direct service startup connections retry transient PostgreSQL races within a
+  fixed bound. Do not restore crash/restart as the normal retry mechanism.
 
 ## Testing
 

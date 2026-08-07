@@ -42,6 +42,12 @@ The release artifact uses the same neutral external network key
 `"your.network"`. Replace every occurrence with an existing Docker network
 name before startup; Compose does not create that external network.
 
+The release Compose health check gates the API on `/health/ready`. It also
+retains a two-minute PostgreSQL stop grace period and a 45-second application
+grace period. A brief `starting` state during recovery or migrations is
+expected; shortening the PostgreSQL stop timeout can force WAL crash recovery
+on the next deployment.
+
 For Unraid, replace the named-volume entries once with dedicated bind mounts.
 The right-hand container paths stay fixed:
 

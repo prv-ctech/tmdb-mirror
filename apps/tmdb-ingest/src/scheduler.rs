@@ -37,6 +37,12 @@ struct PendingScheduleSlot {
     window_end: Option<NaiveDate>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubmissionOrigin {
+    CurrentSlot,
+    PendingRetry,
+}
+
 impl CatalogSchedulerConfig {
     pub(crate) fn new(
         timezone: &str,
@@ -138,6 +144,7 @@ async fn submit_slot(pool: &PgPool, schedule: &CatalogSchedule, slot: DateTime<T
         slot.with_timezone(&Utc),
         window_start,
         window_end,
+        SubmissionOrigin::CurrentSlot,
     )
     .await;
 }
@@ -166,6 +173,7 @@ async fn retry_pending_slots(pool: &PgPool) {
             slot.scheduled_for,
             slot.window_start,
             slot.window_end,
+            SubmissionOrigin::PendingRetry,
         )
         .await;
     }
@@ -177,6 +185,7 @@ async fn submit_database_slot(
     scheduled_for: DateTime<Utc>,
     window_start: Option<NaiveDate>,
     window_end: Option<NaiveDate>,
+    origin: SubmissionOrigin,
 ) {
     let submission = sqlx::query_as::<_, ScheduledSubmission>(
         "SELECT job_id, outcome, full_sweep_required
@@ -189,14 +198,25 @@ async fn submit_database_slot(
     .fetch_one(pool)
     .await;
     if let Ok(submission) = submission {
-        tracing::info!(
-            event = "catalog_schedule_slot",
-            mode,
-            slot = %scheduled_for,
-            outcome = submission.outcome,
-            job_id = submission.job_id.map(|id| id.to_string()),
-            full_sweep_required = submission.full_sweep_required,
-        );
+        if is_unchanged_pending_retry(origin, &submission.outcome) {
+            tracing::debug!(
+                event = "catalog_schedule_slot",
+                mode,
+                slot = %scheduled_for,
+                outcome = submission.outcome,
+                job_id = submission.job_id.map(|id| id.to_string()),
+                full_sweep_required = submission.full_sweep_required,
+            );
+        } else {
+            tracing::info!(
+                event = "catalog_schedule_slot",
+                mode,
+                slot = %scheduled_for,
+                outcome = submission.outcome,
+                job_id = submission.job_id.map(|id| id.to_string()),
+                full_sweep_required = submission.full_sweep_required,
+            );
+        }
     } else {
         tracing::warn!(
             event = "catalog_schedule_submission_failed",
@@ -204,6 +224,10 @@ async fn submit_database_slot(
             error_code = "database_unavailable",
         );
     }
+}
+
+fn is_unchanged_pending_retry(origin: SubmissionOrigin, outcome: &str) -> bool {
+    origin == SubmissionOrigin::PendingRetry && outcome == "pending"
 }
 
 async fn daily_window(pool: &PgPool, today: NaiveDate) -> Result<(NaiveDate, NaiveDate), ()> {
@@ -272,5 +296,25 @@ mod tests {
     #[test]
     fn six_field_cron_is_rejected() {
         assert!(CatalogSchedulerConfig::new("UTC", "0 0 * * * *", "", "").is_err());
+    }
+
+    #[test]
+    fn unchanged_pending_retry_is_quiet() {
+        assert!(is_unchanged_pending_retry(
+            SubmissionOrigin::PendingRetry,
+            "pending"
+        ));
+    }
+
+    #[test]
+    fn current_or_transitioned_slots_remain_visible() {
+        assert!(!is_unchanged_pending_retry(
+            SubmissionOrigin::CurrentSlot,
+            "pending"
+        ));
+        assert!(!is_unchanged_pending_retry(
+            SubmissionOrigin::PendingRetry,
+            "submitted"
+        ));
     }
 }

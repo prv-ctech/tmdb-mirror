@@ -42,6 +42,14 @@ docker compose --env-file "$TMDB_ENV_FILE" \
   -f deploy/compose.production.yaml ps
 ```
 
+The API health check uses `/health/ready`, so Docker may briefly report it as
+`starting` while PostgreSQL recovers or the main worker applies migrations.
+`daily_sync` starts only after the worker is ready and does not control
+container health. Application database connections retry bounded startup
+races instead of exiting, and Compose allows PostgreSQL two minutes to finish
+a clean shutdown checkpoint. Do not override that grace period with a shorter
+`docker compose stop -t` value.
+
 The external network named in the Compose file must already exist. The Git
 examples use `your.network` as a neutral placeholder; replace every
 `"your.network"` network reference with your existing Docker network name

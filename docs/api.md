@@ -22,6 +22,11 @@ GET /health/ready
 GET /3/{tmdb_v3_endpoint_path}
 ```
 
+`/health/live` confirms that the API process and listeners are alive.
+`/health/ready` additionally verifies the PostgreSQL version, schema revision,
+extensions, migrations, and read role. Compose uses the readiness route, so a
+brief `starting` state during database recovery or migration is intentional.
+
 These routes are generated locally rather than loaded from the document store:
 
 - `search/movie`, `search/tv`, `search/multi`, `search/person`,

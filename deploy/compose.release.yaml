@@ -17,6 +17,7 @@ x-app-common: &app-common
   cap_drop:
     - ALL
   init: true
+  stop_grace_period: 45s
 
 services:
   postgres:
@@ -26,6 +27,7 @@ services:
     env_file:
       - ${TMDB_ENV_FILE:-./.env}
     shm_size: 2gb
+    stop_grace_period: 2m
     command:
       - postgres
       - -c
@@ -82,11 +84,11 @@ services:
       - "9000:9000"
       - "9001:9001"
     healthcheck:
-      test: [CMD, curl, --fail, --silent, --show-error, http://127.0.0.1:9000/health/live]
+      test: [CMD, curl, --fail, --silent, --show-error, http://127.0.0.1:9000/health/ready]
       interval: 10s
       timeout: 5s
       retries: 12
-      start_period: 10s
+      start_period: 30s
     networks:
       "your.network":
         aliases:

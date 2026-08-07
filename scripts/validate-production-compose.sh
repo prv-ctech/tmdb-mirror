@@ -100,10 +100,14 @@ grep -Eq '^[[:space:]]*-[[:space:]]*"9001:9001"[[:space:]]*$' "$compose_file" \
     || die 'admin API port mapping is missing'
 grep -Eq '^[[:space:]]*-[[:space:]]*"9002:9002"[[:space:]]*$' "$compose_file" \
     || die 'media port mapping is missing'
-grep -Fq 'http://127.0.0.1:9000/health/live' "$compose_file" \
-    || die 'public API health check uses the wrong container port'
+grep -Fq 'http://127.0.0.1:9000/health/ready' "$compose_file" \
+    || die 'public API health check must gate on database readiness'
 grep -Fq 'http://127.0.0.1:9002/health/live' "$compose_file" \
     || die 'media health check uses the wrong container port'
+grep -Eq '^[[:space:]]{4}stop_grace_period:[[:space:]]+2m[[:space:]]*$' "$compose_file" \
+    || die 'PostgreSQL must have two minutes for a clean checkpoint during shutdown'
+grep -Eq '^[[:space:]]{2}stop_grace_period:[[:space:]]+45s[[:space:]]*$' "$compose_file" \
+    || die 'application services must have time for bounded graceful shutdown'
 ! grep -Eq ':[[:space:]]*(8080|8081|8090)([^0-9]|$)' "$compose_file" \
     || die 'legacy container listener port remains'
 grep -Fq '"your.network":' "$compose_file" || die 'neutral external network placeholder is missing'

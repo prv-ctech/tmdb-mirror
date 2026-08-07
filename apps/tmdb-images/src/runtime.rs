@@ -15,7 +15,7 @@ use reqwest::Url;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tmdb_config::{ConfigSource, EnvSource, Environment, load_database_for_role};
-use tmdb_db::{PoolPolicy, connect_direct};
+use tmdb_db::{PoolPolicy, connect_direct_for_startup};
 use tmdb_jobs::{
     ClaimedJob, JobExecutionError, JobExecutor, JobRepository, Worker, WorkerConfig, WorkerId,
 };
@@ -59,7 +59,7 @@ pub async fn run() -> anyhow::Result<()> {
     let media_bind = parse_or(source, "TMDB_MEDIA_BIND", DEFAULT_MEDIA_BIND.to_owned())?
         .parse::<SocketAddr>()
         .map_err(|_| anyhow::anyhow!("configuration field TMDB_MEDIA_BIND is invalid"))?;
-    let pool = connect_direct(&database, PoolPolicy::ReadWrite)
+    let pool = connect_direct_for_startup(&database, PoolPolicy::ReadWrite)
         .await
         .map_err(|error| anyhow::anyhow!(error))
         .context("connect image database")?;

@@ -7,6 +7,7 @@ services:
     restart: unless-stopped
     env_file: ["${TMDB_STRESS_ENV_FILE:?TMDB_STRESS_ENV_FILE must be set}"]
     shm_size: 1gb
+    stop_grace_period: 2m
     command:
       - postgres
       - -c
@@ -75,12 +76,13 @@ services:
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     init: true
+    stop_grace_period: 45s
     healthcheck:
-      test: [CMD, curl, --fail, --silent, --show-error, http://127.0.0.1:9000/health/live]
+      test: [CMD, curl, --fail, --silent, --show-error, http://127.0.0.1:9000/health/ready]
       interval: 3s
       timeout: 3s
       retries: 30
-      start_period: 5s
+      start_period: 30s
     networks: [tmdb-private]
 
   worker:
@@ -99,6 +101,7 @@ services:
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SETPCAP]
+    stop_grace_period: 45s
     networks: [tmdb-private]
 
   media:
@@ -124,6 +127,7 @@ services:
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, SETPCAP]
+    stop_grace_period: 45s
     healthcheck:
       test: [CMD, curl, --fail, --silent, http://127.0.0.1:9002/health/live]
       interval: 3s

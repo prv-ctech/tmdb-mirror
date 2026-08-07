@@ -186,6 +186,20 @@ docker compose --env-file "$TMDB_ENV_FILE" \
   -f deploy/compose.production.yaml up -d
 ```
 
+The public API container health check calls `/health/ready`, not the liveness
+route. A temporary `starting` state is therefore expected while PostgreSQL
+finishes recovery or the main worker applies migrations. The API and workers
+retry transient startup connection failures in-process; they do not need to
+crash and rely on Docker restart timing. The catalog scheduler starts only
+after `main_worker_ready`, so a `daily_sync` slot cannot cause the initial
+container state.
+
+Compose gives PostgreSQL a two-minute stop grace period and the application
+services 45 seconds. PostgreSQL may need longer than Docker's default 10
+seconds to checkpoint a write-heavy database. Keep these values when adapting
+the Compose file and do not use a shorter explicit stop timeout, or the next
+start can require WAL crash recovery.
+
 The main worker applies all embedded SQLx migrations under the PostgreSQL
 advisory lock. Both workers begin draining eligible durable work on container
 startup. Operators can request `full_sweep`, `missing_only`, `recovery`,
@@ -214,7 +228,8 @@ re-enriching every complete title. `full_sweep` remains manual. A changes gap
 older than 14 days sets `fullSweepRequired` in admin status.
 Busy schedule slots remain pending until incompatible maintenance finishes.
 Unresolved child dead letters prevent the corresponding synchronization
-watermark from advancing.
+watermark from advancing. An unchanged pending-slot retry is logged at
+`debug`; submission and state transitions remain visible at `info`.
 
 ## Media policy
 

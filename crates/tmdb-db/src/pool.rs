@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::time::Duration;
 
 use sqlx::PgPool;
@@ -6,6 +7,9 @@ use tmdb_config::DatabaseConfig;
 
 use crate::DbError;
 use crate::options::connect_options;
+
+const STARTUP_CONNECTION_ATTEMPTS: usize = 12;
+const STARTUP_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Session policy for a bounded direct `PostgreSQL` pool.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,4 +70,88 @@ pub async fn connect_direct(
         .connect_with(connect_options(config, policy))
         .await
         .map_err(|_| DbError::Connection)
+}
+
+/// Opens a direct `PostgreSQL` pool and tolerates bounded startup races.
+///
+/// # Errors
+///
+/// Returns a sanitized connection error after all startup attempts fail.
+pub async fn connect_direct_for_startup(
+    config: &DatabaseConfig,
+    policy: PoolPolicy,
+) -> Result<PgPool, DbError> {
+    retry_connection(
+        STARTUP_CONNECTION_ATTEMPTS,
+        STARTUP_CONNECTION_RETRY_DELAY,
+        || connect_direct(config, policy),
+    )
+    .await
+}
+
+async fn retry_connection<T, Connect, ConnectFuture>(
+    max_attempts: usize,
+    retry_delay: Duration,
+    mut connect: Connect,
+) -> Result<T, DbError>
+where
+    Connect: FnMut() -> ConnectFuture,
+    ConnectFuture: Future<Output = Result<T, DbError>>,
+{
+    for attempt in 1..=max_attempts {
+        match connect().await {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt == max_attempts => return Err(error),
+            Err(_) => {
+                tracing::warn!(
+                    event = "database_startup_retry",
+                    attempt,
+                    max_attempts,
+                    retry_seconds = retry_delay.as_secs_f64(),
+                );
+                tokio::time::sleep(retry_delay).await;
+            }
+        }
+    }
+    Err(DbError::Connection)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn startup_retry_returns_after_a_transient_connection_failure() {
+        let attempts = Cell::new(0_u8);
+
+        let result = retry_connection(3, Duration::ZERO, || {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            async move {
+                if attempt < 3 {
+                    Err(DbError::Connection)
+                } else {
+                    Ok("connected")
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(result, Ok("connected"));
+    }
+
+    #[tokio::test]
+    async fn startup_retry_stops_at_the_attempt_limit() {
+        let attempts = Cell::new(0_u8);
+
+        let result: Result<(), DbError> = retry_connection(3, Duration::ZERO, || {
+            attempts.set(attempts.get() + 1);
+            async { Err(DbError::Connection) }
+        })
+        .await;
+
+        assert_eq!((attempts.get(), result), (3, Err(DbError::Connection)));
+    }
 }

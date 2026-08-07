@@ -5,7 +5,7 @@ use chrono::Utc;
 use tmdb_config::{
     ConfigSource, EnvSource, Environment, load_database_for_role, load_secret_for_environment,
 };
-use tmdb_db::{PoolPolicy, connect_direct, migrate};
+use tmdb_db::{PoolPolicy, connect_direct_for_startup, migrate};
 use tmdb_jobs::{JobRepository, Worker, WorkerConfig, WorkerId};
 use tmdb_media::{RAW_ROOT, RuntimeStorageRole, prepare_runtime_storage};
 use tmdb_observability::init_tracing_from_env;
@@ -45,7 +45,7 @@ pub async fn run() -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!(error))?;
     let worker_config = load_worker_config(source, "tmdb-ingest")?;
     let scheduler_config = load_catalog_scheduler_config(source)?;
-    let pool = connect_direct(&database, PoolPolicy::ReadWrite)
+    let pool = connect_direct_for_startup(&database, PoolPolicy::ReadWrite)
         .await
         .map_err(|error| anyhow::anyhow!(error))
         .context("connect ingest database")?;
@@ -97,7 +97,7 @@ pub async fn run_worker() -> anyhow::Result<()> {
     let source = EnvSource;
     let environment = load_environment(source)?;
     let migrator = load_database_for_role(&source, environment, "migrator")?;
-    let migration_pool = connect_direct(&migrator, PoolPolicy::Migrator)
+    let migration_pool = connect_direct_for_startup(&migrator, PoolPolicy::Migrator)
         .await
         .map_err(|error| anyhow::anyhow!(error))
         .context("connect migration database")?;
@@ -123,7 +123,7 @@ pub async fn run_worker() -> anyhow::Result<()> {
     let worker_config = load_worker_config(source, "tmdb-worker")?;
     let worker_concurrency = load_ingest_worker_concurrency(&source)?;
     let scheduler_config = load_catalog_scheduler_config(source)?;
-    let pool = connect_direct(&database, PoolPolicy::ReadWrite)
+    let pool = connect_direct_for_startup(&database, PoolPolicy::ReadWrite)
         .await
         .map_err(|error| anyhow::anyhow!(error))
         .context("connect worker database")?;

@@ -10,7 +10,7 @@ use tmdb_api::{
     build_admin_router_with_operations_and_auth, build_router, shutdown_signal, supervise_shutdown,
 };
 use tmdb_config::{AppConfig, EnvSource, Environment, load_database_for_role};
-use tmdb_db::{PoolPolicy, connect_direct};
+use tmdb_db::{PoolPolicy, connect_direct_for_startup};
 use tmdb_observability::{Metrics, init_tracing_from_env};
 use tokio_util::sync::CancellationToken;
 
@@ -114,15 +114,15 @@ async fn connect_api_database_pools(environment: Environment) -> anyhow::Result<
         .context("load API submitter database configuration")?;
     let monitor_database = load_database_for_role(&EnvSource, environment, "monitor")
         .context("load API monitor database configuration")?;
-    let read_pool = connect_direct(&reader_database, PoolPolicy::ReadOnly)
+    let read_pool = connect_direct_for_startup(&reader_database, PoolPolicy::ReadOnly)
         .await
         .map_err(|error| anyhow::anyhow!(error))
         .context("connect API read pool")?;
-    let write_pool = connect_direct(&submitter_database, PoolPolicy::ReadWrite)
+    let write_pool = connect_direct_for_startup(&submitter_database, PoolPolicy::ReadWrite)
         .await
         .map_err(|error| anyhow::anyhow!(error))
         .context("connect API administrative write pool")?;
-    let admin_read_pool = connect_direct(&monitor_database, PoolPolicy::ReadOnly)
+    let admin_read_pool = connect_direct_for_startup(&monitor_database, PoolPolicy::ReadOnly)
         .await
         .map_err(|error| anyhow::anyhow!(error))
         .context("connect API administrative read pool")?;

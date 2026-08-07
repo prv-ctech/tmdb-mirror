@@ -8,7 +8,7 @@ mod readiness;
 
 pub use documents::TmdbDocumentRepository;
 pub use migrate::{MIGRATOR, MigrationReport, migrate};
-pub use pool::{PoolPolicy, connect_direct};
+pub use pool::{PoolPolicy, connect_direct, connect_direct_for_startup};
 pub use readiness::{ReadinessReport, readiness};
 
 /// A sanitized database failure suitable for command-line and readiness boundaries.
