@@ -59,8 +59,7 @@ does not use Compose `include`; place it beside the `.env` file.
 New checkout deployments can use the canonical file above. See
 [production deployment](docs/deployment-production.md) for bind mounts,
 permissions, media policy, and validation.
-The [documentation map](docs/README.md) separates current operator contracts
-from historical design records.
+The [documentation map](docs/README.md) indexes the current operator contracts.
 
 These files replace the older deployment contract. They use the `tmdb-runtime`
 startup wrapper for API/worker/media file logging and storage preparation,

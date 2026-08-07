@@ -57,6 +57,7 @@ __pycache__/
 .superpowers/
 superpowers/
 .agents/
+/tasks/
 skills-lock.json
 
 # Local Compose overrides

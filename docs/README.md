@@ -16,13 +16,7 @@ Current operator and implementation contracts:
 - [`CHANGELOG.md`](../CHANGELOG.md): current unreleased behavior and release
   history.
 
-Current design and verification records:
-
-- [`media-gallery-redesign.md`](../tasks/media-gallery-redesign.md): implemented
-  local-truth on-demand media design.
-- [`plan.md`](../tasks/plan.md): concise current architecture and queue bounds.
-- [`todo.md`](../tasks/todo.md): archived implementation/stress checklist.
-
-Superpowers-generated planning records are local agent artifacts and are not
-tracked. Current runtime facts come from code, SQLx migrations, Compose files,
-and scripts; when those change, update the active documents in the same change.
+Planning/task and Superpowers-generated records are local agent artifacts and
+are not tracked. Current runtime facts come from code, SQLx migrations, Compose
+files, and scripts; when those change, update the active documents in the same
+change.
