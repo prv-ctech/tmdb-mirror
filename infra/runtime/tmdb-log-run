@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly TMDB_LOG_DIRECTORY=/config/logs
+readonly TMDB_LOG_RETENTION=10
+
+log_run_error() {
+    jq --null-input --compact-output \
+        --arg service "${1:-unknown}" \
+        --arg reason "$2" \
+        '{
+            timestamp: (now | todateiso8601),
+            level: "ERROR",
+            service: $service,
+            fields: {event: "startup_failed", reason: $reason}
+        }' >&2
+}
+
+validate_service_name() {
+    case "$1" in
+        api|worker|media|postgres) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+validate_log_directory() {
+    local directory="$1"
+    [[ ! -L "$directory" && -d "$directory" && -w "$directory" ]]
+}
+
+log_generation() {
+    local service="$1"
+    local filename="$2"
+    local suffix
+
+    if [[ "$filename" == "$service.log" ]]; then
+        printf '%s\n' 0
+        return 0
+    fi
+    if [[ "$filename" != "$service-"*.log ]]; then
+        return 1
+    fi
+    suffix="${filename#"$service-"}"
+    suffix="${suffix%.log}"
+    if [[ ! "$suffix" =~ ^[0-9]+$ || ${#suffix} -gt 9 ]]; then
+        return 1
+    fi
+    printf '%s\n' "$((10#$suffix))"
+}
+
+service_log_records() {
+    local directory="$1"
+    local service="$2"
+    local path filename generation
+    local -a candidates
+
+    shopt -s nullglob
+    candidates=("$directory/$service.log" "$directory/$service-"*.log)
+    shopt -u nullglob
+    for path in "${candidates[@]}"; do
+        [[ -f "$path" && ! -L "$path" ]] || continue
+        filename="${path##*/}"
+        generation="$(log_generation "$service" "$filename")" || continue
+        printf '%s|%s\n' "$generation" "$path"
+    done
+}
+
+prune_service_logs() {
+    local directory="$1"
+    local service="$2"
+    local count remove_count
+
+    count="$(service_log_records "$directory" "$service" | wc -l)"
+    remove_count=$((count - TMDB_LOG_RETENTION))
+    if ((remove_count <= 0)); then
+        return 0
+    fi
+    service_log_records "$directory" "$service" \
+        | sort -t '|' -k1,1n \
+        | sed -n "1,${remove_count}p" \
+        | while IFS='|' read -r _ path; do
+            rm -- "$path"
+        done
+}
+
+allocate_log_file() {
+    local directory="$1"
+    local service="$2"
+    local maximum=-1 generation candidate
+
+    validate_service_name "$service" || return 64
+    validate_log_directory "$directory" || return 78
+    while IFS='|' read -r generation _; do
+        if ((generation > maximum)); then
+            maximum="$generation"
+        fi
+    done < <(service_log_records "$directory" "$service")
+
+    generation=$((maximum + 1))
+    while true; do
+        if ((generation == 0)); then
+            candidate="$directory/$service.log"
+        else
+            candidate="$directory/$service-$generation.log"
+        fi
+        if (umask 027; set -o noclobber; : >"$candidate") 2>/dev/null; then
+            break
+        fi
+        generation=$((generation + 1))
+    done
+    prune_service_logs "$directory" "$service"
+    printf '%s\n' "$candidate"
+}
+
+forward_signal() {
+    local signal="$1"
+    if [[ -n "${child_pid:-}" ]]; then
+        kill -"$signal" "$child_pid" >/dev/null 2>&1 || true
+    fi
+}
+
+run_logged() {
+    local service="$1"
+    shift
+    local log_file fifo fifo_directory child_status logger_status
+    local logger_pid child_pid=""
+
+    log_file="$(allocate_log_file "$TMDB_LOG_DIRECTORY" "$service")" || {
+        log_run_error "$service" log_file_unavailable
+        return 78
+    }
+    fifo_directory="$(mktemp -d "/tmp/tmdb-log-$service.XXXXXXXX")" || {
+        log_run_error "$service" log_pipe_directory_unavailable
+        return 78
+    }
+    fifo="$fifo_directory/stream"
+    if ! mkfifo -m 0600 "$fifo"; then
+        rmdir -- "$fifo_directory" >/dev/null 2>&1 || true
+        log_run_error "$service" log_pipe_unavailable
+        return 78
+    fi
+
+    (
+        set -o pipefail
+        jq --unbuffered --raw-input --compact-output --arg service "$service" '
+            . as $line
+            | (try ($line | fromjson) catch null) as $parsed
+            | if ($parsed | type) == "object" then
+                  $parsed + (if $parsed.service == null then {service: $service} else {} end)
+              else
+                  {
+                      timestamp: (now | todateiso8601),
+                      level: "INFO",
+                      service: $service,
+                      fields: {event: "process_output", message: $line}
+                  }
+              end
+        ' <"$fifo" | tee -a "$log_file"
+    ) &
+    logger_pid=$!
+
+    (
+        printf '{"timestamp":"%s","level":"INFO","service":"%s","fields":{"event":"file_log_started","file":"%s"}}\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$service" "${log_file##*/}"
+        exec "$@"
+    ) >"$fifo" 2>&1 &
+    child_pid=$!
+
+    trap 'forward_signal TERM' TERM
+    trap 'forward_signal INT' INT
+    trap 'forward_signal HUP' HUP
+
+    set +e
+    wait "$child_pid"
+    child_status=$?
+    if kill -0 "$child_pid" >/dev/null 2>&1; then
+        wait "$child_pid"
+        child_status=$?
+    fi
+    wait "$logger_pid"
+    logger_status=$?
+    set -e
+
+    trap - TERM INT HUP
+    rm -- "$fifo"
+    rmdir -- "$fifo_directory"
+    if ((child_status != 0)); then
+        return "$child_status"
+    fi
+    if ((logger_status != 0)); then
+        log_run_error "$service" log_writer_failed
+        return 74
+    fi
+}
+
+main() {
+    if (($# < 2)) || ! validate_service_name "$1"; then
+        log_run_error "${1:-unknown}" invalid_arguments
+        return 64
+    fi
+    run_logged "$@"
+}
+
+if [[ "${TMDB_LOG_RUN_SOURCE_ONLY:-0}" != 1 ]]; then
+    main "$@"
+fi

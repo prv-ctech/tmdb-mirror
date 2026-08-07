@@ -72,9 +72,12 @@ services:
 
   api:
     <<: *app-common
+    entrypoint: [/usr/local/bin/tmdb-runtime, api]
     depends_on:
       postgres:
         condition: service_healthy
+    volumes:
+      - tmdb-config:/config
     ports:
       - "9000:9000"
       - "9001:9001"

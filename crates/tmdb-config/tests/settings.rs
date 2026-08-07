@@ -207,14 +207,13 @@ fn secret_file_enforces_the_64_kib_limit() -> Result<(), Box<dyn std::error::Err
 
 #[test]
 fn storage_roots_must_be_absolute_normalized_distinct_and_non_root() {
-    assert!(StorageRoots::try_new("/", "/images", "/raw", "/backups").is_err());
-    assert!(StorageRoots::try_new("work", "/images", "/raw", "/backups").is_err());
-    assert!(StorageRoots::try_new("/work/../escape", "/images", "/raw", "/backups").is_err());
-    assert!(StorageRoots::try_new("/work/./cache", "/images", "/raw", "/backups").is_err());
-    assert!(StorageRoots::try_new("/work/", "/images", "/raw", "/backups").is_err());
-    assert!(StorageRoots::try_new("/work", "/work", "/raw", "/backups").is_err());
-    assert!(StorageRoots::try_new("/work", "/work/images", "/raw", "/backups").is_err());
-    assert!(StorageRoots::try_new("/work", "/workbench", "/raw", "/backups").is_ok());
+    assert!(StorageRoots::try_new("/", "/raw", "/backups").is_err());
+    assert!(StorageRoots::try_new("images", "/raw", "/backups").is_err());
+    assert!(StorageRoots::try_new("/images/../escape", "/raw", "/backups").is_err());
+    assert!(StorageRoots::try_new("/images/./cache", "/raw", "/backups").is_err());
+    assert!(StorageRoots::try_new("/images/", "/raw", "/backups").is_err());
+    assert!(StorageRoots::try_new("/images", "/images/raw", "/backups").is_err());
+    assert!(StorageRoots::try_new("/images", "/raw", "/backups").is_ok());
 }
 
 #[test]
@@ -228,10 +227,6 @@ fn app_config_parses_typed_settings_and_redacts_secrets() -> Result<(), Box<dyn 
     assert_eq!(config.admin_bind.to_string(), "127.0.0.1:19001");
     assert_eq!(config.database.host, "postgres");
     assert_eq!(config.database.port, 5432);
-    assert_eq!(
-        config.storage_roots.work,
-        std::path::Path::new("/config/work")
-    );
     assert_eq!(config.storage_roots.images, std::path::Path::new("/media"));
     assert_eq!(
         config.storage_roots.raw_archive,

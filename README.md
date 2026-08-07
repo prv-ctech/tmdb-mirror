@@ -46,9 +46,9 @@ The external network named in the Compose file must already exist. The Git
 examples use `your.network` as a neutral placeholder; replace every
 `"your.network"` network reference with your existing Docker network name
 before starting the stack. All four services use this one external network.
-The application paths inside containers are fixed:
-`/config` for scratch, exports, checkpoints, logs, and backups; `/media` for
-public image files.
+The application paths inside containers are fixed: `/config` for raw catalog
+exports, media scratch data, persistent logs, and backups; `/media` for public
+image files.
 
 To reuse existing host directories, edit the `source:` values in the Compose
 file. Host mount paths are deployment settings, not application environment.
@@ -62,7 +62,7 @@ The [documentation map](docs/README.md) separates current operator contracts
 from historical design records.
 
 These files replace the older deployment contract. They use the `tmdb-runtime`
-startup wrapper for worker/media storage preparation, relative Compose bind
+startup wrapper for API/worker/media file logging and storage preparation, relative Compose bind
 sources, and the fixed `9000` read, `9001` admin, and `9002` media listener
 contract. The root standalone file reads `.env` beside it; the production file
 reads `../.env` by default or the file selected by `TMDB_ENV_FILE`.
@@ -165,6 +165,11 @@ log timestamps; `.env.example` uses `America/New_York`. Persisted API and
 database timestamps remain UTC. pgBackRest stores its same-host recovery
 repository at `/config/backups/pgbackrest`. See
 [backup and recovery](docs/backup-recovery.md).
+
+All four services stream JSONL to Docker and persist the same stream below
+`/config/logs`. The first process start uses `api.log`, `worker.log`,
+`media.log`, or `postgres.log`; later starts add a numeric suffix. Each service
+retains only its newest 10 files.
 
 GitHub publishes rolling `main` images, immutable versioned images, and a
 digest-pinned release Compose artifact. See [release notes](docs/release.md).

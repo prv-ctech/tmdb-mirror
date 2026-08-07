@@ -80,9 +80,16 @@ services:
   api:
     <<: *app-common
     container_name: tmdb-mirror-api
+    entrypoint: [/usr/local/bin/tmdb-runtime, api]
     depends_on:
       postgres:
         condition: service_healthy
+    volumes:
+      - type: bind
+        source: ./data/config
+        target: /config
+        bind:
+          create_host_path: true
     ports:
       - "9000:9000"
       - "9001:9001"

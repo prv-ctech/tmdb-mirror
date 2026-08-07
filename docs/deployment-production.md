@@ -32,7 +32,7 @@ The application only knows these container paths:
 | Container path | Purpose |
 | --- | --- |
 | `/media` | Permanent on-demand final image renditions |
-| `/config` | NVMe worker scratch, raw exports, checkpoints, and logs |
+| `/config` | Raw catalog exports, media scratch data, persistent logs, and backups |
 | `/config/backups/pgbackrest` | PostgreSQL-owned same-host pgBackRest repository |
 | PostgreSQL `/var/lib/postgresql` | PostgreSQL 18 data/WAL |
 
@@ -54,21 +54,26 @@ use `your.network` as a neutral placeholder; replace every
 `"your.network"` service and top-level network reference with an existing
 network name before starting the stack. No `tmdb-private` network is created.
 
-The API runs as UID/GID `10001`. The worker and media services begin with a
-tiny built-in startup preparer: it creates their fixed child folders, gives
-those folders to UID/GID `10001`, verifies an actual write as that user, and
-then drops root before starting Rust. No separate storage-init container or
-manual `chown` step is needed.
+The API, worker, and media processes run as UID/GID `10001`. PostgreSQL prepares
+the shared log directory before it becomes healthy. The API validates that
+directory; worker and media startup prepare only their fixed writable child
+folders, verify an actual write as UID/GID `10001`, and then start Rust. No
+separate storage-init container or manual recursive `chown` step is needed.
 
 It never recursively changes `/config` or `/media`, so a restart does not walk
 millions of images or alter unrelated files in a broad host mount. It changes
 only these app-owned paths:
 
 ```text
-/config/work  /config/raw  /config/logs  /config/media
+/config/raw  /config/logs  /config/media
 /media/movies  /media/tv  /media/people  /media/networks
 /media/companies  /media/collections
 ```
+
+`/config/raw` is active worker storage for TMDB daily exports and reconcile ID
+files. `/config/media` is active media-download scratch space. The obsolete
+`/config/work` directory is no longer created or read and may be removed after
+deploying the new images if it is empty.
 
 PostgreSQL alone creates `/config/backups/pgbackrest`. The worker and media
 worker never recursively change that repository or its parent permissions.
@@ -141,18 +146,21 @@ ports into `.env`.
 Keep `TMDB_RATE_LIMIT` at `40` or lower. The worker rejects a higher value
 before it starts upstream requests.
 
-## Terminal logs
+## Persistent logs
 
-`TMDB_LOG_FORMAT=pretty` is the default and produces compact, readable colored
-service logs in Docker/Unraid. `TMDB_LOG_LEVEL=info` shows startup, storage
-checks, worker lifecycle, retries, dead letters, and media failures without
-flooding the terminal with successful health checks. Temporarily set
-`TMDB_LOG_LEVEL=debug` to show individual HTTP requests, job claims,
-successful jobs, and successful image publication while diagnosing a small
-test run. Set
-`TMDB_LOG_FORMAT=json` only when a log collector requires JSON; `RUST_LOG`
+All four containers emit JSONL to Docker/Unraid and write the identical stream
+to `/config/logs`. The first start creates `api.log`, `worker.log`, `media.log`,
+and `postgres.log`. Each later process start creates the next numeric file,
+such as `worker-1.log`; only the newest 10 files for each service are retained.
+Rotation is automatic and has no environment setting.
+
+`TMDB_LOG_FORMAT` defaults to `json`. `TMDB_LOG_LEVEL=info` shows startup,
+storage checks, worker lifecycle, retries, dead letters, and media failures
+without logging every successful operation. Temporarily use
+`TMDB_LOG_LEVEL=debug` for individual HTTP requests, job claims, successful
+jobs, and image publication during a bounded diagnostic run. `RUST_LOG`
 remains an advanced full filter override. For temporary raw SQLx query timing,
-include `sqlx=warn` in that override; it is deliberately off by default.
+include `sqlx=warn`; it is deliberately off by default.
 
 Operational events contain only bounded fields: fixed container paths, job
 IDs/types, retry codes, image entity IDs, safe HTTP status, and safe I/O

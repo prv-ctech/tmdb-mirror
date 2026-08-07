@@ -615,11 +615,11 @@ pub enum InitTracingError {
     AlreadyInitialized,
 }
 
-/// Initializes tracing using the deployment's human-readable log settings.
+/// Initializes tracing using the deployment's structured log settings.
 ///
-/// `TMDB_LOG_FORMAT` defaults to `pretty`; set it to `json` only when a log
-/// collector needs structured JSON. `RUST_LOG` remains an advanced complete
-/// filter override. Without it, `TMDB_LOG_LEVEL` defaults to `info`.
+/// `TMDB_LOG_FORMAT` defaults to `json`; direct developer runs may select
+/// `pretty`. `RUST_LOG` remains an advanced complete filter override. Without
+/// it, `TMDB_LOG_LEVEL` defaults to `info`.
 ///
 /// # Errors
 ///
@@ -635,7 +635,8 @@ pub fn init_tracing_from_env(service_name: &str) -> Result<(), InitTracingError>
 
 fn parse_log_format(value: Option<&str>) -> Result<LogFormat, InitTracingError> {
     match value.map(str::trim).filter(|value| !value.is_empty()) {
-        None | Some("pretty") => Ok(LogFormat::Pretty),
+        None => Ok(LogFormat::Json),
+        Some("pretty") => Ok(LogFormat::Pretty),
         Some("json") => Ok(LogFormat::Json),
         Some(_) => Err(InitTracingError::InvalidLogFormat),
     }
@@ -716,12 +717,12 @@ mod log_tests {
     use super::*;
 
     #[test]
-    fn terminal_logs_default_to_pretty_and_accept_json() {
-        assert!(matches!(parse_log_format(None), Ok(LogFormat::Pretty)));
-        assert!(matches!(parse_log_format(Some("")), Ok(LogFormat::Pretty)));
+    fn terminal_logs_default_to_json_and_accept_pretty() {
+        assert!(matches!(parse_log_format(None), Ok(LogFormat::Json)));
+        assert!(matches!(parse_log_format(Some("")), Ok(LogFormat::Json)));
         assert!(matches!(
-            parse_log_format(Some("json")),
-            Ok(LogFormat::Json)
+            parse_log_format(Some("pretty")),
+            Ok(LogFormat::Pretty)
         ));
     }
 

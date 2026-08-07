@@ -91,7 +91,7 @@ jobs:
         id: postgres-build
         uses: docker/build-push-action@v7
         with:
-          context: ./infra/postgres
+          context: .
           file: ./infra/postgres/Dockerfile
           platforms: linux/amd64
           push: true

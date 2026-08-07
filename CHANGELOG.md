@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pg_stat_statements, WAL archiving, scheduled backups, and PITR verification.
 - Linux/Bash Docker stress harness with secret-safe real-TMDB fixtures,
   media checks, worker-state checks, HTTP load, and resilience tests.
+- Persistent JSONL logs for PostgreSQL, API, worker, and media under the shared
+  `/config/logs` appdata root, with per-restart generations and 10-file
+  retention per service.
 
 ### Changed
 
@@ -44,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   image variants, `optimized/`, `.masters`, and obsolete compatibility paths.
 - Workers now drain eligible durable PostgreSQL work on container startup;
   authenticated controls still start, pause, resume, or cancel each queue.
+- Removed the unused `/config/work` storage contract. `/config/raw` remains the
+  active bounded export/reconcile store.
 
 ### Fixed
 

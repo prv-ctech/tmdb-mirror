@@ -61,9 +61,12 @@ services:
     image: ${TMDB_STRESS_APP_IMAGE:-tmdb-stress-app:local}
     restart: on-failure
     env_file: ["${TMDB_STRESS_ENV_FILE:?TMDB_STRESS_ENV_FILE must be set}"]
+    entrypoint: [/usr/local/bin/tmdb-runtime, api]
     depends_on:
       postgres:
         condition: service_healthy
+    volumes:
+      - tmdb_stress_config:/config
     ports:
       - 127.0.0.1:${TMDB_STRESS_API_PORT:-18080}:9000
       - 127.0.0.1:${TMDB_STRESS_ADMIN_PORT:-18081}:9001

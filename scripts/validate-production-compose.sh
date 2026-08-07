@@ -79,6 +79,8 @@ done
 
 grep -Eq 'target:[[:space:]]*/media([[:space:]]|$)' "$compose_file" || die 'Compose is missing the fixed /media mount'
 grep -Eq 'target:[[:space:]]*/config([[:space:]]|$)' "$compose_file" || die 'Compose is missing the fixed /config mount'
+[[ "$(grep -Ec 'target:[[:space:]]*/config([[:space:]]|$)' "$compose_file")" -eq 4 ]] \
+    || die 'all four services must mount the shared /config appdata root'
 for service in postgres api worker media; do
     grep -Eq "^[[:space:]]{2}${service}:" "$compose_file" || die "Compose is missing service: $service"
 done
@@ -110,7 +112,7 @@ grep -Eq '^[[:space:]]{4}external:[[:space:]]+true[[:space:]]*$' "$compose_file"
 ! grep -Eq '^[[:space:]]{4}name:[[:space:]]+' "$compose_file" \
     || die 'external network must use its top-level Compose key directly'
 grep -Fq 'tmdb-mirror-api' "$compose_file" || die 'private API alias is missing'
-for role in worker media; do
+for role in api worker media; do
     grep -Eq "entrypoint:[[:space:]]*\[/usr/local/bin/tmdb-runtime,[[:space:]]*${role}\]" "$compose_file" \
         || die "$role must start through tmdb-runtime"
 done

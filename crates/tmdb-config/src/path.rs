@@ -5,8 +5,6 @@ use crate::ConfigError;
 /// Validated, pairwise-disjoint storage trees.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StorageRoots {
-    /// Scratch and temporary worker storage.
-    pub work: PathBuf,
     /// Permanent image library storage.
     pub images: PathBuf,
     /// Compressed source archive storage.
@@ -23,27 +21,24 @@ impl StorageRoots {
         // These literals are validated by the unit tests and are part of the
         // container contract, so construction cannot fail at runtime.
         Self {
-            work: PathBuf::from("/config/work"),
             images: PathBuf::from("/media"),
             raw_archive: PathBuf::from("/config/raw"),
             backups: PathBuf::from("/config/backups"),
         }
     }
 
-    /// Validates four lexical storage roots without accessing the filesystem.
+    /// Validates three lexical storage roots without accessing the filesystem.
     ///
     /// # Errors
     ///
     /// Returns an error if a path is relative, non-normalized, a filesystem
     /// root, contains NUL or parent traversal, or overlaps any other root.
     pub fn try_new(
-        work: impl Into<PathBuf>,
         images: impl Into<PathBuf>,
         raw_archive: impl Into<PathBuf>,
         backups: impl Into<PathBuf>,
     ) -> Result<Self, ConfigError> {
         let roots = [
-            ("work", validate("work", work.into())?),
             ("images", validate("images", images.into())?),
             ("raw_archive", validate("raw_archive", raw_archive.into())?),
             ("backups", validate("backups", backups.into())?),
@@ -59,9 +54,8 @@ impl StorageRoots {
             }
         }
 
-        let [(_, work), (_, images), (_, raw_archive), (_, backups)] = roots;
+        let [(_, images), (_, raw_archive), (_, backups)] = roots;
         Ok(Self {
-            work,
             images,
             raw_archive,
             backups,

@@ -29,8 +29,9 @@ logs, reports, source, or image layers. The disposable environment disables
 catalog cron schedules so tests are deterministic.
 
 Bootstrap builds the local app and PostgreSQL/pgBackRest images, applies all
-migrations, waits for four healthy services, verifies the runtime UID, and
-checks `/config` and `/media` permissions.
+migrations, waits for four healthy services, verifies the runtime UID, checks
+`/config` and `/media` permissions, and validates one JSON object from each of
+`postgres.log`, `api.log`, `worker.log`, and `media.log`.
 
 ## Exercise the stack
 
@@ -118,6 +119,7 @@ Start with a smaller endpoint profile before the 100-client run.
 ./scripts/verify-toolchain.sh
 ./scripts/validate-production-compose.sh --env-file .env.example
 ./scripts/verify-repository-hygiene.sh
+./infra/runtime/tests/tmdb-log-run.test.sh
 ./infra/postgres/tests/pgbackrest-runner.test.sh
 ./infra/postgres/tests/pgbackrest-pitr.test.sh
 ```

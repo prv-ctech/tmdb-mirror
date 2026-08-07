@@ -5,6 +5,8 @@ readonly PGBACKREST_CONFIG_DIRECTORY=/etc/pgbackrest
 readonly PGBACKREST_CONFIG_FILE=/etc/pgbackrest/pgbackrest.conf
 readonly PGBACKREST_REPOSITORY=/config/backups/pgbackrest
 readonly PGBACKREST_STANZA=tmdb
+readonly APP_UID=10001
+readonly APP_GID=10001
 
 postgres_pid=""
 scheduler_pid=""
@@ -16,6 +18,19 @@ log() {
 fail() {
     log "event=backup_prepare_failed reason=$1"
     exit 78
+}
+
+start_with_file_logging() {
+    if [[ -L /config || ! -d /config ]] || ! chmod o+x /config; then
+        fail config_mount_unavailable
+    fi
+    if [[ -L /config/logs || (-e /config/logs && ! -d /config/logs) ]]; then
+        fail log_directory_invalid
+    fi
+    install -d -o "$APP_UID" -g "$APP_GID" -m 0755 /config/logs \
+        || fail log_directory_unavailable
+    export TMDB_POSTGRES_LOG_WRAPPED=1
+    exec /usr/local/bin/tmdb-log-run postgres "$0" "$@"
 }
 
 is_postgres_server_command() {
@@ -124,7 +139,10 @@ wait_for_postgres() {
 stop_children() {
     local signal="$1"
     if [[ -n "$scheduler_pid" ]]; then
-        kill -"$signal" "$scheduler_pid" >/dev/null 2>&1 || true
+        # Non-interactive background shells may ignore SIGINT. The scheduler
+        # has no database state of its own, so always stop it with SIGTERM
+        # before forwarding PostgreSQL's configured stop signal.
+        kill -TERM "$scheduler_pid" >/dev/null 2>&1 || true
         wait "$scheduler_pid" >/dev/null 2>&1 || true
     fi
     if [[ -n "$postgres_pid" ]]; then
@@ -180,4 +198,7 @@ main() {
     exit "$status"
 }
 
+if [[ "${TMDB_POSTGRES_LOG_WRAPPED:-0}" != 1 ]]; then
+    start_with_file_logging "$@"
+fi
 main "$@"

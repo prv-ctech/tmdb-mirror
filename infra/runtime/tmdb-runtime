@@ -57,7 +57,6 @@ drop_privileges_and_exec() {
     fi
     role=$1
     shift
-    printf '%s\n' "tmdb-runtime event=storage_prepared role=$role uid=$APP_UID gid=$APP_GID"
     exec setpriv \
         --reuid="$APP_UID" \
         --regid="$APP_GID" \
@@ -65,13 +64,20 @@ drop_privileges_and_exec() {
         --bounding-set=-all \
         --inh-caps=-all \
         --ambient-caps=-all \
-        -- "$@"
+        -- /usr/local/bin/tmdb-log-run "$role" "$@"
 }
 
 case "${1:-}" in
+    api)
+        if [ -L /config ] || [ ! -d /config ] || [ -L /config/logs ] \
+            || [ ! -d /config/logs ] || [ ! -w /config/logs ]; then
+            fail api /config/logs unavailable check_config_mount
+        fi
+        shift
+        exec /usr/local/bin/tmdb-log-run api /usr/local/bin/tmdb-api "$@"
+        ;;
     worker)
         prepare_mount_root worker /config
-        prepare_directory worker /config/work
         prepare_directory worker /config/raw
         prepare_directory worker /config/logs
         shift

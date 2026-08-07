@@ -23,8 +23,6 @@ pub const MEDIA_WORK_ROOT: &str = "/config/media";
 pub const RAW_ROOT: &str = "/config/raw";
 /// Durable worker logs below [`CONFIG_ROOT`].
 pub const LOG_ROOT: &str = "/config/logs";
-/// General worker scratch directory below [`CONFIG_ROOT`].
-pub const WORK_ROOT: &str = "/config/work";
 /// PostgreSQL-owned pgBackRest parent directory below [`CONFIG_ROOT`].
 ///
 /// Application workers deliberately do not prepare or write this path. The
@@ -57,8 +55,6 @@ impl RuntimeStorageRole {
 /// contain a deployment's host-side mount path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeStoragePath {
-    /// `/config/work`
-    ConfigWork,
     /// `/config/raw`
     ConfigRaw,
     /// `/config/backups` (PostgreSQL-owned; not included in worker preflight)
@@ -86,7 +82,6 @@ impl RuntimeStoragePath {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::ConfigWork => WORK_ROOT,
             Self::ConfigRaw => RAW_ROOT,
             Self::ConfigBackups => BACKUP_ROOT,
             Self::ConfigLogs => LOG_ROOT,
@@ -102,7 +97,6 @@ impl RuntimeStoragePath {
 
     fn resolve(self, config_root: &Path, media_root: &Path) -> PathBuf {
         match self {
-            Self::ConfigWork => config_root.join("work"),
             Self::ConfigRaw => config_root.join("raw"),
             Self::ConfigBackups => config_root.join("backups"),
             Self::ConfigLogs => config_root.join("logs"),
@@ -199,7 +193,6 @@ impl RuntimeStorageError {
 }
 
 const WORKER_RUNTIME_PATHS: &[RuntimeStoragePath] = &[
-    RuntimeStoragePath::ConfigWork,
     RuntimeStoragePath::ConfigRaw,
     RuntimeStoragePath::ConfigLogs,
 ];
@@ -572,7 +565,7 @@ mod tests {
 
         prepare_runtime_storage_at(RuntimeStorageRole::Worker, &config, &media)?;
 
-        for child in ["work", "raw", "logs"] {
+        for child in ["raw", "logs"] {
             assert!(config.join(child).is_dir(), "missing {child}");
         }
         assert!(

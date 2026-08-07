@@ -71,10 +71,10 @@ generated locally or captured by a scan returns local `404`, not an upstream
 request. Use the official TMDB v3 path and query names unchanged. For example:
 
 ```bash
-curl -sS 'http://127.0.0.1:9001/3/configuration'
-curl -sS 'http://127.0.0.1:9001/3/movie/550'
-curl -sS 'http://127.0.0.1:9001/3/tv/4586/images?language=en-US&include_image_language=en,null'
-curl -sS 'http://127.0.0.1:9001/3/tv/4586/season/1/episode/1/images?language=en-US&include_image_language=en,null'
+curl -sS 'http://127.0.0.1:9000/3/configuration'
+curl -sS 'http://127.0.0.1:9000/3/movie/550'
+curl -sS 'http://127.0.0.1:9000/3/tv/4586/images?language=en-US&include_image_language=en,null'
+curl -sS 'http://127.0.0.1:9000/3/tv/4586/season/1/episode/1/images?language=en-US&include_image_language=en,null'
 ```
 
 The worker captures title, season, episode, linked credit/review/keyword/

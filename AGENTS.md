@@ -139,6 +139,13 @@ change.
 - Before commit or push, inspect the staged diff and confirm secrets,
   environment files, databases, media, backups, logs, and runtime artifacts
   are ignored by Git and Docker.
+- `/config/raw` is active catalog export/reconcile storage and `/config/media`
+  is active media scratch storage. Do not remove either as legacy state.
+  `/config/work` is obsolete and must not be recreated.
+- API, worker, media, and PostgreSQL must emit JSONL to Docker and persist the
+  identical stream under `/config/logs`. Use `api.log`, `worker.log`,
+  `media.log`, and `postgres.log` for the first process start, increment a
+  numeric suffix on each restart, and retain only the newest 10 per service.
 
 ## Compose contract
 
@@ -146,6 +153,7 @@ change.
 - Put host bind sources and published ports in Compose, not `.env`.
 - Portable sources are `./data/postgres18`, `./data/config`, and
   `./data/media`; operators may edit those Compose lines for their host.
+- All four services mount the same `/config` appdata root so logs are durable.
 - Keep the default mappings `9000:9000` for the public API, `9001:9001` for
   the authenticated admin API, and `9002:9002` for media. Treat host port
   `9001` as private operational access and protect it with the host firewall.

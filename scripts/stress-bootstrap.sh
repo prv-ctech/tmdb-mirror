@@ -84,7 +84,7 @@ if [[ "$skip_build" != true ]]; then
     docker_checked build --pull=false \
         --file "$(docker_path "$REPO_ROOT/infra/postgres/Dockerfile")" \
         --tag tmdb-stress-postgres:local \
-        "$(docker_path "$REPO_ROOT/infra/postgres")"
+        "$(docker_path "$REPO_ROOT")"
     printf '%s\n' 'Building the pinned Rust application image...'
     docker_checked build --pull=false --file "$(docker_path "$REPO_ROOT/Dockerfile")" --tag tmdb-stress-app:local "$(docker_path "$REPO_ROOT")"
 else
@@ -128,8 +128,22 @@ assert_process_identity() {
 
 assert_process_identity worker tmdb-worker
 assert_process_identity media tmdb-images
-ensure_owner_paths worker 'test -w /config/work && test -w /config/raw && test -w /config/logs'
+assert_process_identity api tmdb-api
+ensure_owner_paths api 'test -w /config/logs'
+ensure_owner_paths worker 'test -w /config/raw && test -w /config/logs'
 ensure_owner_paths media 'test -w /config/media && test -w /media/movies && test -w /media/tv && test -w /media/people && test -w /media/networks && test -w /media/companies && test -w /media/collections'
+
+for service in postgres api worker media; do
+    compose exec -T "$service" sh -ec \
+        'for path in "/config/logs/$1.log" /config/logs/"$1"-*.log; do
+            if test -s "$path" && head -n 1 "$path" | jq -e '\''type == "object"'\'' >/dev/null; then
+                exit 0
+            fi
+         done
+         exit 1' \
+        sh "$service" \
+        || die "$service JSONL file log is not ready"
+done
 
 printf 'Stress stack is ready: http://127.0.0.1:%s\n' "$api_port"
 printf 'Runtime metadata: %s\n' "$METADATA_FILE"
