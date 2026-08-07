@@ -49,6 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authenticated controls still start, pause, resume, or cancel each queue.
 - Removed the unused `/config/work` storage contract. `/config/raw` remains the
   active bounded export/reconcile store.
+- Removed the redundant `/config/media` staging tree. Validated image bytes now
+  publish directly through a destination-local temporary file and atomic rename
+  under `/media`.
 
 ### Fixed
 

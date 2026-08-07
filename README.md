@@ -47,8 +47,9 @@ examples use `your.network` as a neutral placeholder; replace every
 `"your.network"` network reference with your existing Docker network name
 before starting the stack. All four services use this one external network.
 The application paths inside containers are fixed: `/config` for raw catalog
-exports, media scratch data, persistent logs, and backups; `/media` for public
-image files.
+exports, persistent logs, and backups; `/media` for final public image files.
+The media worker publishes through temporary files beside their final
+destinations, so it does not use a separate scratch tree.
 
 To reuse existing host directories, edit the `source:` values in the Compose
 file. Host mount paths are deployment settings, not application environment.

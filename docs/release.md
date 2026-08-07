@@ -54,7 +54,8 @@ The right-hand container paths stay fixed:
 Do not add host paths to `.env`. All four containers share `/config`.
 PostgreSQL stores backups below `/config/backups/pgbackrest`; API, worker,
 media, and PostgreSQL persist restart-rotated JSONL files below `/config/logs`.
-Worker and media use the remaining fixed children below `/config` and `/media`.
+The worker also uses `/config/raw`; media stores final files below `/media` and
+does not create a separate `/config/media` scratch tree.
 
 Both workers drain eligible durable work on startup. The main worker also
 evaluates the three configured catalog cron schedules; `full_sweep` remains a

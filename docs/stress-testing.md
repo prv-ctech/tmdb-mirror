@@ -30,8 +30,9 @@ catalog cron schedules so tests are deterministic.
 
 Bootstrap builds the local app and PostgreSQL/pgBackRest images, applies all
 migrations, waits for four healthy services, verifies the runtime UID, checks
-`/config` and `/media` permissions, and validates one JSON object from each of
-`postgres.log`, `api.log`, `worker.log`, and `media.log`.
+`/config` and `/media` permissions, confirms obsolete `/config/media` is not
+created, and validates one JSON object from each of `postgres.log`, `api.log`,
+`worker.log`, and `media.log`.
 
 ## Exercise the stack
 
@@ -97,6 +98,14 @@ four-container stack and submitted 64 concurrent held title-enrichment jobs
 with a 100 ms PostgreSQL lock timeout. All 64 committed, occupied exactly 64
 durable queue slots, released all slots on cancellation, and produced no lock
 timeout, deadlock, migration, or container-health failure.
+
+The 2026-08-07 runtime-storage qualification built fresh release images,
+started a clean four-container schema `0053` stack, passed formatting, strict
+Clippy, and all 276 database-backed workspace tests. A five-title live request
+published and served 1,636 assets (79,082,815 bytes) with zero failed assets,
+dead letters, leftover temporary files, or `/config/media` directory. Temporary
+TMDB `429` responses retried successfully; the final request was `succeeded`
+and local media returned HTTP `200`.
 
 ## Optional k6 profile
 

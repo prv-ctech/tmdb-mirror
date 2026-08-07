@@ -32,7 +32,7 @@ The application only knows these container paths:
 | Container path | Purpose |
 | --- | --- |
 | `/media` | Permanent on-demand final image renditions |
-| `/config` | Raw catalog exports, media scratch data, persistent logs, and backups |
+| `/config` | Raw catalog exports, persistent logs, and backups |
 | `/config/backups/pgbackrest` | PostgreSQL-owned same-host pgBackRest repository |
 | PostgreSQL `/var/lib/postgresql` | PostgreSQL 18 data/WAL |
 
@@ -65,15 +65,16 @@ millions of images or alter unrelated files in a broad host mount. It changes
 only these app-owned paths:
 
 ```text
-/config/raw  /config/logs  /config/media
+/config/raw  /config/logs
 /media/movies  /media/tv  /media/people  /media/networks
 /media/companies  /media/collections
 ```
 
 `/config/raw` is active worker storage for TMDB daily exports and reconcile ID
-files. `/config/media` is active media-download scratch space. The obsolete
-`/config/work` directory is no longer created or read and may be removed after
-deploying the new images if it is empty.
+files. The obsolete `/config/work` and `/config/media` directories are no
+longer created or read and may be removed after the old containers are stopped.
+Media publication writes a temporary file beside the final file under `/media`,
+syncs it, and atomically renames it into place.
 
 PostgreSQL alone creates `/config/backups/pgbackrest`. The worker and media
 worker never recursively change that repository or its parent permissions.

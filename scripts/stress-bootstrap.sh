@@ -131,7 +131,7 @@ assert_process_identity media tmdb-images
 assert_process_identity api tmdb-api
 ensure_owner_paths api 'test -w /config/logs'
 ensure_owner_paths worker 'test -w /config/raw && test -w /config/logs'
-ensure_owner_paths media 'test -w /config/media && test -w /media/movies && test -w /media/tv && test -w /media/people && test -w /media/networks && test -w /media/companies && test -w /media/collections'
+ensure_owner_paths media 'test ! -e /config/media && test -w /media/movies && test -w /media/tv && test -w /media/people && test -w /media/networks && test -w /media/companies && test -w /media/collections'
 
 for service in postgres api worker media; do
     compose exec -T "$service" sh -ec \

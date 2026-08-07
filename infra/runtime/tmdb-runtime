@@ -86,7 +86,6 @@ case "${1:-}" in
     media)
         prepare_mount_root media /config
         prepare_mount_root media /media
-        prepare_directory media /config/media
         prepare_directory media /config/logs
         prepare_directory media /media/movies
         prepare_directory media /media/tv
@@ -98,7 +97,7 @@ case "${1:-}" in
         drop_privileges_and_exec media /usr/local/bin/tmdb-images "$@"
         ;;
     *)
-        printf '%s\n' "tmdb-runtime event=startup_failed operation=invalid_role hint=use_worker_or_media" >&2
+        printf '%s\n' "tmdb-runtime event=startup_failed operation=invalid_role hint=use_api_worker_or_media" >&2
         exit 64
         ;;
 esac

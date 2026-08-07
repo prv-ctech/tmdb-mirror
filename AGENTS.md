@@ -117,9 +117,10 @@ change.
   PNG rendition. Never resize, recompress, re-encode, or create derivatives.
 - Store only final files in deterministic entity directories. Never create
   `optimized/`, `.masters`, variant, original, or compatibility directories.
-- Publish atomically, store size/SHA-256/verification time, lazily revalidate
-  requested assets, and restrict stale-file deletion to the exact validated
-  TMDB entity directory. Local URLs include a digest query parameter.
+- Publish through a destination-local temporary file and atomic rename, store
+  size/SHA-256/verification time, lazily revalidate requested assets, and
+  restrict stale-file deletion to the exact validated TMDB entity directory.
+  Local URLs include a digest query parameter.
 - Reject symlinks in every publication/deletion path component. Serialize one
   active image job per owner/kind/index slot, and serialize media cancellation
   with request expansion so files and database metadata cannot diverge.
@@ -139,9 +140,9 @@ change.
 - Before commit or push, inspect the staged diff and confirm secrets,
   environment files, databases, media, backups, logs, and runtime artifacts
   are ignored by Git and Docker.
-- `/config/raw` is active catalog export/reconcile storage and `/config/media`
-  is active media scratch storage. Do not remove either as legacy state.
-  `/config/work` is obsolete and must not be recreated.
+- `/config/raw` is active catalog export/reconcile storage. `/config/logs` and
+  `/config/backups` are active persistent state. `/config/work` and
+  `/config/media` are obsolete and must not be recreated.
 - API, worker, media, and PostgreSQL must emit JSONL to Docker and persist the
   identical stream under `/config/logs`. Use `api.log`, `worker.log`,
   `media.log`, and `postgres.log` for the first process start, increment a

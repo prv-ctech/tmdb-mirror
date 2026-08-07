@@ -635,9 +635,8 @@ pub fn init_tracing_from_env(service_name: &str) -> Result<(), InitTracingError>
 
 fn parse_log_format(value: Option<&str>) -> Result<LogFormat, InitTracingError> {
     match value.map(str::trim).filter(|value| !value.is_empty()) {
-        None => Ok(LogFormat::Json),
+        None | Some("json") => Ok(LogFormat::Json),
         Some("pretty") => Ok(LogFormat::Pretty),
-        Some("json") => Ok(LogFormat::Json),
         Some(_) => Err(InitTracingError::InvalidLogFormat),
     }
 }

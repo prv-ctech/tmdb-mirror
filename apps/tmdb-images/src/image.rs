@@ -5,8 +5,8 @@
 //! * [`ImageJobPayload`] validates the durable job boundary;
 //! * [`ImageDownloader`] enforces the network policy and, only for a tested
 //!   challenge response, asks the configured Trawl instance for a fallback;
-//! * [`ImageStore`] writes a scratch copy and then publishes a content
-//!   addressed semantic path atomically on the permanent filesystem.
+//! * [`ImageStore`] publishes validated bytes through a destination-local
+//!   temporary file and an atomic rename.
 //!
 //! MIME types, byte limits, format signatures, bounded dimensions, and a full
 //! decode are enforced before bytes can be published.  No encoder is used.
@@ -931,14 +931,6 @@ pub enum StorageError {
 /// Fixed media-publication stages used in safe terminal diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StorageOperation {
-    /// Create the bounded `/config/media/images` scratch directory.
-    PrepareScratchDirectory,
-    /// Create a unique scratch image file.
-    CreateScratchFile,
-    /// Write downloaded bytes to the scratch image file.
-    WriteScratchFile,
-    /// Sync a scratch image file before publication.
-    SyncScratchFile,
     /// Check whether the final destination already exists.
     CheckDestination,
     /// Read existing destination metadata.
@@ -947,10 +939,12 @@ pub enum StorageOperation {
     VerifyExistingDigest,
     /// Create the final destination directory.
     PrepareDestinationDirectory,
-    /// Copy scratch content into a destination-local temporary file.
-    CopyToDestination,
+    /// Create a unique destination-local temporary file.
+    CreateTemporaryFile,
+    /// Write validated image bytes to the temporary file.
+    WriteTemporaryFile,
     /// Sync the destination-local temporary file.
-    SyncDestinationFile,
+    SyncTemporaryFile,
     /// Atomically rename the temporary file into its final destination.
     PublishDestination,
 }
@@ -960,16 +954,13 @@ impl StorageOperation {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::PrepareScratchDirectory => "prepare_scratch_directory",
-            Self::CreateScratchFile => "create_scratch_file",
-            Self::WriteScratchFile => "write_scratch_file",
-            Self::SyncScratchFile => "sync_scratch_file",
             Self::CheckDestination => "check_destination",
             Self::ReadDestinationMetadata => "read_destination_metadata",
             Self::VerifyExistingDigest => "verify_existing_digest",
             Self::PrepareDestinationDirectory => "prepare_destination_directory",
-            Self::CopyToDestination => "copy_to_destination",
-            Self::SyncDestinationFile => "sync_destination_file",
+            Self::CreateTemporaryFile => "create_temporary_file",
+            Self::WriteTemporaryFile => "write_temporary_file",
+            Self::SyncTemporaryFile => "sync_temporary_file",
             Self::PublishDestination => "publish_destination",
         }
     }
@@ -981,28 +972,23 @@ impl StorageError {
     }
 }
 
-/// Scratch/permanent image store.  Scratch and permanent roots are checked to
-/// be disjoint; publication uses a temporary file under the permanent root so
-/// the final rename remains atomic even when the roots are different mounts.
+/// Permanent image store using destination-local temporary files so final
+/// publication remains atomic.
 #[derive(Clone, Debug)]
 pub struct ImageStore {
-    work_root: PathBuf,
     image_root: PathBuf,
 }
 
 impl ImageStore {
-    /// Creates the fixed `/config/media` to `/media` store used by the media
-    /// container.  No host filesystem path is read from the environment.
+    /// Creates the fixed `/media` store used by the media container. No host
+    /// filesystem path is read from the environment.
     ///
     /// # Errors
     ///
     /// Returns [`StorageError::InvalidRoot`] only if the fixed contract is
     /// changed to an invalid layout.
     pub fn fixed() -> Result<Self, StorageError> {
-        Self::with_semantic_layout(
-            PathBuf::from(tmdb_media::MEDIA_WORK_ROOT),
-            PathBuf::from(tmdb_media::MEDIA_ROOT),
-        )
+        Self::with_semantic_layout(PathBuf::from(tmdb_media::MEDIA_ROOT))
     }
 
     /// Creates a semantic-layout store for isolated tests.  Production code
@@ -1010,21 +996,10 @@ impl ImageStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::InvalidRoot`] when either path is invalid or
-    /// the roots overlap.
-    pub fn with_semantic_layout(
-        work_root: impl Into<PathBuf>,
-        image_root: impl Into<PathBuf>,
-    ) -> Result<Self, StorageError> {
-        let work_root = validate_root(work_root.into())?;
+    /// Returns [`StorageError::InvalidRoot`] when the path is invalid.
+    pub fn with_semantic_layout(image_root: impl Into<PathBuf>) -> Result<Self, StorageError> {
         let image_root = validate_root(image_root.into())?;
-        if work_root.starts_with(&image_root) || image_root.starts_with(&work_root) {
-            return Err(StorageError::InvalidRoot);
-        }
-        Ok(Self {
-            work_root,
-            image_root,
-        })
+        Ok(Self { image_root })
     }
 
     /// Publishes bytes and constructs metadata.  The caller must pass a body
@@ -1032,7 +1007,7 @@ impl ImageStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError`] when scratch or permanent publication fails.
+    /// Returns [`StorageError`] when permanent publication fails.
     pub async fn publish(
         &self,
         payload: &ImageJobPayload,
@@ -1045,22 +1020,10 @@ impl ImageStore {
             return Err(StorageError::DigestMismatch);
         }
         let digest = image.digest;
-        let scratch_dir = self.work_root.join("images");
-        tokio::fs::create_dir_all(&scratch_dir)
-            .await
-            .map_err(|error| StorageError::io(StorageOperation::PrepareScratchDirectory, error))?;
         let relative =
             semantic_path(payload, &image.mime_type).map_err(|()| StorageError::InvalidPayload)?;
         let destination = self.image_root.join(&relative);
-        let scratch = scratch_dir.join(format!(
-            ".source-{}.{}.part",
-            digest.as_hex(),
-            Uuid::now_v7()
-        ));
-        let outcome = self
-            .publish_inner(&scratch, &destination, &image.body, digest, true)
-            .await;
-        let _ = tokio::fs::remove_file(&scratch).await;
+        let outcome = self.publish_inner(&destination, &image.body, digest).await;
         let deduplicated = matches!(outcome?, PublishOutcome::AlreadyPresent);
         Ok(StoredImage {
             metadata: ImageMetadata {
@@ -1083,34 +1046,12 @@ impl ImageStore {
         })
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the atomic same-filesystem publication protocol is clearer as one linear operation"
-    )]
     async fn publish_inner(
         &self,
-        scratch: &Path,
         destination: &Path,
         body: &[u8],
         digest: ImageDigest,
-        replace_existing: bool,
     ) -> Result<PublishOutcome, StorageError> {
-        let mut scratch_file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(scratch)
-            .await
-            .map_err(|error| StorageError::io(StorageOperation::CreateScratchFile, error))?;
-        scratch_file
-            .write_all(body)
-            .await
-            .map_err(|error| StorageError::io(StorageOperation::WriteScratchFile, error))?;
-        scratch_file
-            .sync_all()
-            .await
-            .map_err(|error| StorageError::io(StorageOperation::SyncScratchFile, error))?;
-        drop(scratch_file);
-
         let parent = destination.parent().ok_or(StorageError::InvalidRoot)?;
         prepare_safe_directory(&self.image_root, parent).await?;
         match tokio::fs::symlink_metadata(destination).await {
@@ -1121,9 +1062,6 @@ impl ImageStore {
                 if file_matches_digest(destination, digest).await? {
                     return Ok(PublishOutcome::AlreadyPresent);
                 }
-                if !replace_existing {
-                    return Err(StorageError::DestinationConflict);
-                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
@@ -1131,67 +1069,35 @@ impl ImageStore {
             }
         }
 
-        let temporary = parent.join(format!(".{}.{}.tmp", Uuid::now_v7(), Uuid::now_v7()));
-        let copy_result = async {
-            let mut source = tokio::fs::File::open(scratch).await?;
-            let mut target = tokio::fs::OpenOptions::new()
+        let temporary = parent.join(format!(".{}.tmp", Uuid::now_v7()));
+        let write_result = async {
+            let mut temporary_file = tokio::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&temporary)
-                .await?;
-            tokio::io::copy(&mut source, &mut target).await?;
-            Ok::<(), std::io::Error>(())
-        }
-        .await;
-        if let Err(error) = copy_result {
-            let _ = tokio::fs::remove_file(&temporary).await;
-            return Err(StorageError::io(StorageOperation::CopyToDestination, error));
-        }
-        let outcome = async {
-            let temporary_file = tokio::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&temporary)
                 .await
-                .map_err(|error| StorageError::io(StorageOperation::SyncDestinationFile, error))?;
+                .map_err(|error| StorageError::io(StorageOperation::CreateTemporaryFile, error))?;
+            temporary_file
+                .write_all(body)
+                .await
+                .map_err(|error| StorageError::io(StorageOperation::WriteTemporaryFile, error))?;
             temporary_file
                 .sync_all()
                 .await
-                .map_err(|error| StorageError::io(StorageOperation::SyncDestinationFile, error))?;
-            drop(temporary_file);
+                .map_err(|error| StorageError::io(StorageOperation::SyncTemporaryFile, error))?;
+            Ok::<(), StorageError>(())
+        }
+        .await;
+        if let Err(error) = write_result {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+        let outcome = async {
             prepare_safe_directory(&self.image_root, parent).await?;
-            if replace_existing {
-                tokio::fs::rename(&temporary, destination)
-                    .await
-                    .map(|()| PublishOutcome::Published)
-                    .map_err(|error| StorageError::io(StorageOperation::PublishDestination, error))
-            } else {
-                match tokio::fs::hard_link(&temporary, destination).await {
-                    Ok(()) => Ok(PublishOutcome::Published),
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        let metadata = tokio::fs::symlink_metadata(destination).await.map_err(
-                            |metadata_error| {
-                                StorageError::io(
-                                    StorageOperation::ReadDestinationMetadata,
-                                    metadata_error,
-                                )
-                            },
-                        )?;
-                        if !metadata.file_type().is_file() {
-                            return Err(StorageError::DestinationConflict);
-                        }
-                        if file_matches_digest(destination, digest).await? {
-                            Ok(PublishOutcome::AlreadyPresent)
-                        } else {
-                            Err(StorageError::DestinationConflict)
-                        }
-                    }
-                    Err(error) => Err(StorageError::io(
-                        StorageOperation::PublishDestination,
-                        error,
-                    )),
-                }
-            }
+            tokio::fs::rename(&temporary, destination)
+                .await
+                .map(|()| PublishOutcome::Published)
+                .map_err(|error| StorageError::io(StorageOperation::PublishDestination, error))
         }
         .await;
         if outcome.is_err() {
@@ -2235,9 +2141,8 @@ mod tests {
     #[tokio::test]
     async fn semantic_publication_deduplicates_unchanged_content()
     -> Result<(), Box<dyn std::error::Error>> {
-        let work = tempfile::tempdir()?;
         let images = tempfile::tempdir()?;
-        let store = ImageStore::with_semantic_layout(work.path().join("work"), images.path())?;
+        let store = ImageStore::with_semantic_layout(images.path())?;
         let job = payload()?;
         let image = DownloadedImage {
             body: PNG.to_vec(),
@@ -2257,11 +2162,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semantic_store_writes_one_exact_public_file() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let work = tempfile::tempdir()?;
+    async fn semantic_publication_requires_only_public_root_and_writes_one_exact_file()
+    -> Result<(), Box<dyn std::error::Error>> {
         let images = tempfile::tempdir()?;
-        let store = ImageStore::with_semantic_layout(work.path().join("work"), images.path())?;
+        let store = ImageStore::with_semantic_layout(images.path())?;
         let job = payload()?;
         let image = DownloadedImage {
             body: PNG.to_vec(),
@@ -2283,6 +2187,12 @@ mod tests {
             tokio::fs::read(images.path().join(&stored.metadata.storage_path)).await?,
             PNG
         );
+        let mut entries = tokio::fs::read_dir(images.path().join("movies/123/posters")).await?;
+        let entry = entries.next_entry().await?.ok_or_else(|| {
+            std::io::Error::other("published image directory must contain its final file")
+        })?;
+        assert_eq!(entry.file_name(), "poster.png");
+        assert!(entries.next_entry().await?.is_none());
         assert!(!images.path().join("optimized").exists());
         assert!(!images.path().join(".masters").exists());
         Ok(())
@@ -2291,9 +2201,8 @@ mod tests {
     #[tokio::test]
     async fn episode_thumbnail_uses_flat_thumbnail_directory_and_supports_specials()
     -> Result<(), Box<dyn std::error::Error>> {
-        let work = tempfile::tempdir()?;
         let images = tempfile::tempdir()?;
-        let store = ImageStore::with_semantic_layout(work.path().join("work"), images.path())?;
+        let store = ImageStore::with_semantic_layout(images.path())?;
         let job = ImageJobPayload::new(
             ImageEntityType::Episode,
             300,
@@ -2327,9 +2236,8 @@ mod tests {
     #[tokio::test]
     async fn webp_rendition_bytes_are_preserved_without_a_derivative()
     -> Result<(), Box<dyn std::error::Error>> {
-        let work = tempfile::tempdir()?;
         let images = tempfile::tempdir()?;
-        let store = ImageStore::with_semantic_layout(work.path().join("work"), images.path())?;
+        let store = ImageStore::with_semantic_layout(images.path())?;
         let source = webp_vp8();
         let job = payload()?;
         let image = DownloadedImage {
@@ -2358,9 +2266,8 @@ mod tests {
     #[tokio::test]
     async fn semantic_store_replaces_changed_public_file_atomically()
     -> Result<(), Box<dyn std::error::Error>> {
-        let work = tempfile::tempdir()?;
         let images = tempfile::tempdir()?;
-        let store = ImageStore::with_semantic_layout(work.path().join("work"), images.path())?;
+        let store = ImageStore::with_semantic_layout(images.path())?;
         let job = payload()?;
         let first = DownloadedImage {
             body: PNG.to_vec(),
@@ -2405,9 +2312,8 @@ mod tests {
     #[tokio::test]
     async fn semantic_store_numbers_gallery_files_without_reencoding()
     -> Result<(), Box<dyn std::error::Error>> {
-        let work = tempfile::tempdir()?;
         let images = tempfile::tempdir()?;
-        let store = ImageStore::with_semantic_layout(work.path().join("work"), images.path())?;
+        let store = ImageStore::with_semantic_layout(images.path())?;
         let job = payload()?.with_asset_index(2)?;
         let source = PNG.to_vec();
         let image = DownloadedImage {
@@ -2438,10 +2344,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         const PUBLICATIONS: u32 = 64;
 
-        let work = tempfile::tempdir()?;
         let images = tempfile::tempdir()?;
         let store = Arc::new(ImageStore::with_semantic_layout(
-            work.path().join("work"),
             images.path().join("media"),
         )?);
         let barrier = Arc::new(Barrier::new(PUBLICATIONS as usize + 1));
@@ -2495,12 +2399,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn atomic_publication_failure_cleans_scratch() -> Result<(), Box<dyn std::error::Error>> {
-        let work = tempfile::tempdir()?;
+    async fn publication_rejects_a_non_directory_media_root()
+    -> Result<(), Box<dyn std::error::Error>> {
         let images = tempfile::tempdir()?;
         let image_root = images.path().join("images");
         tokio::fs::write(&image_root, b"not a directory").await?;
-        let store = ImageStore::with_semantic_layout(work.path().join("work"), image_root)?;
+        let store = ImageStore::with_semantic_layout(image_root)?;
         let job = payload()?;
         let image = DownloadedImage {
             body: PNG.to_vec(),
@@ -2512,11 +2416,6 @@ mod tests {
             height: 1,
         };
         assert!(store.publish(&job, &image).await.is_err());
-        let scratch_dir = work.path().join("work").join("images");
-        if tokio::fs::try_exists(&scratch_dir).await? {
-            let mut entries = tokio::fs::read_dir(scratch_dir).await?;
-            assert!(entries.next_entry().await?.is_none());
-        }
         Ok(())
     }
 
@@ -2526,12 +2425,11 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         use std::os::unix::fs::symlink;
 
-        let work = tempfile::tempdir()?;
         let images = tempfile::tempdir()?;
         let outside = tempfile::tempdir()?;
         tokio::fs::create_dir(images.path().join("movies")).await?;
         symlink(outside.path(), images.path().join("movies/123"))?;
-        let store = ImageStore::with_semantic_layout(work.path().join("work"), images.path())?;
+        let store = ImageStore::with_semantic_layout(images.path())?;
         let job = payload()?;
         let image = DownloadedImage {
             body: PNG.to_vec(),

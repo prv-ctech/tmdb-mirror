@@ -15,10 +15,8 @@ use thiserror::Error;
 
 /// Permanent public media mount inside every application container.
 pub const MEDIA_ROOT: &str = "/media";
-/// NVMe-backed application-data mount inside every worker container.
+/// Application-data mount inside every worker container.
 pub const CONFIG_ROOT: &str = "/config";
-/// Media worker scratch directory below [`CONFIG_ROOT`].
-pub const MEDIA_WORK_ROOT: &str = "/config/media";
 /// Raw exports and checkpoints below [`CONFIG_ROOT`].
 pub const RAW_ROOT: &str = "/config/raw";
 /// Durable worker logs below [`CONFIG_ROOT`].
@@ -36,7 +34,7 @@ pub const BACKUP_ROOT: &str = "/config/backups";
 pub enum RuntimeStorageRole {
     /// The main worker, which owns migrations, metadata ingest, and exports.
     Worker,
-    /// The media worker, which owns image scratch data and final media publication.
+    /// The media worker, which owns final media publication.
     Media,
 }
 
@@ -61,8 +59,6 @@ pub enum RuntimeStoragePath {
     ConfigBackups,
     /// `/config/logs`
     ConfigLogs,
-    /// `/config/media`
-    ConfigMedia,
     /// `/media/movies`
     MediaMovies,
     /// `/media/tv`
@@ -85,7 +81,6 @@ impl RuntimeStoragePath {
             Self::ConfigRaw => RAW_ROOT,
             Self::ConfigBackups => BACKUP_ROOT,
             Self::ConfigLogs => LOG_ROOT,
-            Self::ConfigMedia => MEDIA_WORK_ROOT,
             Self::MediaMovies => "/media/movies",
             Self::MediaTv => "/media/tv",
             Self::MediaPeople => "/media/people",
@@ -100,7 +95,6 @@ impl RuntimeStoragePath {
             Self::ConfigRaw => config_root.join("raw"),
             Self::ConfigBackups => config_root.join("backups"),
             Self::ConfigLogs => config_root.join("logs"),
-            Self::ConfigMedia => config_root.join("media"),
             Self::MediaMovies => media_root.join("movies"),
             Self::MediaTv => media_root.join("tv"),
             Self::MediaPeople => media_root.join("people"),
@@ -197,7 +191,6 @@ const WORKER_RUNTIME_PATHS: &[RuntimeStoragePath] = &[
     RuntimeStoragePath::ConfigLogs,
 ];
 const MEDIA_RUNTIME_PATHS: &[RuntimeStoragePath] = &[
-    RuntimeStoragePath::ConfigMedia,
     RuntimeStoragePath::ConfigLogs,
     RuntimeStoragePath::MediaMovies,
     RuntimeStoragePath::MediaTv,
@@ -551,7 +544,6 @@ mod tests {
     fn fixed_root_contract_is_container_only() {
         assert_eq!(MEDIA_ROOT, "/media");
         assert_eq!(CONFIG_ROOT, "/config");
-        assert_eq!(MEDIA_WORK_ROOT, "/config/media");
         assert_eq!(RAW_ROOT, "/config/raw");
     }
 
@@ -577,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn media_storage_preflight_creates_fixed_scratch_and_public_paths()
+    fn media_storage_preflight_creates_only_logs_and_public_paths()
     -> Result<(), Box<dyn std::error::Error>> {
         let sandbox = tempdir()?;
         let config = sandbox.path().join("config");
@@ -587,9 +579,11 @@ mod tests {
 
         prepare_runtime_storage_at(RuntimeStorageRole::Media, &config, &media)?;
 
-        for child in ["media", "logs"] {
-            assert!(config.join(child).is_dir(), "missing /config/{child}");
-        }
+        assert!(config.join("logs").is_dir(), "missing /config/logs");
+        assert!(
+            !config.join("media").exists(),
+            "obsolete /config/media must not be recreated"
+        );
         for child in [
             "movies",
             "tv",
@@ -610,17 +604,17 @@ mod tests {
         let config = sandbox.path().join("config");
         let media = sandbox.path().join("media");
         fs::create_dir(&config)?;
-        fs::write(config.join("media"), b"not a directory")?;
         fs::create_dir(&media)?;
+        fs::write(media.join("movies"), b"not a directory")?;
 
         let Err(error) = prepare_runtime_storage_at(RuntimeStorageRole::Media, &config, &media)
         else {
             return Err(std::io::Error::other(
-                "a regular file must not satisfy the media scratch directory",
+                "a regular file must not satisfy a required media directory",
             )
             .into());
         };
-        assert_eq!(error.path(), RuntimeStoragePath::ConfigMedia,);
+        assert_eq!(error.path(), RuntimeStoragePath::MediaMovies);
         assert_eq!(error.operation(), "not_directory");
         Ok(())
     }
