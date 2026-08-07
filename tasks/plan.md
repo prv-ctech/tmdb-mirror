@@ -13,6 +13,10 @@ details live in `README.md` and `docs/`.
   `daily_sync`, and `reconcile`; three cron schedules are durable and bounded.
 - Media is requested only through `POST /admin/v1/media/requests` for active
   local catalog titles. PostgreSQL is the sole metadata source.
+- `/config/raw`, `/config/logs`, and `/config/backups` are active persistent
+  state. `/config/work` and `/config/media` are obsolete.
+- API, worker, media, and PostgreSQL write JSONL below `/config/logs`, retaining
+  the newest 10 restart generations per service.
 - There is one movie namespace and one TV namespace. Anime is not a storage,
   database, or public API partition.
 
@@ -38,6 +42,8 @@ details live in `README.md` and `docs/`.
   contribute only their primary locally stored path.
 - Download exact bounded CDN renditions without original files, local resizing,
   re-encoding, derivatives, or variants.
+- Publish validated bytes through a destination-local temporary file and atomic
+  rename directly under `/media`; no separate scratch tree exists.
 - Use TMDB IDs for reusable entities. Do not create `optimized/`, `.masters`,
   video files, or compatibility paths.
 - Store video metadata only. The current public response preserves `site` and
@@ -53,8 +59,12 @@ details live in `README.md` and `docs/`.
   failures, and container health without recording credentials.
 - The 2026-08-06 clean-stack acceptance run completed the Rust test suite,
   on-demand media reuse/repair checks, 100-client HTTP load, and pgBackRest
-  backup/PITR checks. These are repository qualification results, not a claim
-  about the current health of an arbitrary production deployment.
+  backup/PITR checks.
+- The 2026-08-07 runtime-storage run passed formatting, strict Clippy, and 276
+  database-backed tests, then published and served 1,636 assets (79,082,815
+  bytes) with no failed assets, dead letters, temporary files, or obsolete
+  `/config/media` directory. These are repository qualification results, not a
+  claim about the current health of an arbitrary production deployment.
 
 ## Publication
 

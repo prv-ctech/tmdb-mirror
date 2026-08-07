@@ -63,14 +63,15 @@ The [documentation map](docs/README.md) separates current operator contracts
 from historical design records.
 
 These files replace the older deployment contract. They use the `tmdb-runtime`
-startup wrapper for API/worker/media file logging and storage preparation, relative Compose bind
-sources, and the fixed `9000` read, `9001` admin, and `9002` media listener
-contract. The root standalone file reads `.env` beside it; the production file
-reads `../.env` by default or the file selected by `TMDB_ENV_FILE`.
+startup wrapper for API/worker/media file logging and storage preparation,
+relative Compose bind sources, and the fixed `9000` read, `9001` admin, and
+`9002` media listener contract. The root standalone file reads `.env` beside
+it; the production file reads `../.env` by default or the file selected by
+`TMDB_ENV_FILE`.
 
-The current `.env.example` is intentionally minimal. Enter database owner
-credentials, the TMDB read token, admin key, media URL, worker identities, and
-the three catalog schedules. Do not carry forward listener binds, `PGDATA`,
+The current `.env.example` is intentionally minimal. Replace its credential
+and public media URL placeholders, then adjust only the listed runtime knobs
+that differ for your deployment. Do not carry forward listener binds, `PGDATA`,
 `POSTGRES_INITDB_ARGS`, host-path variables, or per-role credentials. Host
 paths and host ports belong in Compose.
 

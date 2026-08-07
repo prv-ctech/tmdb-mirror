@@ -1,7 +1,8 @@
 # Local-Truth On-Demand Media Redesign
 
 Status: media redesign implemented in schema revision `0052`; current schema
-revision is `0053`. The bounded media contract was qualified on 2026-08-06.
+revision is `0053`. The current bounded media and storage contract was last
+qualified on 2026-08-07.
 
 ## Contract
 
@@ -51,12 +52,12 @@ networks/<network_id>/logo.png
 collections/<collection_id>/poster.jpg
 ```
 
-No `optimized/`, `.masters`, original, variant, compatibility, or video
-directory exists. Files publish through same-filesystem temporary files and
-atomic rename. PostgreSQL stores final path, MIME, dimensions, size, SHA-256,
-status, and verification time. Public local URLs use a digest query parameter.
-Lazy verification repairs requested files and deletes stale files only inside
-the exact validated entity directory.
+No `optimized/`, `.masters`, original, variant, compatibility, video, or
+`/config/media` scratch directory exists. Files publish through hidden
+destination-local temporary files and atomic rename. PostgreSQL stores final
+path, MIME, dimensions, size, SHA-256, status, and verification time. Public
+local URLs use a digest query parameter. Lazy verification repairs requested
+files and deletes stale files only inside the exact validated entity directory.
 
 ## Catalog scheduling
 
@@ -86,7 +87,11 @@ Acceptance covered local-truth API and role tests, offline persistence, startup
 draining, backpressure, bounded continuation, pause/resume/cancel, exact-byte
 image tests, atomic publication, lazy repair/deletion, schedule/watermark tests,
 forward migration, Docker media requests, concurrent reads, backups/PITR, and
-secret-free logs. The clean-stack run produced 1,650 ready final assets; a
-repeat request reused all 1,650 with zero failures. The 100-client public API
-sample completed 2,000 requests without failures. These figures describe that
-bounded acceptance run, not a permanent production capacity guarantee.
+secret-free logs. The 2026-08-06 clean-stack run produced 1,650 ready final
+assets, reused all 1,650 on a repeat request, and completed a 2,000-request,
+100-client public API sample without failures. The 2026-08-07 storage run passed
+formatting, strict Clippy, and 276 database-backed tests, then published and
+served 1,636 assets (79,082,815 bytes) with zero failed assets, dead letters,
+leftover temporary files, or `/config/media` directory. These bounded results
+qualify those builds and hosts; they are not permanent production capacity
+guarantees.
